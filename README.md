@@ -1,11 +1,3 @@
-# ⚠️ This repository has moved
-
-**This repo has been relocated to [microsoft/duroxide](https://github.com/microsoft/duroxide).**
-
-All future development will happen there. This repository is archived and will no longer receive updates.
-
----
-
 ![Banner](duroxide_banner.jpg)
 ## duroxide
 
