@@ -541,7 +541,7 @@ pub struct DurableFuture<T> {
     inner: std::pin::Pin<Box<dyn Future<Output = T> + Send>>,
 }
 
-impl<T> DurableFuture<T> {
+impl<T: Send + 'static> DurableFuture<T> {
     /// Create a new `DurableFuture` wrapping an inner future.
     fn new(
         token: u64,
@@ -556,6 +556,48 @@ impl<T> DurableFuture<T> {
             completed: false,
             inner: Box::pin(inner),
         }
+    }
+
+    /// Transform the output of this `DurableFuture` while preserving its
+    /// identity for cancellation, `join`, and `select` composability.
+    ///
+    /// The mapping function runs synchronously after the underlying future
+    /// completes. Cancellation semantics are fully preserved: dropping the
+    /// returned `DurableFuture` cancels the original scheduled work.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use duroxide::OrchestrationContext;
+    /// # async fn example(ctx: OrchestrationContext) -> Result<String, String> {
+    /// // Map an activity result to extract a field
+    /// let length = ctx.schedule_activity("Greet", "World")
+    ///     .map(|r| r.map(|s| s.len().to_string()));
+    /// let len_result = length.await?;
+    /// # Ok(len_result)
+    /// # }
+    /// ```
+    pub fn map<U: Send + 'static>(self, f: impl FnOnce(T) -> U + Send + 'static) -> DurableFuture<U> {
+        // Transfer ownership of cancellation guard to the new DurableFuture.
+        // We must defuse `self` so its Drop doesn't fire cancellation.
+        let token = self.token;
+        let kind = self.kind.clone();
+        let ctx = self.ctx.clone();
+
+        // Defuse: take the inner future out without running Drop.
+        let inner = unsafe {
+            let inner = std::ptr::read(&self.inner);
+            // Prevent Drop from running on the original (would cancel the token)
+            std::mem::forget(self);
+            inner
+        };
+
+        let mapped = async move {
+            let value = inner.await;
+            f(value)
+        };
+
+        DurableFuture::new(token, kind, ctx, mapped)
     }
 }
 
@@ -3094,17 +3136,14 @@ impl OrchestrationContext {
     /// # Errors
     ///
     /// Returns an error if the activity fails or if the output cannot be deserialized.
-    pub fn schedule_activity_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned>(
+    pub fn schedule_activity_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         name: impl Into<String>,
         input: &In,
-    ) -> impl Future<Output = Result<Out, String>> {
+    ) -> DurableFuture<Result<Out, String>> {
         let payload = crate::_typed_codec::Json::encode(input).expect("encode");
-        let fut = self.schedule_activity(name, payload);
-        async move {
-            let s = fut.await?;
-            crate::_typed_codec::Json::decode::<Out>(&s)
-        }
+        self.schedule_activity(name, payload)
+            .map(|r| r.and_then(|s| crate::_typed_codec::Json::decode::<Out>(&s)))
     }
 
     /// Schedule an activity routed to the worker owning the given session.
@@ -3137,18 +3176,15 @@ impl OrchestrationContext {
     /// # Errors
     ///
     /// Returns an error if the activity fails or if the output cannot be deserialized.
-    pub fn schedule_activity_on_session_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned>(
+    pub fn schedule_activity_on_session_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         name: impl Into<String>,
         input: &In,
         session_id: impl Into<String>,
-    ) -> impl Future<Output = Result<Out, String>> {
+    ) -> DurableFuture<Result<Out, String>> {
         let payload = crate::_typed_codec::Json::encode(input).expect("encode");
-        let fut = self.schedule_activity_on_session(name, payload, session_id);
-        async move {
-            let s = fut.await?;
-            crate::_typed_codec::Json::decode::<Out>(&s)
-        }
+        self.schedule_activity_on_session(name, payload, session_id)
+            .map(|r| r.and_then(|s| crate::_typed_codec::Json::decode::<Out>(&s)))
     }
 
     /// Internal implementation for activity scheduling.
@@ -3260,15 +3296,12 @@ impl OrchestrationContext {
     }
 
     /// Typed version of schedule_wait.
-    pub fn schedule_wait_typed<T: serde::de::DeserializeOwned>(
+    pub fn schedule_wait_typed<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         name: impl Into<String>,
-    ) -> impl Future<Output = T> {
-        let fut = self.schedule_wait(name);
-        async move {
-            let s = fut.await;
-            crate::_typed_codec::Json::decode::<T>(&s).expect("decode")
-        }
+    ) -> DurableFuture<T> {
+        self.schedule_wait(name)
+            .map(|s| crate::_typed_codec::Json::decode::<T>(&s).expect("decode"))
     }
 
     /// Dequeue the next message from a named queue (FIFO mailbox semantics).
@@ -3501,17 +3534,14 @@ impl OrchestrationContext {
     /// # Errors
     ///
     /// Returns an error if the sub-orchestration fails or if the output cannot be deserialized.
-    pub fn schedule_sub_orchestration_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned>(
+    pub fn schedule_sub_orchestration_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         name: impl Into<String>,
         input: &In,
-    ) -> impl Future<Output = Result<Out, String>> {
+    ) -> DurableFuture<Result<Out, String>> {
         let payload = crate::_typed_codec::Json::encode(input).expect("encode");
-        let fut = self.schedule_sub_orchestration(name, payload);
-        async move {
-            let s = fut.await?;
-            crate::_typed_codec::Json::decode::<Out>(&s)
-        }
+        self.schedule_sub_orchestration(name, payload)
+            .map(|r| r.and_then(|s| crate::_typed_codec::Json::decode::<Out>(&s)))
     }
 
     /// Typed version of schedule_sub_orchestration_with_id.
@@ -3519,18 +3549,15 @@ impl OrchestrationContext {
     /// # Errors
     ///
     /// Returns an error if the sub-orchestration fails or if the output cannot be deserialized.
-    pub fn schedule_sub_orchestration_with_id_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned>(
+    pub fn schedule_sub_orchestration_with_id_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         name: impl Into<String>,
         instance: impl Into<String>,
         input: &In,
-    ) -> impl Future<Output = Result<Out, String>> {
+    ) -> DurableFuture<Result<Out, String>> {
         let payload = crate::_typed_codec::Json::encode(input).expect("encode");
-        let fut = self.schedule_sub_orchestration_with_id(name, instance, payload);
-        async move {
-            let s = fut.await?;
-            crate::_typed_codec::Json::decode::<Out>(&s)
-        }
+        self.schedule_sub_orchestration_with_id(name, instance, payload)
+            .map(|r| r.and_then(|s| crate::_typed_codec::Json::decode::<Out>(&s)))
     }
 
     /// Await all futures concurrently using `futures::future::join_all`.
