@@ -22,7 +22,13 @@ Recommendations
 
 ## Event Queues (Persistent/FIFO)
 
-For use cases where messages arrive before the orchestration subscribes — or where FIFO ordering matters — use the queue-based API:
+For use cases where FIFO ordering matters — use the queue-based API:
+
+> **Important:** Events must be enqueued *after* the orchestration has started
+> (i.e., after `start_orchestration` is called). Events enqueued for a
+> non-existent orchestration instance are dropped by the provider. Once the
+> orchestration is running, queued events are buffered until consumed — even
+> if no `dequeue_event` subscription is currently active.
 
 **Orchestration side:**
 ```rust
@@ -47,7 +53,7 @@ Key differences from ephemeral events:
 | Feature | Ephemeral (`schedule_wait`/`raise_event`) | Queue (`dequeue_event`/`enqueue_event`) |
 |---------|------------------------------------------|----------------------------------------|
 | Matching | Positional (Nth wait ↔ Nth raise) | FIFO queue |
-| Early messages | Dropped if no subscription | Buffered until dequeued |
+| Early messages | Dropped if no subscription | Buffered once orchestration is running; dropped if enqueued before start |
 | Survives CAN | No (must re-subscribe) | Yes (queue persists) |
 | Use case | One-shot signals, approvals | Chat, command streams, iterative loops |
 

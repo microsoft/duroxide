@@ -545,7 +545,7 @@ The validation test suite includes **157 individual test functions** organized i
    - `test_continue_as_new_creates_new_execution` - ContinueAsNew creates new execution
    - `test_execution_history_persistence` - All executions' history persists independently
 
-6. **Queue Semantics Tests (7 tests)**
+6. **Queue Semantics Tests (8 tests)**
    - `test_worker_queue_fifo_ordering` - Worker items dequeued in FIFO order
    - `test_worker_peek_lock_semantics` - Dequeue doesn't remove item until ack
    - `test_worker_ack_atomicity` - Ack_worker atomically removes item and enqueues completion
@@ -553,6 +553,7 @@ The validation test suite includes **157 individual test functions** organized i
    - `test_lost_lock_token_handling` - Locked items become available after expiration
    - `test_worker_delayed_visibility_skips_future_items` - Future-visible worker items skipped
    - `test_worker_item_immediate_visibility` - Worker items immediately visible by default
+   - `test_orphan_queue_messages_dropped` - QueueMessage for non-existent instance is dropped; QueueMessage for existing instance is kept
 
 7. **Instance Creation Tests (4 tests)**
    - `test_instance_creation_via_metadata` - Instances created via ack metadata, not on enqueue

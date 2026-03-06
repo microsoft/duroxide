@@ -945,7 +945,48 @@ impl Provider for SqliteProvider {
                     Vec::new(),
                 )
             } else {
-                tracing::debug!(target="duroxide::providers::sqlite", instance=%instance_id, "No instance info or history; cannot build orchestration item");
+                // No instance info, no history, no StartOrchestration/ContinueAsNew.
+                // Check if the batch contains only QueueMessage items (persistent events
+                // enqueued before the orchestration started). These are orphans — drop them.
+                // Other work items (CancelInstance, ActivityCompleted, etc.) may legitimately
+                // race with StartOrchestration and must be kept in the queue.
+                let all_queue_messages = work_items
+                    .iter()
+                    .all(|item| matches!(item, WorkItem::QueueMessage { .. }));
+                if all_queue_messages {
+                    let message_count = work_items.len();
+                    tracing::warn!(
+                        target="duroxide::providers::sqlite",
+                        instance=%instance_id,
+                        message_count,
+                        "Dropping orphan queue messages — events enqueued before orchestration started are not supported"
+                    );
+                    // Messages are already marked with our lock_token; delete them.
+                    sqlx::query("DELETE FROM orchestrator_queue WHERE lock_token = ?1")
+                        .bind(&lock_token)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Self::sqlx_to_provider_error("fetch_orchestration_item", e))?;
+                    // Release instance lock
+                    sqlx::query("DELETE FROM instance_locks WHERE lock_token = ?1")
+                        .bind(&lock_token)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Self::sqlx_to_provider_error("fetch_orchestration_item", e))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| Self::sqlx_to_provider_error("fetch_orchestration_item", e))?;
+                    return Ok(None);
+                }
+
+                // Non-QueueMessage items racing with StartOrchestration — release locks
+                // and leave messages in queue for the next poll.
+                tracing::debug!(
+                    target="duroxide::providers::sqlite",
+                    instance=%instance_id,
+                    message_count=work_items.len(),
+                    "Work items without orchestration context; releasing for retry"
+                );
                 tx.rollback().await.ok();
                 return Ok(None);
             }

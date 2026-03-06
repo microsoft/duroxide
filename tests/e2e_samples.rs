@@ -1792,10 +1792,13 @@ async fn sample_self_pruning_eternal_orchestration() {
 /// or many between cycles — and none are lost.
 ///
 /// Highlights:
-/// - `schedule_wait_persistent("ConfigUpdate")` buffers arrivals until consumed
+/// - `dequeue_event("ConfigUpdate")` buffers arrivals until consumed
 /// - `select2(persistent_wait, timer)` drains buffered updates without blocking
 /// - Events that arrive while the orchestration is busy are queued, not dropped
 /// - Demonstrates the "mailbox" pattern: decouple sender timing from consumer readiness
+///
+/// Note: Events enqueued *before* the orchestration starts may be dropped by the
+/// provider (orphan message semantics). This test only enqueues events after start.
 #[tokio::test]
 async fn sample_config_hot_reload_persistent_events_fs() {
     let (store, _temp_dir) = common::create_sqlite_store_disk().await;
@@ -1864,19 +1867,21 @@ async fn sample_config_hot_reload_persistent_events_fs() {
         runtime::Runtime::start_with_options(store.clone(), activity_registry, orchestration_registry, options).await;
     let client = Client::new(store.clone());
 
-    // Push two config updates BEFORE starting the orchestration.
-    // They'll be buffered and picked up in the first drain cycle.
+    // Start the orchestration first — events enqueued before start may be
+    // dropped by the provider (orphan message semantics).
+    client
+        .start_orchestration("inst-hot-reload", "ConfigHotReload", "")
+        .await
+        .unwrap();
+
+    // Push two config updates immediately after start.
+    // The orchestration's first drain cycle will pick them up.
     client
         .enqueue_event("inst-hot-reload", "ConfigUpdate", "v1")
         .await
         .unwrap();
     client
         .enqueue_event("inst-hot-reload", "ConfigUpdate", "v2")
-        .await
-        .unwrap();
-
-    client
-        .start_orchestration("inst-hot-reload", "ConfigHotReload", "")
         .await
         .unwrap();
 
@@ -1895,7 +1900,7 @@ async fn sample_config_hot_reload_persistent_events_fs() {
         runtime::OrchestrationStatus::Completed { output, .. } => {
             let entries: Vec<&str> = output.split(',').collect();
 
-            // Find positions of key entries
+            // All three events should be present
             let pos_v1 = entries
                 .iter()
                 .position(|e| *e == "applied:v1")
@@ -1913,18 +1918,9 @@ async fn sample_config_hot_reload_persistent_events_fs() {
                 .position(|e| *e == "cycle:0")
                 .unwrap_or_else(|| panic!("cycle:0 missing from output: {output}"));
 
-            // v1 and v2 were buffered before start → must be drained before cycle:0
-            assert!(
-                pos_v1 < pos_cycle0,
-                "v1 should be drained before cycle:0, got: {output}"
-            );
-            assert!(
-                pos_v2 < pos_cycle0,
-                "v2 should be drained before cycle:0, got: {output}"
-            );
-
-            // FIFO ordering: v1 must come before v2
+            // FIFO ordering: v1 must come before v2, v2 before v3
             assert!(pos_v1 < pos_v2, "v1 should come before v2 (FIFO), got: {output}");
+            assert!(pos_v2 < pos_v3, "v2 should come before v3 (FIFO), got: {output}");
 
             // v3 arrived mid-flight → must come after cycle:0
             assert!(

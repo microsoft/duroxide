@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.21] - 2026-03-06
+
+**Release:** <https://crates.io/crates/duroxide/0.1.21>
+
+### Fixed
+
+- **Orphan queue message handling** — `QueueMessage` items enqueued before an orchestration
+  starts are now dropped (deleted) with a warning instead of being left in the queue (which
+  caused a busy-loop in the SQLite provider) or silently lost (in PG providers). Non-QueueMessage
+  work items (e.g., `CancelInstance`) that race with `StartOrchestration` are correctly kept
+  in the queue for retry.
+
+### Added
+
+- **`test_orphan_queue_messages_dropped`** — New provider validation test verifying that
+  QueueMessage items for non-existent instances are dropped, while QueueMessage items for
+  existing instances are kept and returned.
+
+### Changed
+
+- **`sample_config_hot_reload_persistent_events_fs`** e2e test adapted to start the
+  orchestration before enqueuing events (matching the corrected orphan message semantics).
+
+### Documentation
+
+- Updated ORCHESTRATION-GUIDE.md, external-events.md, provider-implementation-guide.md,
+  and provider-testing-guide.md to document pre-start event drop behavior.
+
 ## [0.1.20] - 2026-02-21
 
 **Release:** <https://crates.io/crates/duroxide/0.1.20>

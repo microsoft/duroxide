@@ -49,9 +49,7 @@ fn math_activities() -> duroxide::runtime::registry::Registry<dyn duroxide::runt
             Ok(AddRes { sum: req.a + req.b })
         })
         .register_typed::<MulReq, MulRes, _, _>("Mul", |_ctx: ActivityContext, req| async move {
-            Ok(MulRes {
-                product: req.a * req.b,
-            })
+            Ok(MulRes { product: req.a * req.b })
         })
         .register_typed::<AddReq, AddRes, _, _>("SlowAdd", |_ctx: ActivityContext, req| async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -61,9 +59,7 @@ fn math_activities() -> duroxide::runtime::registry::Registry<dyn duroxide::runt
             if req.b == 0 {
                 Err("division by zero".to_string())
             } else {
-                Ok(MulRes {
-                    product: req.a / req.b,
-                })
+                Ok(MulRes { product: req.a / req.b })
             }
         })
         .build()
@@ -89,15 +85,16 @@ async fn typed_activity_join_fan_out() {
         Ok(total.to_string())
     };
 
-    let orchestrations = OrchestrationRegistry::builder()
-        .register("TypedJoin", orch)
-        .build();
+    let orchestrations = OrchestrationRegistry::builder().register("TypedJoin", orch).build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
     let client = Client::new(store);
     client.start_orchestration("tj-1", "TypedJoin", "").await.unwrap();
 
-    let status = client.wait_for_orchestration("tj-1", Duration::from_secs(5)).await.unwrap();
+    let status = client
+        .wait_for_orchestration("tj-1", Duration::from_secs(5))
+        .await
+        .unwrap();
     match status {
         duroxide::OrchestrationStatus::Completed { output, .. } => {
             assert_eq!(output, "333"); // 3 + 30 + 300
@@ -127,15 +124,16 @@ async fn typed_activity_join2_heterogeneous() {
         Ok(format!("sum={sum},product={product}"))
     };
 
-    let orchestrations = OrchestrationRegistry::builder()
-        .register("TypedJoin2", orch)
-        .build();
+    let orchestrations = OrchestrationRegistry::builder().register("TypedJoin2", orch).build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
     let client = Client::new(store);
     client.start_orchestration("tj2-1", "TypedJoin2", "").await.unwrap();
 
-    let status = client.wait_for_orchestration("tj2-1", Duration::from_secs(5)).await.unwrap();
+    let status = client
+        .wait_for_orchestration("tj2-1", Duration::from_secs(5))
+        .await
+        .unwrap();
     match status {
         duroxide::OrchestrationStatus::Completed { output, .. } => {
             assert_eq!(output, "sum=8,product=15");
@@ -163,15 +161,16 @@ async fn typed_activity_select2_timeout() {
         }
     };
 
-    let orchestrations = OrchestrationRegistry::builder()
-        .register("TypedSelect2", orch)
-        .build();
+    let orchestrations = OrchestrationRegistry::builder().register("TypedSelect2", orch).build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
     let client = Client::new(store);
     client.start_orchestration("ts2-1", "TypedSelect2", "").await.unwrap();
 
-    let status = client.wait_for_orchestration("ts2-1", Duration::from_secs(5)).await.unwrap();
+    let status = client
+        .wait_for_orchestration("ts2-1", Duration::from_secs(5))
+        .await
+        .unwrap();
     match status {
         duroxide::OrchestrationStatus::Completed { output, .. } => {
             // Either outcome valid depending on timing
@@ -203,23 +202,26 @@ async fn durable_future_map_transforms_result() {
         // .map() to post-process inline
         let result = ctx
             .schedule_activity("Double", "21")
-            .map(|r| r.map(|s| {
-                let n: i32 = s.parse().unwrap();
-                (n + 1).to_string()
-            }))
+            .map(|r| {
+                r.map(|s| {
+                    let n: i32 = s.parse().unwrap();
+                    (n + 1).to_string()
+                })
+            })
             .await?;
         Ok(result) // "43"
     };
 
-    let orchestrations = OrchestrationRegistry::builder()
-        .register("MapCombo", orch)
-        .build();
+    let orchestrations = OrchestrationRegistry::builder().register("MapCombo", orch).build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
     let client = Client::new(store);
     client.start_orchestration("mc-1", "MapCombo", "").await.unwrap();
 
-    let status = client.wait_for_orchestration("mc-1", Duration::from_secs(5)).await.unwrap();
+    let status = client
+        .wait_for_orchestration("mc-1", Duration::from_secs(5))
+        .await
+        .unwrap();
     match status {
         duroxide::OrchestrationStatus::Completed { output, .. } => assert_eq!(output, "43"),
         other => panic!("Expected completed, got {other:?}"),
@@ -249,15 +251,16 @@ async fn typed_map_then_join() {
         Ok(total.to_string())
     };
 
-    let orchestrations = OrchestrationRegistry::builder()
-        .register("TypedMapJoin", orch)
-        .build();
+    let orchestrations = OrchestrationRegistry::builder().register("TypedMapJoin", orch).build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
     let client = Client::new(store);
     client.start_orchestration("tmj-1", "TypedMapJoin", "").await.unwrap();
 
-    let status = client.wait_for_orchestration("tmj-1", Duration::from_secs(5)).await.unwrap();
+    let status = client
+        .wait_for_orchestration("tmj-1", Duration::from_secs(5))
+        .await
+        .unwrap();
     match status {
         duroxide::OrchestrationStatus::Completed { output, .. } => assert_eq!(output, "33"),
         other => panic!("Expected completed, got {other:?}"),
@@ -291,15 +294,16 @@ async fn map_preserves_cancellation_on_drop() {
         }
     };
 
-    let orchestrations = OrchestrationRegistry::builder()
-        .register("MapCancel", orch)
-        .build();
+    let orchestrations = OrchestrationRegistry::builder().register("MapCancel", orch).build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
     let client = Client::new(store);
     client.start_orchestration("mcan-1", "MapCancel", "").await.unwrap();
 
-    let status = client.wait_for_orchestration("mcan-1", Duration::from_secs(5)).await.unwrap();
+    let status = client
+        .wait_for_orchestration("mcan-1", Duration::from_secs(5))
+        .await
+        .unwrap();
     match status {
         duroxide::OrchestrationStatus::Completed { output, .. } => assert_eq!(output, "cancelled"),
         other => panic!("Expected completed, got {other:?}"),
@@ -328,15 +332,16 @@ async fn typed_error_propagation_through_join() {
         Ok(format!("ok={first},err={second_err}"))
     };
 
-    let orchestrations = OrchestrationRegistry::builder()
-        .register("TypedErrJoin", orch)
-        .build();
+    let orchestrations = OrchestrationRegistry::builder().register("TypedErrJoin", orch).build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
     let client = Client::new(store);
     client.start_orchestration("tej-1", "TypedErrJoin", "").await.unwrap();
 
-    let status = client.wait_for_orchestration("tej-1", Duration::from_secs(5)).await.unwrap();
+    let status = client
+        .wait_for_orchestration("tej-1", Duration::from_secs(5))
+        .await
+        .unwrap();
     match status {
         duroxide::OrchestrationStatus::Completed { output, .. } => {
             assert_eq!(output, "ok=5,err=division by zero");

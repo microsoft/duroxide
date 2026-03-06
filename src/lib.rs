@@ -3176,7 +3176,10 @@ impl OrchestrationContext {
     /// # Errors
     ///
     /// Returns an error if the activity fails or if the output cannot be deserialized.
-    pub fn schedule_activity_on_session_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned + Send + 'static>(
+    pub fn schedule_activity_on_session_typed<
+        In: serde::Serialize,
+        Out: serde::de::DeserializeOwned + Send + 'static,
+    >(
         &self,
         name: impl Into<String>,
         input: &In,
@@ -3549,7 +3552,10 @@ impl OrchestrationContext {
     /// # Errors
     ///
     /// Returns an error if the sub-orchestration fails or if the output cannot be deserialized.
-    pub fn schedule_sub_orchestration_with_id_typed<In: serde::Serialize, Out: serde::de::DeserializeOwned + Send + 'static>(
+    pub fn schedule_sub_orchestration_with_id_typed<
+        In: serde::Serialize,
+        Out: serde::de::DeserializeOwned + Send + 'static,
+    >(
         &self,
         name: impl Into<String>,
         instance: impl Into<String>,

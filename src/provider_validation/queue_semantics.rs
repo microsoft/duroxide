@@ -1,4 +1,4 @@
-use crate::provider_validation::{Event, EventKind, ExecutionMetadata, start_item};
+use crate::provider_validation::{Event, EventKind, ExecutionMetadata, create_instance, start_item};
 use crate::provider_validations::ProviderFactory;
 use crate::providers::WorkItem;
 use std::time::Duration;
@@ -507,4 +507,109 @@ pub async fn test_worker_delayed_visibility_skips_future_items<F: ProviderFactor
         .unwrap();
 
     tracing::info!("✓ Test passed: worker delayed visibility skips future items verified");
+}
+
+/// Test 5.8: Orphan Queue Messages Dropped
+/// Goal: Verify that QueueMessage items enqueued for a non-existent orchestration
+/// are dropped (deleted) by the provider, and that QueueMessage items enqueued
+/// for an existing orchestration are kept and returned in the next fetch.
+pub async fn test_orphan_queue_messages_dropped<F: ProviderFactory>(factory: &F) {
+    tracing::info!("→ Testing queue semantics: orphan queue messages are dropped");
+    let provider = factory.create_provider().await;
+
+    // --- Part 1: Events for non-existent instance are dropped ---
+
+    // Enqueue two QueueMessage items for an instance that doesn't exist yet
+    provider
+        .enqueue_for_orchestrator(
+            WorkItem::QueueMessage {
+                instance: "orphan-test".to_string(),
+                name: "ConfigUpdate".to_string(),
+                data: "v1".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    provider
+        .enqueue_for_orchestrator(
+            WorkItem::QueueMessage {
+                instance: "orphan-test".to_string(),
+                name: "ConfigUpdate".to_string(),
+                data: "v2".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Fetch should return None (no orchestration found) and DROP the messages
+    let result = provider
+        .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert!(result.is_none(), "Expected None for orphan queue messages");
+
+    // Verify messages were actually deleted: a second fetch should also return None
+    // (if they were left in the queue, we'd get them again — busy loop)
+    let result2 = provider
+        .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert!(
+        result2.is_none(),
+        "Orphan messages should have been deleted, not left in queue"
+    );
+
+    // --- Part 2: Events for an existing instance are kept ---
+
+    // Create an orchestration instance (enqueue StartOrchestration, fetch, ack with history)
+    create_instance(&*provider, "orphan-test-existing")
+        .await
+        .expect("Failed to create instance");
+
+    // Now enqueue a QueueMessage for the existing instance
+    provider
+        .enqueue_for_orchestrator(
+            WorkItem::QueueMessage {
+                instance: "orphan-test-existing".to_string(),
+                name: "ConfigUpdate".to_string(),
+                data: "v3".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Fetch should return the item with the QueueMessage included
+    let (item, lock_token, _attempt) = provider
+        .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("Expected orchestration item for existing instance with queued event");
+
+    assert_eq!(item.instance, "orphan-test-existing");
+    assert!(
+        item.messages
+            .iter()
+            .any(|m| matches!(m, WorkItem::QueueMessage { name, data, .. } if name == "ConfigUpdate" && data == "v3")),
+        "QueueMessage for existing instance should be included in messages, got: {:?}",
+        item.messages
+    );
+
+    // Clean up: ack the item
+    provider
+        .ack_orchestration_item(
+            &lock_token,
+            item.execution_id,
+            vec![],
+            vec![],
+            vec![],
+            ExecutionMetadata::default(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    tracing::info!("✓ Test passed: orphan queue messages dropped, existing instance events kept");
 }

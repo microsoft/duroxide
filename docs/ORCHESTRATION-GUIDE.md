@@ -544,6 +544,11 @@ Durable FIFO queues that survive `continue_as_new` boundaries. Unlike ephemeral
 events, queue messages are consumed in order and don't require a matching
 subscription before the event is raised.
 
+> **Important:** Events must be enqueued *after* the orchestration has started.
+> Events enqueued before `start_orchestration` is called may be dropped by the
+> provider (orphan message semantics). Once the orchestration is running, queued
+> events are buffered until consumed — even if no `dequeue_event` call is active.
+
 ```rust
 // Dequeue next message from a named queue (blocks until available)
 fn dequeue_event(&self, queue: impl Into<String>) -> impl Future<Output = String>
@@ -565,6 +570,7 @@ let msg: ChatMessage = ctx.dequeue_event_typed("inbox").await;
 | Semantics | Positional (Nth wait matches Nth raise) | FIFO queue |
 | Survives CAN | No | Yes |
 | Pre-subscription required | Yes | No |
+| Pre-start messages | N/A | Dropped (enqueue only after orchestration starts) |
 | Use case | One-shot signals, approvals | Chat messages, command streams |
 
 #### Custom Status

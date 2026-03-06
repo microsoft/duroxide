@@ -106,6 +106,7 @@ pub use crate::provider_validation::ProviderFactory;
 /// - `test_lost_lock_token_handling` - Verify locked items become available after expiration
 /// - `test_worker_item_immediate_visibility` - Verify newly enqueued items are immediately visible
 /// - `test_worker_delayed_visibility_skips_future_items` - Verify items with future visible_at are skipped
+/// - `test_orphan_queue_messages_dropped` - Verify QueueMessage for non-existent instance is dropped; kept for existing instance
 ///
 /// **Management Tests:**
 /// - `test_list_instances` - Verify list_instances returns all instance IDs
@@ -170,9 +171,9 @@ pub use crate::provider_validation::multi_execution::{
 
 #[cfg(feature = "provider-test")]
 pub use crate::provider_validation::queue_semantics::{
-    test_lost_lock_token_handling, test_timer_delayed_visibility, test_worker_ack_atomicity,
-    test_worker_delayed_visibility_skips_future_items, test_worker_item_immediate_visibility,
-    test_worker_peek_lock_semantics, test_worker_queue_fifo_ordering,
+    test_lost_lock_token_handling, test_orphan_queue_messages_dropped, test_timer_delayed_visibility,
+    test_worker_ack_atomicity, test_worker_delayed_visibility_skips_future_items,
+    test_worker_item_immediate_visibility, test_worker_peek_lock_semantics, test_worker_queue_fifo_ordering,
 };
 
 #[cfg(feature = "provider-test")]

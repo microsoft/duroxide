@@ -140,6 +140,7 @@ mod tests {
         test_null_version_handling,
         test_orchestration_lock_renewal_after_expiration,
         test_orphan_activity_after_instance_force_deletion,
+        test_orphan_queue_messages_dropped,
         test_renew_fails_when_entry_deleted,
         test_renew_returns_missing_when_instance_deleted,
         test_renew_returns_running_when_orchestration_active,
@@ -412,6 +413,12 @@ mod tests {
     async fn test_sqlite_worker_delayed_visibility_skips_future_items() {
         test_worker_delayed_visibility_skips_future_items(&SqliteTestFactory).await;
     }
+
+    #[tokio::test]
+    async fn test_sqlite_orphan_queue_messages_dropped() {
+        test_orphan_queue_messages_dropped(&SqliteTestFactory).await;
+    }
+
     // Management tests
     #[tokio::test]
     async fn test_sqlite_list_instances() {

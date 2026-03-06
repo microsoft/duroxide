@@ -4,6 +4,14 @@
 
 - Size limits 
 - RaiseEvent pub/sub
+- **Stale activity cleanup / Activity TTL**
+  - Tagged activities that no matching worker picks up sit in the worker queue indefinitely
+  - Need either: (1) Per-activity TTL that auto-fails after expiry, or (2) Background cleanup process
+  - TTL approach: add optional `expires_at` to worker queue items, provider skips expired items on fetch, periodic sweep fails them back to orchestrator
+  - Cleanup approach: runtime background task scans for items older than a configurable threshold
+  - Either way, the orchestration should receive a clear error (e.g., `ActivityExpired`) so it can handle the timeout
+  - Related: activity tagging makes this more likely — easy to schedule a tag no worker handles
+  - Complexity: Medium — touches provider trait (expiry field), worker dispatcher (sweep), event model (new error kind)
 - **Nested Select2 Support** - Enable `select2(select2(a, b), c)` composition
   - Currently `select2` only accepts `DurableFuture`, not `SelectFuture`
   - Options: (1) Add trait for select2 args that both types implement, (2) Add `SelectFuture::into_selectable()` wrapper

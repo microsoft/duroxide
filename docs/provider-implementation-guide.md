@@ -207,7 +207,7 @@ Work queues hold items waiting to be processed. Each item represents something t
 - `ActivityCompleted` / `ActivityFailed` — Activity finished
 - `TimerFired` — A timer expired
 - `ExternalEvent` — External system sent an event
-- `QueueMessage` — Persistent event queued via `client.enqueue_event()` (FIFO mailbox)
+- `QueueMessage` — Persistent event queued via `client.enqueue_event()` (FIFO mailbox). **Note:** If a `QueueMessage` arrives for an instance that has no orchestration yet (no history, no `StartOrchestration` in the batch), the provider must drop (delete) it with a warning rather than returning it or leaving it in the queue. Events enqueued after the orchestration starts are always kept.
 - `SubOrchCompleted` / `SubOrchFailed` — Child orchestration finished
 - `CancelInstance` — Cancellation requested
 
