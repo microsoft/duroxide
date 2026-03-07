@@ -34,8 +34,8 @@ mod tests {
     use duroxide::provider_validations::tag_filtering::{
         test_any_filter_fetches_everything, test_default_and_fetches_untagged_and_matching,
         test_default_only_fetches_untagged, test_multi_runtime_tag_isolation, test_multi_tag_filter,
-        test_none_filter_returns_nothing, test_tag_round_trip_preservation, test_tag_survives_abandon_and_refetch,
-        test_tags_fetches_only_matching,
+        test_none_filter_returns_nothing, test_tag_preserved_through_ack_orchestration_item,
+        test_tag_round_trip_preservation, test_tag_survives_abandon_and_refetch, test_tags_fetches_only_matching,
     };
     use duroxide::provider_validations::{
         ProviderFactory,
@@ -1151,5 +1151,10 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_tag_multi_runtime_isolation() {
         test_multi_runtime_tag_isolation(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_preserved_through_ack_orchestration_item() {
+        test_tag_preserved_through_ack_orchestration_item(&SqliteTestFactory).await;
     }
 }

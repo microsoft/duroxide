@@ -8,8 +8,8 @@
 
 A lightweight and embeddable durable execution runtime for Rust. Inspired by the [Durable Task Framework](https://github.com/Azure/durabletask) and [Temporal](https://temporal.io/).
 
-> **[Latest Release: v0.1.22](https://crates.io/crates/duroxide/0.1.22)** — Activity tag routing for worker specialization, flaky test fixes.
-> See [CHANGELOG.md](CHANGELOG.md#0122---2026-03-07) for release notes. [Proposal](docs/proposals/activity-tags.md)
+> **[Latest Release: v0.1.23](https://crates.io/crates/duroxide/0.1.23)** — Tag preservation validation through ack path, flaky test fixes.
+> See [CHANGELOG.md](CHANGELOG.md#0123---2026-03-07) for release notes.
 
 ### What you can build with this
 - Function chaining: model a multi-step process as sequential awaits where each step depends on prior results.

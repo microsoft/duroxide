@@ -520,3 +520,120 @@ pub async fn test_multi_runtime_tag_isolation(factory: &dyn ProviderFactory) {
         "All items consumed or locked"
     );
 }
+
+/// Verifies that tags on worker items survive the `ack_orchestration_item` path.
+///
+/// This is the critical path: when the orchestration dispatcher acks an orchestration
+/// turn, it passes worker items (ActivityExecute) to `ack_orchestration_item`, which
+/// must persist the `tag` field so that `fetch_work_item` can filter correctly.
+///
+/// This test catches providers whose `ack_orchestration_item` stored procedure inserts
+/// worker items into the worker queue without extracting/storing the tag column.
+pub async fn test_tag_preserved_through_ack_orchestration_item(factory: &dyn ProviderFactory) {
+    use crate::provider_validation::{Event, EventKind, ExecutionMetadata, start_item};
+
+    let provider = factory.create_provider().await;
+
+    // Step 1: Set up an orchestration instance by enqueuing and fetching
+    provider
+        .enqueue_for_orchestrator(start_item("tag-ack-inst"), None)
+        .await
+        .unwrap();
+
+    let (_item, lock_token, _attempt) = provider
+        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("should get orchestration item");
+
+    // Step 2: Ack with worker items — one tagged "gpu", one untagged
+    let gpu_activity = WorkItem::ActivityExecute {
+        instance: "tag-ack-inst".to_string(),
+        execution_id: 1,
+        id: 10,
+        name: "GpuWork".to_string(),
+        input: r#""model-v3""#.to_string(),
+        session_id: None,
+        tag: Some("gpu".to_string()),
+    };
+    let cpu_activity = WorkItem::ActivityExecute {
+        instance: "tag-ack-inst".to_string(),
+        execution_id: 1,
+        id: 11,
+        name: "CpuWork".to_string(),
+        input: r#""data""#.to_string(),
+        session_id: None,
+        tag: None,
+    };
+
+    provider
+        .ack_orchestration_item(
+            &lock_token,
+            1,
+            vec![Event::with_event_id(
+                1,
+                "tag-ack-inst".to_string(),
+                1,
+                None,
+                EventKind::OrchestrationStarted {
+                    name: "TestOrch".to_string(),
+                    version: "1.0.0".to_string(),
+                    input: "{}".to_string(),
+                    parent_instance: None,
+                    parent_id: None,
+                    carry_forward_events: None,
+                    initial_custom_status: None,
+                },
+            )],
+            vec![gpu_activity, cpu_activity],
+            vec![],
+            ExecutionMetadata::default(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Step 3: DefaultOnly should fetch ONLY the untagged item
+    let default_result = provider
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::DefaultOnly)
+        .await
+        .unwrap()
+        .expect("DefaultOnly should get the untagged activity");
+
+    match &default_result.0 {
+        WorkItem::ActivityExecute { name, tag, .. } => {
+            assert_eq!(name, "CpuWork", "DefaultOnly must return untagged item");
+            assert!(tag.is_none(), "DefaultOnly item must have no tag");
+        }
+        other => panic!("expected ActivityExecute, got {:?}", other),
+    }
+    // Ack the item to remove it from the queue
+    provider.ack_work_item(&default_result.1, None).await.unwrap();
+
+    // Step 4: DefaultOnly should now find nothing (only gpu-tagged item remains)
+    let empty = provider
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::DefaultOnly)
+        .await
+        .unwrap();
+    assert!(
+        empty.is_none(),
+        "DefaultOnly must NOT see gpu-tagged item — got {:?}",
+        empty
+    );
+
+    // Step 5: Tags(["gpu"]) should fetch the gpu-tagged item
+    let gpu_filter = TagFilter::Tags(["gpu".to_string()].into_iter().collect());
+    let gpu_result = provider
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &gpu_filter)
+        .await
+        .unwrap()
+        .expect("Tags([gpu]) should get the gpu-tagged activity");
+
+    match &gpu_result.0 {
+        WorkItem::ActivityExecute { name, tag, .. } => {
+            assert_eq!(name, "GpuWork", "Tags([gpu]) must return gpu item");
+            assert_eq!(tag.as_deref(), Some("gpu"), "tag must be preserved as 'gpu'");
+        }
+        other => panic!("expected ActivityExecute, got {:?}", other),
+    }
+}

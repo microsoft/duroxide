@@ -1819,10 +1819,10 @@ async fn sample_config_hot_reload_persistent_events_fs() {
         let mut log: Vec<String> = Vec::new();
 
         for cycle in 0..3 {
-            // ── Drain pending config updates (non-blocking) ──
+            // Drain pending config updates (non-blocking)
             loop {
                 let config_wait = ctx.dequeue_event("ConfigUpdate");
-                let drain_timeout = ctx.schedule_timer(Duration::from_millis(50));
+                let drain_timeout = ctx.schedule_timer(Duration::from_millis(100));
                 match ctx.select2(config_wait, drain_timeout).await {
                     Either2::First(config_json) => {
                         let result = ctx.schedule_activity("ApplyConfig", &config_json).await?;
@@ -1832,16 +1832,17 @@ async fn sample_config_hot_reload_persistent_events_fs() {
                 }
             }
 
-            // ── Mark cycle boundary, then simulate work ──
-            ctx.schedule_timer(Duration::from_millis(100)).await;
+            // Mark cycle boundary, then simulate work.
+            // Use a longer timer (1s) so there is a wide window for v3 to arrive mid-flight.
+            ctx.schedule_timer(Duration::from_millis(1000)).await;
             let _ = ctx.schedule_activity("ApplyConfig", format!("cycle_{cycle}")).await?;
             log.push(format!("cycle:{cycle}"));
         }
 
-        // ── Final drain: pick up any events that arrived during the last cycle ──
+        // Final drain: pick up any events that arrived during the last cycle
         loop {
             let config_wait = ctx.dequeue_event("ConfigUpdate");
-            let drain_timeout = ctx.schedule_timer(Duration::from_millis(50));
+            let drain_timeout = ctx.schedule_timer(Duration::from_millis(100));
             match ctx.select2(config_wait, drain_timeout).await {
                 Either2::First(config_json) => {
                     let result = ctx.schedule_activity("ApplyConfig", &config_json).await?;
@@ -1885,15 +1886,35 @@ async fn sample_config_hot_reload_persistent_events_fs() {
         .await
         .unwrap();
 
-    // Push a third update while the orchestration is running (arrives mid-flight)
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the orchestration to progress past cycle:0's drain phase before
+    // sending v3. A fixed delay is unreliable because dispatch latency is
+    // variable under load. Instead, observe history for the cycle_0
+    // activity being scheduled, which proves the drain loop has completed,
+    // the 1s cycle timer has fired, and the cycle boundary activity is in flight.
+    assert!(
+        common::wait_for_history(
+            store.clone(),
+            "inst-hot-reload",
+            |hist| {
+                hist.iter().any(|e| {
+                    matches!(
+                        &e.kind,
+                        EventKind::ActivityScheduled { input, .. } if input == "cycle_0"
+                    )
+                })
+            },
+            15_000,
+        )
+        .await,
+        "Timed out waiting for cycle:0 to progress past its drain phase"
+    );
     client
         .enqueue_event("inst-hot-reload", "ConfigUpdate", "v3")
         .await
         .unwrap();
 
     let status = client
-        .wait_for_orchestration("inst-hot-reload", Duration::from_secs(10))
+        .wait_for_orchestration("inst-hot-reload", Duration::from_secs(20))
         .await
         .unwrap();
     match status {

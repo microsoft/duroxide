@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.23] - 2026-03-07
+
+**Release:** <https://crates.io/crates/duroxide/0.1.23>
+
+### Added
+
+- **Provider validation test for tag preservation through ack** — New test
+  `test_tag_preserved_through_ack_orchestration_item` verifies that tags on worker items
+  survive the `ack_orchestration_item` path (orchestrator ack → worker queue fetch with
+  tag filter). Catches providers that drop the tag column during worker item insertion.
+
+### Fixed
+
+- **Flaky `sample_config_hot_reload_persistent_events_fs` test** — Replaced fixed
+  `tokio::time::sleep(300ms)` delay with `wait_for_history` polling that waits for the
+  `cycle_0` activity to be scheduled before sending the mid-flight event. Increased drain
+  timeouts (50ms → 100ms) and cycle timer (100ms → 1s) to provide reliable timing margins.
+
+### Documentation
+
+- Updated provider-testing-guide: tag filtering tests 9 → 10, total test count updated to 176
+
 ## [0.1.22] - 2026-03-07
 
 **Release:** <https://crates.io/crates/duroxide/0.1.22>

@@ -667,7 +667,7 @@ The validation test suite includes **166 individual test functions** organized i
     - Race conditions: `test_concurrent_session_claim_only_one_wins`, `test_session_takeover_after_lock_expiry`, `test_cleanup_then_new_item_recreates_session`, `test_abandoned_session_item_retryable`, `test_abandoned_session_item_ignore_attempt`
     - Cross-concern locks: `test_renew_session_lock_after_expiry_returns_zero`, `test_original_worker_reclaims_expired_session`, `test_activity_lock_expires_session_lock_valid_same_worker_refetches`, `test_both_locks_expire_different_worker_claims`, `test_session_lock_expires_activity_lock_valid_ack_succeeds`, `test_session_lock_renewal_extends_past_original_timeout`
 
-17. **Tag Filtering Tests (9 tests)** - `duroxide::provider_validations::tag_filtering`
+17. **Tag Filtering Tests (10 tests)** - `duroxide::provider_validations::tag_filtering`
     - `test_default_only_fetches_untagged` - DefaultOnly filter returns only untagged items
     - `test_tags_fetches_only_matching` - Tags filter returns only matching tagged items
     - `test_default_and_fetches_untagged_and_matching` - DefaultAnd filter returns untagged + matching
@@ -677,6 +677,7 @@ The validation test suite includes **166 individual test functions** organized i
     - `test_tag_round_trip_preservation` - Tag value preserved through enqueue → fetch → dequeue
     - `test_tag_survives_abandon_and_refetch` - Tag preserved after lock → abandon → refetch cycle
     - `test_multi_runtime_tag_isolation` - Concurrent runtimes with different TagFilters (mutual exclusion, partial overlap, full overlap)
+    - `test_tag_preserved_through_ack_orchestration_item` - Tags on worker items survive the ack_orchestration_item path (enqueue via orchestrator ack → fetch with tag filter)
 
 ### Running Individual Test Functions
 
@@ -1049,7 +1050,7 @@ This generates `stress-test-results.md` with:
 
 - **Test Implementation**: `src/provider_validation/` (individual test modules)
 - **Test API**: `src/provider_validations.rs` (test function exports)
-- **Example Usage**: `tests/sqlite_provider_validations.rs` (complete example with all 157 tests)
+- **Example Usage**: `tests/sqlite_provider_validations.rs` (complete example with all 176 tests)
 - **Test Specification**: See individual test function documentation
 - **Provider Guide**: `docs/provider-implementation-guide.md`
 - **Built-in Providers**: `src/providers/sqlite.rs`
