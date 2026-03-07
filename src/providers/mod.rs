@@ -1,9 +1,124 @@
 use crate::Event;
 use std::any::Any;
+use std::collections::HashSet;
 use std::time::Duration;
 
 pub mod error;
 pub use error::ProviderError;
+
+/// Maximum number of tags a worker can subscribe to.
+pub use crate::runtime::limits::MAX_WORKER_TAGS;
+
+/// Filter for which activity tags a worker will process.
+///
+/// Activity tags route work items to specialized workers. A tag is an
+/// opaque string label set at schedule time via `.with_tag()`. Workers
+/// declare which tags they accept via [`crate::RuntimeOptions`]`.worker_tag_filter`.
+///
+/// # Variants
+///
+/// - `DefaultOnly` (default) — process only activities with no tag.
+/// - `Tags(["gpu"])` — process only activities tagged `"gpu"`.
+/// - `DefaultAnd(["gpu"])` — process activities with no tag OR tagged `"gpu"`.
+/// - `Any` — process all activities regardless of tag.
+/// - `None` — don't process any activities (orchestrator-only mode).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TagFilter {
+    /// Process only activities with no tag (default).
+    #[default]
+    DefaultOnly,
+
+    /// Process only activities with the specified tags (NOT default).
+    /// Limited to [`MAX_WORKER_TAGS`] (5) tags.
+    Tags(HashSet<String>),
+
+    /// Process activities with no tag AND the specified tags.
+    /// Limited to [`MAX_WORKER_TAGS`] (5) tags.
+    DefaultAnd(HashSet<String>),
+
+    /// Process all activities regardless of tag (generalist worker).
+    Any,
+
+    /// Don't process any activities (orchestrator-only mode).
+    None,
+}
+
+impl TagFilter {
+    /// Create a filter for specific tags only.
+    ///
+    /// # Panics
+    /// Panics if more than [`MAX_WORKER_TAGS`] (5) tags are provided.
+    pub fn tags<I, S>(tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: HashSet<String> = tags.into_iter().map(Into::into).collect();
+        assert!(
+            !set.is_empty(),
+            "TagFilter::tags() requires at least one tag; use TagFilter::None for no activities"
+        );
+        assert!(
+            set.len() <= MAX_WORKER_TAGS,
+            "Worker can subscribe to at most {} tags, got {}",
+            MAX_WORKER_TAGS,
+            set.len()
+        );
+        TagFilter::Tags(set)
+    }
+
+    /// Create a filter for default plus specific tags.
+    ///
+    /// # Panics
+    /// Panics if more than [`MAX_WORKER_TAGS`] (5) tags are provided.
+    pub fn default_and<I, S>(tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: HashSet<String> = tags.into_iter().map(Into::into).collect();
+        assert!(
+            !set.is_empty(),
+            "TagFilter::default_and() requires at least one tag; use TagFilter::DefaultOnly for untagged only"
+        );
+        assert!(
+            set.len() <= MAX_WORKER_TAGS,
+            "Worker can subscribe to at most {} tags, got {}",
+            MAX_WORKER_TAGS,
+            set.len()
+        );
+        TagFilter::DefaultAnd(set)
+    }
+
+    /// Create a filter for only untagged activities.
+    pub fn default_only() -> Self {
+        TagFilter::DefaultOnly
+    }
+
+    /// Create a filter that processes no activities.
+    pub fn none() -> Self {
+        TagFilter::None
+    }
+
+    /// Create a filter that processes all activities regardless of tag.
+    pub fn any() -> Self {
+        TagFilter::Any
+    }
+
+    /// Check if an activity with the given tag matches this filter.
+    pub fn matches(&self, tag: Option<&str>) -> bool {
+        match (self, tag) {
+            (TagFilter::Any, _) => true,
+            (TagFilter::None, _) => false,
+            (TagFilter::DefaultOnly, Option::None) => true,
+            (TagFilter::DefaultOnly, Some(_)) => false,
+            (TagFilter::Tags(_), Option::None) => false,
+            (TagFilter::Tags(set), Some(t)) => set.contains(t),
+            (TagFilter::DefaultAnd(_), Option::None) => true,
+            (TagFilter::DefaultAnd(set), Some(t)) => set.contains(t),
+        }
+    }
+}
 
 /// Returns the current build version of the duroxide crate.
 pub fn current_build_version() -> semver::Version {
@@ -326,6 +441,11 @@ pub enum WorkItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         session_id: Option<String>,
+        /// Routing tag for directing this activity to specific workers.
+        /// `None` means default (untagged) queue.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        tag: Option<String>,
     },
 
     /// Activity completed successfully (goes to orchestrator queue)
@@ -1589,11 +1709,20 @@ pub trait Provider: Any + Send + Sync {
     ///
     /// When `session` is `None`, only non-session items (`session_id IS NULL`) are returned.
     /// Session-bound items are skipped entirely.
+    ///
+    /// # Tag Filtering
+    ///
+    /// The `tag_filter` parameter controls which activities this worker processes:
+    /// - `DefaultOnly`: Only items with `tag IS NULL`
+    /// - `Tags(set)`: Only items whose `tag` is in `set`
+    /// - `DefaultAnd(set)`: Items with `tag IS NULL` OR `tag` in `set`
+    /// - `None`: No items (orchestrator-only mode)
     async fn fetch_work_item(
         &self,
         lock_timeout: Duration,
         poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError>;
 
     /// Acknowledge successful processing of a work item.
@@ -2554,4 +2683,71 @@ pub trait ProviderAdmin: Any + Send + Sync {
         filter: InstanceFilter,
         options: PruneOptions,
     ) -> Result<PruneResult, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_only_matches_none_rejects_tag() {
+        let f = TagFilter::DefaultOnly;
+        assert!(f.matches(None));
+        assert!(!f.matches(Some("gpu")));
+    }
+
+    #[test]
+    fn tags_matches_member_rejects_others() {
+        let f = TagFilter::tags(["gpu"]);
+        assert!(f.matches(Some("gpu")));
+        assert!(!f.matches(Some("cpu")));
+        assert!(!f.matches(None));
+    }
+
+    #[test]
+    fn default_and_matches_both() {
+        let f = TagFilter::default_and(["gpu"]);
+        assert!(f.matches(None));
+        assert!(f.matches(Some("gpu")));
+        assert!(!f.matches(Some("cpu")));
+    }
+
+    #[test]
+    fn none_matches_nothing() {
+        let f = TagFilter::None;
+        assert!(!f.matches(None));
+        assert!(!f.matches(Some("x")));
+    }
+
+    #[test]
+    fn any_matches_everything() {
+        let f = TagFilter::Any;
+        assert!(f.matches(None));
+        assert!(f.matches(Some("gpu")));
+        assert!(f.matches(Some("cpu")));
+        assert!(f.matches(Some("anything")));
+    }
+
+    #[test]
+    fn default_impl_is_default_only() {
+        assert_eq!(TagFilter::default(), TagFilter::DefaultOnly);
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 5 tags")]
+    fn panics_over_max_tags() {
+        TagFilter::tags(["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires at least one tag")]
+    fn panics_on_empty_tags() {
+        TagFilter::tags(Vec::<String>::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "requires at least one tag")]
+    fn panics_on_empty_default_and() {
+        TagFilter::default_and(Vec::<String>::new());
+    }
 }

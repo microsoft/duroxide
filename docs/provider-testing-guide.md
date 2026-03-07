@@ -495,7 +495,7 @@ async fn test_my_provider_worker_queue_fifo_ordering() {
 
 ### What the Tests Validate
 
-The validation test suite includes **157 individual test functions** organized into 17 categories:
+The validation test suite includes **166 individual test functions** organized into 18 categories:
 
 1. **Atomicity Tests (4 tests)**
    - `test_atomicity_failure_rollback` - All-or-nothing commit semantics, rollback on failure
@@ -666,6 +666,17 @@ The validation test suite includes **157 individual test functions** organized i
     - Process-level identity: `test_shared_worker_id_any_caller_can_fetch_owned_session`
     - Race conditions: `test_concurrent_session_claim_only_one_wins`, `test_session_takeover_after_lock_expiry`, `test_cleanup_then_new_item_recreates_session`, `test_abandoned_session_item_retryable`, `test_abandoned_session_item_ignore_attempt`
     - Cross-concern locks: `test_renew_session_lock_after_expiry_returns_zero`, `test_original_worker_reclaims_expired_session`, `test_activity_lock_expires_session_lock_valid_same_worker_refetches`, `test_both_locks_expire_different_worker_claims`, `test_session_lock_expires_activity_lock_valid_ack_succeeds`, `test_session_lock_renewal_extends_past_original_timeout`
+
+17. **Tag Filtering Tests (9 tests)** - `duroxide::provider_validations::tag_filtering`
+    - `test_default_only_fetches_untagged` - DefaultOnly filter returns only untagged items
+    - `test_tags_fetches_only_matching` - Tags filter returns only matching tagged items
+    - `test_default_and_fetches_untagged_and_matching` - DefaultAnd filter returns untagged + matching
+    - `test_none_filter_returns_nothing` - None filter never returns items
+    - `test_any_filter_fetches_everything` - Any filter returns all items regardless of tag
+    - `test_multi_tag_filter` - Multiple tags in filter work correctly
+    - `test_tag_round_trip_preservation` - Tag value preserved through enqueue → fetch → dequeue
+    - `test_tag_survives_abandon_and_refetch` - Tag preserved after lock → abandon → refetch cycle
+    - `test_multi_runtime_tag_isolation` - Concurrent runtimes with different TagFilters (mutual exclusion, partial overlap, full overlap)
 
 ### Running Individual Test Functions
 

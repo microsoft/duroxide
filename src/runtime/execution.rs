@@ -147,6 +147,7 @@ impl Runtime {
                             name,
                             input,
                             session_id,
+                            tag,
                         } => {
                             let execution_id = self.get_execution_id_for_instance(instance, Some(execution_id)).await;
                             worker_items.push(WorkItem::ActivityExecute {
@@ -156,6 +157,7 @@ impl Runtime {
                                 name: name.clone(),
                                 input: input.clone(),
                                 session_id: session_id.clone(),
+                                tag: tag.clone(),
                             });
                         }
                         crate::Action::CreateTimer {
@@ -734,6 +736,7 @@ mod tests {
                 name: "task".to_string(),
                 input: "{}".to_string(),
                 session_id: None,
+                tag: None,
             },
         )
     }

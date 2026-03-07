@@ -147,6 +147,8 @@ struct ActivityWorkContext {
     worker_id: String,
     /// Optional session ID for worker affinity routing
     session_id: Option<String>,
+    /// Optional activity tag for worker specialization
+    tag: Option<String>,
 }
 
 // ============================================================================
@@ -299,6 +301,7 @@ async fn process_next_work_item(
             rt.options.worker_lock_timeout,
             rt.options.dispatcher_long_poll_timeout,
             session_config.as_ref(),
+            &rt.options.worker_tag_filter,
         )
         .await?
     {
@@ -316,6 +319,7 @@ async fn process_next_work_item(
             name,
             input,
             session_id,
+            tag,
         } => {
             // If this is a session-bound item, acquire a session slot via a guard.
             // The guard releases the slot on drop (when activity processing completes).
@@ -356,6 +360,7 @@ async fn process_next_work_item(
                 item_serialized,
                 worker_id: worker_id.to_string(),
                 session_id,
+                tag,
             };
 
             // Cancellation is detected during lock renewal (lock stealing).
@@ -468,6 +473,7 @@ async fn execute_activity(
         activity_name = %ctx.activity_name,
         activity_id = %ctx.activity_id,
         worker_id = %ctx.worker_id,
+        activity_tag = ?ctx.tag,
         "Activity started"
     );
 
@@ -517,6 +523,7 @@ async fn build_activity_context(
         ctx.activity_id,
         ctx.worker_id.clone(),
         ctx.session_id.clone(),
+        ctx.tag.clone(),
         cancellation_token,
         Arc::clone(&rt.history_store),
     )
@@ -557,6 +564,7 @@ async fn run_activity_with_cancellation(
                 activity_name = %ctx.activity_name,
                 activity_id = %ctx.activity_id,
                 worker_id = %ctx.worker_id,
+                activity_tag = ?ctx.tag,
                 grace_ms = %grace.as_millis(),
                 "Orchestration terminated, waiting for activity grace period"
             );
@@ -577,7 +585,7 @@ async fn run_activity_with_cancellation(
 
             // Record metrics and ack (drop result since orchestration is terminal)
             let duration_seconds = start_time.elapsed().as_secs_f64();
-            rt.record_activity_execution(&ctx.activity_name, "cancelled", duration_seconds, 0);
+            rt.record_activity_execution(&ctx.activity_name, "cancelled", duration_seconds, 0, ctx.tag.as_deref());
 
             let result = rt.history_store.ack_work_item(&ctx.lock_token, None).await;
             if let Err(e) = &result {
@@ -615,13 +623,14 @@ async fn handle_activity_success(
         activity_name = %ctx.activity_name,
         activity_id = %ctx.activity_id,
         worker_id = %ctx.worker_id,
+        activity_tag = ?ctx.tag,
         outcome = "success",
         duration_ms = %duration_ms,
         result_size = %result.len(),
         "Activity completed"
     );
 
-    rt.record_activity_execution(&ctx.activity_name, "success", duration_seconds, 0);
+    rt.record_activity_execution(&ctx.activity_name, "success", duration_seconds, 0, ctx.tag.as_deref());
 
     let ack_result = rt
         .history_store
@@ -656,13 +665,14 @@ async fn handle_activity_error(
         activity_name = %ctx.activity_name,
         activity_id = %ctx.activity_id,
         worker_id = %ctx.worker_id,
+        activity_tag = ?ctx.tag,
         outcome = "app_error",
         duration_ms = %duration_ms,
         error = %error,
         "Activity failed (application error)"
     );
 
-    rt.record_activity_execution(&ctx.activity_name, "app_error", duration_seconds, 0);
+    rt.record_activity_execution(&ctx.activity_name, "app_error", duration_seconds, 0, ctx.tag.as_deref());
 
     let ack_result = rt
         .history_store
@@ -698,6 +708,7 @@ async fn abandon_unregistered_activity(rt: &Arc<Runtime>, ctx: &ActivityWorkCont
         activity_name = %ctx.activity_name,
         activity_id = %ctx.activity_id,
         worker_id = %ctx.worker_id,
+        activity_tag = ?ctx.tag,
         attempt_count = %ctx.attempt_count,
         max_attempts = %rt.options.max_attempts,
         remaining_attempts = %remaining_attempts,

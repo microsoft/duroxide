@@ -1,6 +1,6 @@
 use crate::provider_validation::{Event, EventKind, ExecutionMetadata, start_item};
 use crate::provider_validations::ProviderFactory;
-use crate::providers::WorkItem;
+use crate::providers::{TagFilter, WorkItem};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -155,6 +155,7 @@ pub async fn test_multi_operation_atomic_ack<F: ProviderFactory>(factory: &F) {
                 name: "Activity1".to_string(),
                 input: "input1".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
         Event::with_event_id(
@@ -166,6 +167,7 @@ pub async fn test_multi_operation_atomic_ack<F: ProviderFactory>(factory: &F) {
                 name: "Activity2".to_string(),
                 input: "input2".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
         Event::with_event_id(
@@ -177,6 +179,7 @@ pub async fn test_multi_operation_atomic_ack<F: ProviderFactory>(factory: &F) {
                 name: "Activity3".to_string(),
                 input: "input3".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
         Event::with_event_id(
@@ -196,6 +199,7 @@ pub async fn test_multi_operation_atomic_ack<F: ProviderFactory>(factory: &F) {
             name: "Activity1".to_string(),
             input: "input1".to_string(),
             session_id: None,
+            tag: None,
         },
         WorkItem::ActivityExecute {
             instance: "instance-A".to_string(),
@@ -204,6 +208,7 @@ pub async fn test_multi_operation_atomic_ack<F: ProviderFactory>(factory: &F) {
             name: "Activity2".to_string(),
             input: "input2".to_string(),
             session_id: None,
+            tag: None,
         },
         WorkItem::ActivityExecute {
             instance: "instance-A".to_string(),
@@ -212,6 +217,7 @@ pub async fn test_multi_operation_atomic_ack<F: ProviderFactory>(factory: &F) {
             name: "Activity3".to_string(),
             input: "input3".to_string(),
             session_id: None,
+            tag: None,
         },
     ];
 
@@ -252,7 +258,7 @@ pub async fn test_multi_operation_atomic_ack<F: ProviderFactory>(factory: &F) {
     for _ in 0..3 {
         assert!(
             provider
-                .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+                .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
                 .await
                 .unwrap()
                 .is_some()
@@ -260,7 +266,7 @@ pub async fn test_multi_operation_atomic_ack<F: ProviderFactory>(factory: &F) {
     }
     assert!(
         provider
-            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .is_none()

@@ -311,6 +311,17 @@ pub struct RuntimeOptions {
     /// format regardless of this setting.
     /// Default: None
     pub worker_node_id: Option<String>,
+
+    /// Tag filter for worker activity routing.
+    ///
+    /// Controls which activities this runtime's worker slots will process:
+    /// - `DefaultOnly`: Only untagged activities (default)
+    /// - `Tags(["gpu"])`: Only activities tagged `"gpu"`
+    /// - `DefaultAnd(["gpu"])`: Both untagged and `"gpu"` activities
+    /// - `None`: Disable worker (orchestrator-only mode)
+    ///
+    /// Default: `TagFilter::DefaultOnly` (untagged activities only)
+    pub worker_tag_filter: crate::providers::TagFilter,
 }
 
 impl Default for RuntimeOptions {
@@ -335,6 +346,7 @@ impl Default for RuntimeOptions {
             session_cleanup_interval: Duration::from_secs(300), // 5 minutes
             max_sessions_per_runtime: 10,
             worker_node_id: None,
+            worker_tag_filter: crate::providers::TagFilter::default(),
         }
     }
 }
@@ -555,9 +567,16 @@ impl Runtime {
     }
 
     #[inline]
-    fn record_activity_execution(&self, activity_name: &str, outcome: &str, duration_seconds: f64, retry_attempt: u32) {
+    fn record_activity_execution(
+        &self,
+        activity_name: &str,
+        outcome: &str,
+        duration_seconds: f64,
+        retry_attempt: u32,
+        tag: Option<&str>,
+    ) {
         if let Some(provider) = self.metrics_provider() {
-            provider.record_activity_execution(activity_name, outcome, duration_seconds, retry_attempt);
+            provider.record_activity_execution(activity_name, outcome, duration_seconds, retry_attempt, tag);
         }
     }
 

@@ -169,8 +169,152 @@ async fn persistent_event_fifo_ordering() {
 
 /// Persistent event survives select cancellation — cancelled subscription doesn't consume the event.
 /// A new persistent wait for the same name should still receive it.
+///
+/// Case 1: Both events arrive in the SAME orchestration turn (before terminal).
+/// The unmatched "extra" event is materialized into history as QueueEventDelivered
+/// but consumed by no subscription — it sits as an audit trail.
+///
+/// To guarantee both events land in the same batch, we stop the dispatcher after
+/// phase 1 completes (2 subscriptions visible), enqueue both events while no
+/// dispatcher is running, then restart the dispatcher to process them together.
 #[tokio::test]
-async fn persistent_event_survives_select_cancellation() {
+async fn persistent_event_survives_select_cancellation_same_batch() {
+    let (store, _td) = common::create_sqlite_store_disk().await;
+
+    let make_orch = || {
+        |ctx: OrchestrationContext, _: String| async move {
+            // Phase 1: persistent wait loses to timer → cancelled
+            let wait1 = ctx.dequeue_event("Signal");
+            let timeout1 = ctx.schedule_timer(Duration::from_millis(50));
+            match ctx.select2(wait1, timeout1).await {
+                Either2::First(_) => return Ok("unexpected_phase1".to_string()),
+                Either2::Second(_) => {} // timer won
+            }
+
+            // Phase 2: new persistent wait for same name — should still resolve
+            let data = ctx.dequeue_event("Signal").await;
+            Ok(format!("got:{data}"))
+        }
+    };
+
+    let options = runtime::RuntimeOptions {
+        dispatcher_min_poll_interval: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    // Phase A: Start runtime, let orchestration progress through phase 1,
+    // then shut down so we can enqueue events without a racing dispatcher.
+    let rt = runtime::Runtime::start_with_options(
+        store.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder()
+            .register("TestOrch", make_orch())
+            .build(),
+        options.clone(),
+    )
+    .await;
+    let client = Client::new(store.clone());
+
+    client
+        .start_orchestration("inst-pers-cancel-same", "TestOrch", "")
+        .await
+        .unwrap();
+
+    // Wait for BOTH QueueSubscribed events (sub1 cancelled + sub2 active)
+    assert!(
+        common::wait_for_history(
+            store.clone(),
+            "inst-pers-cancel-same",
+            |hist| {
+                hist.iter()
+                    .filter(|e| matches!(&e.kind, EventKind::QueueSubscribed { name } if name == "Signal"))
+                    .count()
+                    >= 2
+            },
+            3000,
+        )
+        .await,
+        "Second QueueSubscribed was never registered"
+    );
+
+    // Stop the dispatcher — no more polling
+    rt.shutdown(None).await;
+
+    // Phase B: Enqueue both events while dispatcher is stopped.
+    // They sit in the orchestrator queue until we restart.
+    client
+        .enqueue_event("inst-pers-cancel-same", "Signal", "survived")
+        .await
+        .unwrap();
+    client
+        .enqueue_event("inst-pers-cancel-same", "Signal", "extra")
+        .await
+        .unwrap();
+
+    // Phase C: Restart runtime — dispatcher picks up both events in one batch
+    let rt2 = runtime::Runtime::start_with_options(
+        store.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder()
+            .register("TestOrch", make_orch())
+            .build(),
+        options,
+    )
+    .await;
+
+    let status = client
+        .wait_for_orchestration("inst-pers-cancel-same", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(
+        matches!(status, runtime::OrchestrationStatus::Completed { ref output, .. } if output == "got:survived"),
+        "Persistent event should survive cancelled subscription, got {:?}",
+        status
+    );
+
+    // Verify history: both events materialized, sub structure correct
+    let history = store.read("inst-pers-cancel-same").await.unwrap();
+
+    let has_cancel = history
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::QueueSubscriptionCancelled { reason } if reason == "dropped_future"));
+    assert!(
+        has_cancel,
+        "Missing QueueSubscriptionCancelled(dropped_future) for first wait"
+    );
+
+    // Both events MUST be in history — they were enqueued while the dispatcher was
+    // stopped, so they're guaranteed to be batched in the same completing turn.
+    let arrival_count = history
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::QueueEventDelivered { name, .. } if name == "Signal"))
+        .count();
+    assert_eq!(
+        arrival_count, 2,
+        "Both persistent events should be in history (same batch, dispatcher was stopped during enqueue)"
+    );
+
+    let active_sub_count = history
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::QueueSubscribed { name } if name == "Signal"))
+        .count();
+    let cancelled_sub_count = history
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::QueueSubscriptionCancelled { .. }))
+        .count();
+    assert_eq!(active_sub_count, 2, "Expected 2 total persistent subscriptions");
+    assert_eq!(cancelled_sub_count, 1, "Expected 1 cancelled persistent subscription");
+
+    rt2.shutdown(None).await;
+}
+
+/// Persistent event survives select cancellation — late-arriving unmatched event.
+///
+/// Case 2: The unmatched "extra" event arrives AFTER the orchestration is terminal.
+/// The dispatcher's terminal bail path acks and discards it without recording
+/// it in history, so only 1 QueueEventDelivered appears.
+#[tokio::test]
+async fn persistent_event_survives_select_cancellation_late_extra_discarded() {
     let (store, _td) = common::create_sqlite_store_disk().await;
 
     let orch = |ctx: OrchestrationContext, _: String| async move {
@@ -200,25 +344,36 @@ async fn persistent_event_survives_select_cancellation() {
     let client = Client::new(store.clone());
 
     client
-        .start_orchestration("inst-pers-cancel", "TestOrch", "")
+        .start_orchestration("inst-pers-cancel-late", "TestOrch", "")
         .await
         .unwrap();
 
-    // Wait for phase 1 to settle (timer fires, subscription cancelled)
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for both subscriptions to be registered
+    assert!(
+        common::wait_for_history(
+            store.clone(),
+            "inst-pers-cancel-late",
+            |hist| {
+                hist.iter()
+                    .filter(|e| matches!(&e.kind, EventKind::QueueSubscribed { name } if name == "Signal"))
+                    .count()
+                    >= 2
+            },
+            3000,
+        )
+        .await,
+        "Second QueueSubscribed was never registered"
+    );
 
-    // Raise event — should go to phase 2's active subscription, not the cancelled one
+    // Send ONLY "survived" — this completes the orchestration
     client
-        .enqueue_event("inst-pers-cancel", "Signal", "survived")
-        .await
-        .unwrap();
-    client
-        .enqueue_event("inst-pers-cancel", "Signal", "extra")
+        .enqueue_event("inst-pers-cancel-late", "Signal", "survived")
         .await
         .unwrap();
 
+    // Wait for orchestration to complete BEFORE sending extra
     let status = client
-        .wait_for_orchestration("inst-pers-cancel", Duration::from_secs(5))
+        .wait_for_orchestration("inst-pers-cancel-late", Duration::from_secs(5))
         .await
         .unwrap();
     assert!(
@@ -227,8 +382,18 @@ async fn persistent_event_survives_select_cancellation() {
         status
     );
 
-    // Verify: first subscription was cancelled, second consumed "survived", "extra" left unmatched
-    let history = store.read("inst-pers-cancel").await.unwrap();
+    // NOW send "extra" — orchestration is already terminal
+    client
+        .enqueue_event("inst-pers-cancel-late", "Signal", "extra")
+        .await
+        .unwrap();
+
+    // Give the dispatcher time to pick up and discard the late message
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify history: only 1 event materialized — "extra" was discarded by terminal bail path
+    let history = store.read("inst-pers-cancel-late").await.unwrap();
+
     let has_cancel = history
         .iter()
         .any(|e| matches!(&e.kind, EventKind::QueueSubscriptionCancelled { reason } if reason == "dropped_future"));
@@ -237,13 +402,14 @@ async fn persistent_event_survives_select_cancellation() {
         "Missing QueueSubscriptionCancelled(dropped_future) for first wait"
     );
 
-    // Only one of the two events should have been consumed (by the active subscription).
-    // Count persistent arrivals and persistent subscriptions to verify.
     let arrival_count = history
         .iter()
         .filter(|e| matches!(&e.kind, EventKind::QueueEventDelivered { name, .. } if name == "Signal"))
         .count();
-    assert_eq!(arrival_count, 2, "Both persistent events should be in history");
+    assert_eq!(
+        arrival_count, 1,
+        "Only 'survived' should be in history — 'extra' arrived after terminal and was discarded"
+    );
 
     let active_sub_count = history
         .iter()
@@ -253,7 +419,6 @@ async fn persistent_event_survives_select_cancellation() {
         .iter()
         .filter(|e| matches!(&e.kind, EventKind::QueueSubscriptionCancelled { .. }))
         .count();
-    // 2 subscriptions total, 1 cancelled → only 1 active → only 1 event consumed
     assert_eq!(active_sub_count, 2, "Expected 2 total persistent subscriptions");
     assert_eq!(cancelled_sub_count, 1, "Expected 1 cancelled persistent subscription");
 
@@ -908,7 +1073,13 @@ async fn multi_queue_isolation_and_independent_fifo() {
         runtime::Runtime::start_with_options(store.clone(), activity_registry, orchestration_registry, options).await;
     let client = Client::new(store.clone());
 
-    // Enqueue messages across queues in interleaved order BEFORE starting orchestration.
+    // Start orchestration FIRST — events enqueued before start are dropped as orphans.
+    client
+        .start_orchestration("inst-multi-q", "MultiQueue", "")
+        .await
+        .unwrap();
+
+    // Enqueue messages across queues in interleaved order.
     // This tests that buffered messages are matched to the correct queue by name,
     // not by arrival order across all queues.
     client
@@ -932,12 +1103,6 @@ async fn multi_queue_isolation_and_independent_fifo() {
         .await
         .unwrap();
 
-    // Start orchestration — all five messages are already buffered
-    client
-        .start_orchestration("inst-multi-q", "MultiQueue", "")
-        .await
-        .unwrap();
-
     let status = client
         .wait_for_orchestration("inst-multi-q", Duration::from_secs(5))
         .await
@@ -958,6 +1123,9 @@ async fn multi_queue_isolation_and_independent_fifo() {
 /// Multiple queues with staggered delivery: some messages arrive before the
 /// orchestration subscribes, others arrive after. Verifies that per-queue FIFO
 /// is maintained regardless of timing relative to subscription creation.
+///
+/// Note: `start_orchestration` must come before `enqueue_event` — events
+/// enqueued before the orchestration exists are dropped as orphans.
 #[tokio::test]
 async fn multi_queue_staggered_delivery() {
     let (store, _td) = common::create_sqlite_store_disk().await;
@@ -991,7 +1159,14 @@ async fn multi_queue_staggered_delivery() {
         runtime::Runtime::start_with_options(store.clone(), activity_registry, orchestration_registry, options).await;
     let client = Client::new(store.clone());
 
-    // Pre-buffer: two commands and one status
+    // Start the orchestration FIRST, then buffer events.
+    // Events enqueued before start_orchestration are dropped as orphans.
+    client
+        .start_orchestration("inst-staggered-q", "StaggeredQ", "")
+        .await
+        .unwrap();
+
+    // Buffer events: two commands and one status arrive before orchestration subscribes
     client
         .enqueue_event("inst-staggered-q", "commands", "c1")
         .await
@@ -1001,11 +1176,6 @@ async fn multi_queue_staggered_delivery() {
         .await
         .unwrap();
     client.enqueue_event("inst-staggered-q", "status", "s1").await.unwrap();
-
-    client
-        .start_orchestration("inst-staggered-q", "StaggeredQ", "")
-        .await
-        .unwrap();
 
     // Wait for the orchestration to progress past the first dequeue + activity,
     // then send the second status message
@@ -1024,6 +1194,73 @@ async fn multi_queue_staggered_delivery() {
     match status {
         runtime::OrchestrationStatus::Completed { output, .. } => {
             assert_eq!(output, "cmd:c1,c2|stat:s1,s2");
+        }
+        other => panic!("Expected Completed, got: {other:?}"),
+    }
+
+    rt.shutdown(None).await;
+}
+
+/// Events enqueued before `start_orchestration` are dropped as orphans.
+///
+/// The provider detects QueueMessage items for a non-existent instance
+/// and deletes them with a warning. The orchestration never sees them.
+#[tokio::test]
+async fn events_enqueued_before_start_orchestration_are_dropped() {
+    let (store, _td) = common::create_sqlite_store_disk().await;
+
+    let orch = |ctx: OrchestrationContext, _: String| async move {
+        // Race dequeue against a short timer — if the pre-start event was
+        // correctly dropped, the timer wins.
+        let event = ctx.dequeue_event("pre-start-q");
+        let timeout = ctx.schedule_timer(Duration::from_millis(500));
+
+        match ctx.select2(event, timeout).await {
+            Either2::First(data) => Ok(format!("unexpected:{data}")),
+            Either2::Second(()) => {
+                // Now enqueue a post-start event and verify it DOES arrive
+                Ok("timeout_as_expected".to_string())
+            }
+        }
+    };
+
+    let orchestration_registry = OrchestrationRegistry::builder().register("OrphanTest", orch).build();
+    let activity_registry = ActivityRegistry::builder().build();
+
+    let options = runtime::RuntimeOptions {
+        dispatcher_min_poll_interval: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let rt =
+        runtime::Runtime::start_with_options(store.clone(), activity_registry, orchestration_registry, options).await;
+    let client = Client::new(store.clone());
+
+    // Enqueue event BEFORE the orchestration exists — should be dropped
+    client
+        .enqueue_event("inst-orphan", "pre-start-q", "should-be-dropped")
+        .await
+        .unwrap();
+
+    // Small delay to let the provider poll and drop the orphan
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Now start the orchestration
+    client
+        .start_orchestration("inst-orphan", "OrphanTest", "")
+        .await
+        .unwrap();
+
+    let status = client
+        .wait_for_orchestration("inst-orphan", Duration::from_secs(5))
+        .await
+        .unwrap();
+    match status {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(
+                output, "timeout_as_expected",
+                "Pre-start event should have been dropped; dequeue should have timed out"
+            );
         }
         other => panic!("Expected Completed, got: {other:?}"),
     }

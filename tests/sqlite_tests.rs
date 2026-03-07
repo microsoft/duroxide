@@ -3,7 +3,7 @@
 #![allow(clippy::expect_used)]
 
 use duroxide::providers::sqlite::SqliteProvider;
-use duroxide::providers::{ExecutionMetadata, Provider, ProviderAdmin, WorkItem};
+use duroxide::providers::{ExecutionMetadata, Provider, ProviderAdmin, TagFilter, WorkItem};
 use duroxide::{ActivityContext, Event, EventKind};
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,6 +101,7 @@ async fn test_sqlite_provider_basic() {
                 name: "TestActivity".to_string(),
                 input: "test-input".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];
@@ -288,6 +289,7 @@ async fn test_sqlite_basic_persistence() {
                 name: "TestActivity".to_string(),
                 input: "test-input".to_string(),
                 session_id: None,
+                tag: None,
             })
             .await
             .expect("Failed to enqueue worker work");
@@ -300,6 +302,7 @@ async fn test_sqlite_basic_persistence() {
                 name: "TestActivity2".to_string(),
                 input: "test-input-2".to_string(),
                 session_id: None,
+                tag: None,
             })
             .await
             .expect("Failed to enqueue worker work 2");
@@ -317,7 +320,7 @@ async fn test_sqlite_basic_persistence() {
 
         // Dequeue and verify items
         let (item1, token1, _) = store
-            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
             .await
             .expect("Fetch should succeed")
             .expect("Should have first item");
@@ -330,7 +333,7 @@ async fn test_sqlite_basic_persistence() {
         }
 
         let (item2, token2, _) = store
-            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
             .await
             .expect("Fetch should succeed")
             .expect("Should have second item");
@@ -371,7 +374,7 @@ async fn test_sqlite_basic_persistence() {
         // Verify no more items
         assert!(
             store
-                .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+                .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -623,6 +626,7 @@ async fn test_sqlite_provider_transactional() {
                 name: "Activity1".to_string(),
                 input: "{}".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
         Event::with_event_id(
@@ -634,6 +638,7 @@ async fn test_sqlite_provider_transactional() {
                 name: "Activity2".to_string(),
                 input: "{}".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
         Event::with_event_id(
@@ -645,6 +650,7 @@ async fn test_sqlite_provider_transactional() {
                 name: "Activity3".to_string(),
                 input: "{}".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];
@@ -657,6 +663,7 @@ async fn test_sqlite_provider_transactional() {
             name: "Activity1".to_string(),
             input: "{}".to_string(),
             session_id: None,
+            tag: None,
         },
         WorkItem::ActivityExecute {
             instance: instance.to_string(),
@@ -665,6 +672,7 @@ async fn test_sqlite_provider_transactional() {
             name: "Activity2".to_string(),
             input: "{}".to_string(),
             session_id: None,
+            tag: None,
         },
         WorkItem::ActivityExecute {
             instance: instance.to_string(),
@@ -673,6 +681,7 @@ async fn test_sqlite_provider_transactional() {
             name: "Activity3".to_string(),
             input: "{}".to_string(),
             session_id: None,
+            tag: None,
         },
     ];
 
@@ -697,7 +706,7 @@ async fn test_sqlite_provider_transactional() {
     // Verify all worker items enqueued
     let mut worker_count = 0;
     while let Some((work_item, token, _)) = store
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
     {
@@ -835,6 +844,7 @@ async fn test_execution_status_running() {
                 name: "TestActivity".to_string(),
                 input: "test".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];

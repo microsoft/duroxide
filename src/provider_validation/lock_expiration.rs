@@ -1,5 +1,6 @@
 use crate::provider_validation::{Event, EventKind, ExecutionMetadata, WorkItem, start_item};
 use crate::provider_validations::ProviderFactory;
+use crate::providers::TagFilter;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -248,7 +249,7 @@ pub async fn test_worker_lock_renewal_success<F: ProviderFactory>(factory: &F) {
     let provider = factory.create_provider().await;
     let lock_timeout = provider_lock_timeout(factory);
 
-    use crate::providers::WorkItem;
+    use crate::providers::{TagFilter, WorkItem};
 
     // Enqueue and fetch work item
     provider
@@ -259,12 +260,13 @@ pub async fn test_worker_lock_renewal_success<F: ProviderFactory>(factory: &F) {
             name: "TestActivity".to_string(),
             input: "test".to_string(),
             session_id: None,
+            tag: None,
         })
         .await
         .unwrap();
 
     let (_item, token, _) = provider
-        .fetch_work_item(lock_timeout, Duration::ZERO, None)
+        .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -273,7 +275,7 @@ pub async fn test_worker_lock_renewal_success<F: ProviderFactory>(factory: &F) {
     // Verify item is locked (can't fetch again)
     assert!(
         provider
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .is_none()
@@ -289,7 +291,7 @@ pub async fn test_worker_lock_renewal_success<F: ProviderFactory>(factory: &F) {
     // Item should still be locked
     assert!(
         provider
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .is_none()
@@ -318,7 +320,7 @@ pub async fn test_worker_lock_renewal_after_expiration<F: ProviderFactory>(facto
     tracing::info!("→ Testing worker lock renewal: renewal fails after expiration");
     let provider = factory.create_provider().await;
 
-    use crate::providers::WorkItem;
+    use crate::providers::{TagFilter, WorkItem};
 
     // Enqueue and fetch work item with short timeout
     provider
@@ -329,13 +331,14 @@ pub async fn test_worker_lock_renewal_after_expiration<F: ProviderFactory>(facto
             name: "TestActivity".to_string(),
             input: "test".to_string(),
             session_id: None,
+            tag: None,
         })
         .await
         .unwrap();
 
     let short_timeout = Duration::from_secs(1);
     let (_item, token, _) = provider
-        .fetch_work_item(short_timeout, Duration::ZERO, None)
+        .fetch_work_item(short_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -358,7 +361,7 @@ pub async fn test_worker_lock_renewal_extends_timeout<F: ProviderFactory>(factor
     let lock_timeout = factory.lock_timeout();
 
     use crate::provider_validation::start_item;
-    use crate::providers::{ExecutionMetadata, WorkItem};
+    use crate::providers::{ExecutionMetadata, TagFilter, WorkItem};
     use crate::{Event, EventKind, INITIAL_EVENT_ID, INITIAL_EXECUTION_ID};
 
     let instance = "test-lock-renewal-extends";
@@ -382,6 +385,7 @@ pub async fn test_worker_lock_renewal_extends_timeout<F: ProviderFactory>(factor
         name: "TestActivity".to_string(),
         input: "test".to_string(),
         session_id: None,
+        tag: None,
     };
 
     // Ack with Running status and enqueue the activity
@@ -418,7 +422,7 @@ pub async fn test_worker_lock_renewal_extends_timeout<F: ProviderFactory>(factor
 
     // 2. Fetch the activity work item
     let (_item, token, _) = provider
-        .fetch_work_item(lock_timeout, Duration::ZERO, None)
+        .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -441,7 +445,7 @@ pub async fn test_worker_lock_renewal_extends_timeout<F: ProviderFactory>(factor
 
     // Item should still be locked (we're at 1.0x, renewal extended to 1.6x)
     let result = provider
-        .fetch_work_item(lock_timeout, Duration::ZERO, None)
+        .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
     assert!(result.is_none(), "Item should still be locked after renewal");
@@ -455,7 +459,7 @@ pub async fn test_worker_lock_renewal_after_ack<F: ProviderFactory>(factory: &F)
     tracing::info!("→ Testing worker lock renewal: renewal fails after ack");
     let provider = factory.create_provider().await;
 
-    use crate::providers::WorkItem;
+    use crate::providers::{TagFilter, WorkItem};
 
     // Enqueue and fetch work item
     provider
@@ -466,13 +470,14 @@ pub async fn test_worker_lock_renewal_after_ack<F: ProviderFactory>(factory: &F)
             name: "TestActivity".to_string(),
             input: "test".to_string(),
             session_id: None,
+            tag: None,
         })
         .await
         .unwrap();
 
     let lock_timeout = factory.lock_timeout();
     let (_item, token, _) = provider
-        .fetch_work_item(lock_timeout, Duration::ZERO, None)
+        .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -515,13 +520,14 @@ pub async fn test_abandon_work_item_releases_lock<F: ProviderFactory>(factory: &
             name: "TestActivity".to_string(),
             input: "test".to_string(),
             session_id: None,
+            tag: None,
         })
         .await
         .unwrap();
 
     // Fetch the work item
     let (item, token, _) = provider
-        .fetch_work_item(lock_timeout, Duration::ZERO, None)
+        .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -530,7 +536,7 @@ pub async fn test_abandon_work_item_releases_lock<F: ProviderFactory>(factory: &
     // Verify lock is held - no items available
     assert!(
         provider
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .is_none(),
@@ -542,7 +548,7 @@ pub async fn test_abandon_work_item_releases_lock<F: ProviderFactory>(factory: &
 
     // Item should be immediately available again
     let (item2, token2, _) = provider
-        .fetch_work_item(lock_timeout, Duration::ZERO, None)
+        .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -582,13 +588,14 @@ pub async fn test_abandon_work_item_with_delay<F: ProviderFactory>(factory: &F) 
             name: "TestActivity".to_string(),
             input: "test".to_string(),
             session_id: None,
+            tag: None,
         })
         .await
         .unwrap();
 
     // Fetch the work item
     let (_item, token, _) = provider
-        .fetch_work_item(lock_timeout, Duration::ZERO, None)
+        .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -600,7 +607,7 @@ pub async fn test_abandon_work_item_with_delay<F: ProviderFactory>(factory: &F) 
     // Item should NOT be immediately available (delayed)
     assert!(
         provider
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .is_none(),
@@ -612,7 +619,7 @@ pub async fn test_abandon_work_item_with_delay<F: ProviderFactory>(factory: &F) 
 
     // Now item should be available
     let (item2, token2, _) = provider
-        .fetch_work_item(lock_timeout, Duration::ZERO, None)
+        .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -650,13 +657,14 @@ pub async fn test_worker_ack_fails_after_lock_expiry<F: ProviderFactory>(factory
             name: "TestActivity".to_string(),
             input: "test".to_string(),
             session_id: None,
+            tag: None,
         })
         .await
         .unwrap();
 
     let short_timeout = Duration::from_secs(1);
     let (_item, token, _) = provider
-        .fetch_work_item(short_timeout, Duration::ZERO, None)
+        .fetch_work_item(short_timeout, Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -680,7 +688,7 @@ pub async fn test_worker_ack_fails_after_lock_expiry<F: ProviderFactory>(factory
 
     // The item should still be in the queue (not deleted) and refetchable
     let refetch = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
     assert!(

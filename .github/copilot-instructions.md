@@ -18,6 +18,15 @@ cargo nt --test specific_test_file    # Run specific test file
 
 Only fall back to `cargo test` if nextest is not available. Never use `cargo test` when `cargo nt` works.
 
+## ⚠️ CRITICAL: Flaky Tests
+
+**NEVER dismiss a failing test as a "pre-existing flake" and move on.** Flaky tests block progress and must be investigated.
+
+- When a failure is **unrelated to current changes**, state that explicitly — then offer to investigate the root cause and fix it.
+- **Always investigate deeply**: trace the exact code path, build a plausible theory for the failure mechanism, and propose a concrete fix.
+- Do not hand-wave "timing" or "contention" as an explanation without proving the specific race condition.
+- A test that passes in isolation but fails under parallel execution has a real bug — either in the test (ordering assumptions, shared state) or in the runtime (contention handling).
+
 ## Architecture Overview
 
 **Two-queue message-driven runtime:**

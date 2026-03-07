@@ -170,24 +170,34 @@ ActivityRegistry::builder()
 RuntimeOptions::default()
 
 // Explicit default only
-RuntimeOptions::default()
-    .with_worker_tags(TagFilter::default_only())
+RuntimeOptions {
+    worker_tag_filter: TagFilter::default_only(),
+    ..Default::default()
+}
 
 // Only specific tags (NOT default)
-RuntimeOptions::default()
-    .with_worker_tags(TagFilter::tags(["gpu", "high-memory"]))
+RuntimeOptions {
+    worker_tag_filter: TagFilter::tags(["gpu", "high-memory"]),
+    ..Default::default()
+}
 
 // Default + specific tags
-RuntimeOptions::default()
-    .with_worker_tags(TagFilter::default_and(["gpu"]))
+RuntimeOptions {
+    worker_tag_filter: TagFilter::default_and(["gpu"]),
+    ..Default::default()
+}
 
-// Multi-tag worker (up to 5 tags)
-RuntimeOptions::default()
-    .with_worker_tags(TagFilter::tags(["gpu", "llm", "video-encode"]))
+// All activities regardless of tag (generalist/drain worker)
+RuntimeOptions {
+    worker_tag_filter: TagFilter::Any,
+    ..Default::default()
+}
 
 // No activities - orchestrator-only mode
-RuntimeOptions::default()
-    .with_worker_tags(TagFilter::none())
+RuntimeOptions {
+    worker_tag_filter: TagFilter::None,
+    ..Default::default()
+}
 ```
 
 ### Scheduling with Tags
@@ -284,12 +294,15 @@ pub enum TagFilter {
     DefaultOnly,
     
     /// Process only activities with the specified tags (NOT default).
-    /// Limited to MAX_WORKER_TAGS (5) tags.
+    /// Limited to MAX_WORKER_TAGS (5) tags. Must be non-empty.
     Tags(HashSet<String>),
     
     /// Process activities with no tag AND the specified tags.
-    /// Limited to MAX_WORKER_TAGS (5) tags.
+    /// Limited to MAX_WORKER_TAGS (5) tags. Must be non-empty.
     DefaultAnd(HashSet<String>),
+    
+    /// Process all activities regardless of tag (generalist worker).
+    Any,
     
     /// Don't process any activities (orchestrator-only mode).
     None,
@@ -345,6 +358,7 @@ impl TagFilter {
     
     pub fn matches(&self, tag: Option<&str>) -> bool {
         match (self, tag) {
+            (TagFilter::Any, _) => true,
             (TagFilter::None, _) => false,
             (TagFilter::DefaultOnly, None) => true,
             (TagFilter::DefaultOnly, Some(_)) => false,
@@ -529,7 +543,7 @@ Note: No changes to `ActivityRegistry` — tags are not stored at registration.
 ALTER TABLE worker_queue ADD COLUMN tag TEXT;
 
 -- Index for efficient tag filtering
-CREATE INDEX IF NOT EXISTS idx_worker_tag ON worker_queue(tag, visible_at, lock_token);
+CREATE INDEX IF NOT EXISTS idx_worker_tag ON worker_queue(tag);
 ```
 
 ### Provider Trait Changes
@@ -612,27 +626,20 @@ pub struct RuntimeOptions {
     
     /// Tag filter for worker dispatcher.
     /// Default: `TagFilter::DefaultOnly`
-    pub worker_tags: TagFilter,
-}
-
-impl RuntimeOptions {
-    pub fn with_worker_tags(mut self, filter: TagFilter) -> Self {
-        self.worker_tags = filter;
-        self
-    }
+    pub worker_tag_filter: TagFilter,
 }
 ```
 
 ### Worker Dispatcher
 
-Pass `&rt.options.worker_tags` to `fetch_work_item`:
+Pass `&rt.options.worker_tag_filter` to `fetch_work_item`:
 
 ```rust
 let (item, token, attempt_count) = match rt.history_store.fetch_work_item(
     rt.options.worker_lock_timeout,
     rt.options.dispatcher_long_poll_timeout,
     session_config.as_ref(),
-    &rt.options.worker_tags,  // NEW
+    &rt.options.worker_tag_filter,  // NEW
 ).await? { ... };
 ```
 
@@ -692,9 +699,9 @@ Operators should monitor queue depth by tag to detect stranded activities proact
 ### Metrics
 
 ```rust
-duroxide_activity_started_total{activity_name="GPUInference", tag="gpu"}
-duroxide_activity_completed_total{activity_name="SendEmail", tag="default"}
-duroxide_activity_duration_seconds{activity_name="Process", tag="worker-001"}
+duroxide_activity_executions_total{activity_name="GPUInference", outcome="success", tag="gpu"}
+duroxide_activity_duration_seconds{activity_name="SendEmail", outcome="success", tag="default"}
+duroxide_activity_duration_seconds{activity_name="Process", outcome="app_error", tag="worker-001"}
 ```
 
 ### Tracing
@@ -727,7 +734,7 @@ impl ActivityContext {
 | Scenario | Behavior |
 |----------|----------|
 | Existing activity registration | No change needed |
-| Existing RuntimeOptions | `worker_tags` = `TagFilter::DefaultOnly` |
+| Existing RuntimeOptions | `worker_tag_filter` = `TagFilter::DefaultOnly` |
 | Existing orchestration code | No `.with_tag()` = None (default queue) |
 | Old events without `tag` field | Deserialize as `tag: None` via `#[serde(default)]` |
 | Existing Provider implementations | Must update `fetch_work_item` signature |
@@ -822,8 +829,10 @@ let build_runtime = Runtime::start_with_options(
     store.clone(),
     Arc::new(build_activities),
     OrchestrationRegistry::builder().build(),
-    RuntimeOptions::default()
-        .with_worker_tags(TagFilter::tags(["build-machine"])),
+    RuntimeOptions {
+        worker_tag_filter: TagFilter::tags(["build-machine"]),
+        ..Default::default()
+    },
 ).await;
 
 // === DEFAULT WORKER (general purpose) ===
@@ -1021,12 +1030,12 @@ let general_runtime = Runtime::start_with_options(
 3. Add `tag: Option<String>` to `EventKind::ActivityScheduled` in `src/lib.rs`
 4. Add `tag: Option<String>` to `WorkItem::ActivityExecute` in `src/providers/mod.rs`
 5. Implement `DurableFuture::with_tag()` (mutate-after-emit) in `src/lib.rs`
-6. Add `worker_tags: TagFilter` to `RuntimeOptions` in `src/runtime/mod.rs`
+6. Add `worker_tag_filter: TagFilter` to `RuntimeOptions` in `src/runtime/mod.rs`
 7. Update `Provider::fetch_work_item` signature — add `tag_filter` parameter
 8. Add SQLite migration `20240109000000_add_worker_tag.sql`
 9. Update SQLite `fetch_work_item` — compose tag filter in WHERE clause
 10. Update SQLite `ack_orchestration_item` — extract tag to `worker_queue` column
-11. Update worker dispatcher — pass `worker_tags` to `fetch_work_item`
+11. Update worker dispatcher — pass `worker_tag_filter` to `fetch_work_item`
 12. Update `action_to_event` in replay engine — propagate tag
 13. Update Action→WorkItem conversion in execution — propagate tag
 14. Add `tag` to `ActivityContext` and expose accessor
@@ -1048,7 +1057,7 @@ let general_runtime = Runtime::start_with_options(
 | `action_to_event` in `src/runtime/replay_engine.rs` | Propagate `tag` |
 | `CallActivity` match in `src/runtime/execution.rs` | Propagate `tag` to `WorkItem` |
 | `match_and_bind_schedule` in `src/runtime/replay_engine.rs` | Destructure `tag` in `ActivityScheduled` match |
-| Worker dispatcher `fetch_work_item` call in `src/runtime/dispatchers/worker.rs` | Add `&rt.options.worker_tags` |
+| Worker dispatcher `fetch_work_item` call in `src/runtime/dispatchers/worker.rs` | Add `&rt.options.worker_tag_filter` |
 | Every test calling `fetch_work_item` | Add `&TagFilter::DefaultOnly` parameter |
 | Every test constructing `ActivityScheduled` events | Add `tag: None` |
 | Every test constructing `WorkItem::ActivityExecute` | Add `tag: None` |
@@ -1142,26 +1151,25 @@ let general_runtime = Runtime::start_with_options(
 
 ### Phase 4: Runtime Wiring
 
-**Scope:** `RuntimeOptions.worker_tags`, worker dispatcher plumbing, `ActivityContext.tag()` accessor, observability. Tags are now fully functional end-to-end.
+**Scope:** `RuntimeOptions.worker_tag_filter`, worker dispatcher plumbing, `ActivityContext.tag()` accessor, observability. Tags are now fully functional end-to-end.
 
-- [ ] 4.1 Add `worker_tags: TagFilter` to `RuntimeOptions` in `src/runtime/mod.rs` (default `TagFilter::DefaultOnly`)
-- [ ] 4.2 Add `with_worker_tags(mut self, filter: TagFilter) -> Self` builder method
-- [ ] 4.3 Update worker dispatcher in `src/runtime/dispatchers/worker.rs` — pass `&rt.options.worker_tags` to `fetch_work_item`
-- [ ] 4.4 Add `tag: Option<String>` to `ActivityContext` in `src/lib.rs`, expose via `pub fn tag(&self) -> Option<&str>`
-- [ ] 4.5 Update worker dispatcher — plumb `tag` from `WorkItem::ActivityExecute` into `ActivityContext` construction
-- [ ] 4.6 Add `tag` label to activity metrics (`duroxide_activity_started_total`, `duroxide_activity_completed_total`, `duroxide_activity_duration_seconds`) — use `tag.as_deref().unwrap_or("default")`
-- [ ] 4.7 Add `tag` attribute to activity tracing spans in worker dispatcher
-- [ ] 4.8 Run: `cargo build --all-targets` — zero errors
-- [ ] 4.9 Run: `cargo nt` — all tests pass
-- [ ] 4.10 Run: `cargo clippy --all-targets --all-features` — zero warnings
+- [ ] 4.1 Add `worker_tag_filter: TagFilter` to `RuntimeOptions` in `src/runtime/mod.rs` (default `TagFilter::DefaultOnly`)
+- [ ] 4.2 Update worker dispatcher in `src/runtime/dispatchers/worker.rs` — pass `&rt.options.worker_tag_filter` to `fetch_work_item`
+- [ ] 4.3 Add `tag: Option<String>` to `ActivityContext` in `src/lib.rs`, expose via `pub fn tag(&self) -> Option<&str>`
+- [ ] 4.4 Update worker dispatcher — plumb `tag` from `WorkItem::ActivityExecute` into `ActivityContext` construction
+- [ ] 4.5 Add `tag` label to activity metrics (`duroxide_activity_executions_total`, `duroxide_activity_duration_seconds`) — use `tag.as_deref().unwrap_or("default")`
+- [ ] 4.6 Add `tag` attribute to activity tracing spans in worker dispatcher
+- [ ] 4.7 Run: `cargo build --all-targets` — zero errors
+- [ ] 4.8 Run: `cargo nt` — all tests pass
+- [ ] 4.9 Run: `cargo clippy --all-targets --all-features` — zero warnings
 
 **Phase 4 — Adversarial Code Review:**
-- [ ] Re-read worker dispatcher: Is `worker_tags` cloned or borrowed? Is it passed by reference to avoid unnecessary allocation per poll cycle?
+- [ ] Re-read worker dispatcher: Is `worker_tag_filter` cloned or borrowed? Is it passed by reference to avoid unnecessary allocation per poll cycle?
 - [ ] Re-read `ActivityContext` construction: Is `tag` threaded through from the `WorkItem` destructure? Or is it lost somewhere?
 - [ ] Check: Does `TagFilter::None` actually prevent the worker dispatcher from polling? Or does it poll and get `Ok(None)` every cycle? (Both work, but the short-circuit is more efficient)
 - [ ] Check: Are metrics labels consistent — does the tracing span use the same `tag` value as the metric label?
-- [ ] Check: Does `RuntimeOptions::default()` produce `worker_tags: TagFilter::DefaultOnly`?
-- [ ] Check: If observability feature is disabled (`#[cfg(feature = "observability")]`), do the metric/tracing additions compile out cleanly?
+- [ ] Check: Does `RuntimeOptions::default()` produce `worker_tag_filter: TagFilter::DefaultOnly`?
+- [ ] Check: If observability feature is disabled (`#[cfg(feature = "observability"])`), do the metric/tracing additions compile out cleanly?
 - [ ] List all problems found, fix them, re-run `cargo nt` and `cargo clippy`
 
 ---

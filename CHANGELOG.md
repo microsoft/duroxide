@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.22] - 2026-03-07
+
+**Release:** <https://crates.io/crates/duroxide/0.1.22>
+
+**Proposal:** [Activity Tags](https://github.com/microsoft/duroxide/blob/main/docs/proposals/activity-tags.md)
+
+### Added
+
+- **Activity tag routing for worker specialization** — Route activities to specialized
+  worker pools via `.with_tag("gpu")` on `DurableFuture`. Workers subscribe to tags via
+  `RuntimeOptions { worker_tag_filter: TagFilter::tags(["gpu"]) }`. Supports five filter
+  modes: `DefaultOnly`, `Tags`, `DefaultAnd`, `Any`, and `None` (orchestrator-only).
+  Tags compose with sessions, retry, join, select2, and cancellation.
+  - `TagFilter` type with `matches()`, constructor validation (1–5 tags, no empty sets)
+  - `MAX_WORKER_TAGS` (5) and `MAX_TAG_NAME_BYTES` (256) limits enforced at runtime
+  - `ActivityContext::tag()` accessor for activity handlers to inspect their routing tag
+  - SQLite migration adding `tag` column + index to `worker_queue`
+  - Provider trait `fetch_work_item()` extended with `tag_filter` parameter
+  - Tag included in replay determinism checks (tag mismatch → nondeterminism error)
+  - Tag propagated through `Action::CallActivity` → `EventKind::ActivityScheduled` → `WorkItem::ActivityExecute`
+  - `activity_tag` label added to activity metrics (`duroxide_activity_executions_total`,
+    `duroxide_activity_duration_seconds`)
+  - `activity_tag` span attribute on all worker tracing
+
+- **9 provider validation tests** for tag filtering (`src/provider_validation/tag_filtering.rs`)
+
+- **11 tag serde + e2e tests** in `tests/tag_serde_tests.rs`
+  (serde roundtrip, backward compat, routing, starvation timeout, dual-runtime cooperation,
+  oversized tag rejection, boundary tag, tag in `ActivityContext`, multi-worker separation)
+
+- **5 replay engine tests** for tag determinism (tag mismatch, tag change, tag removal → nondeterminism)
+
+- **3 e2e sample tests** in `tests/e2e_samples.rs`
+  (heterogeneous workers, starvation-safe timeout pattern, dual-runtime tag cooperation)
+
+- **Orphan event dropping test** (`events_enqueued_before_start_orchestration_are_dropped`)
+  in `tests/queue_event_tests.rs`
+
+### Fixed
+
+- **Flaky queue event tests** — `multi_queue_staggered_delivery` and
+  `multi_queue_isolation_and_independent_fifo` fixed by moving `start_orchestration` before
+  `enqueue_event` (events enqueued before orchestration start are dropped as orphans per 0.1.21).
+  `persistent_event_survives_select_cancellation` split into two deterministic tests:
+  same-batch (dispatcher stopped during enqueue) and late-extra-discarded (event after terminal).
+
+### Changed
+
+- `Provider::fetch_work_item()` signature now requires `tag_filter: &TagFilter` parameter
+  (**breaking for provider implementors**)
+- `WorkItem::ActivityExecute` gains `tag: Option<String>` field
+- `EventKind::ActivityScheduled` gains `tag: Option<String>` field (backward-compatible via `#[serde(default)]`)
+- `ActivityContext::new_with_cancellation()` gains `tag: Option<String>` parameter
+
+### Documentation
+
+- Updated ORCHESTRATION-GUIDE with activity tags section (routing, `.with_tag()`, `TagFilter` variants, starvation warning, replay determinism)
+- Updated provider-implementation-guide with `fetch_work_item` tag filtering, validation checklist
+- Updated provider-testing-guide with tag filtering test category (18th category, 166 tests)
+- Updated metrics-specification with `activity_tag` label on activity metrics
+- Updated activity-tags proposal to reflect implementation (`TagFilter::Any`, `worker_tag_filter` naming, empty-set rejection)
+- Added flaky test investigation policy to `.github/copilot-instructions.md`
+
 ## [0.1.21] - 2026-03-06
 
 **Release:** <https://crates.io/crates/duroxide/0.1.21>

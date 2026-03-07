@@ -1,6 +1,6 @@
 use crate::provider_validation::{Event, EventKind, ExecutionMetadata, start_item};
 use crate::provider_validations::ProviderFactory;
-use crate::providers::{ScheduledActivityIdentifier, WorkItem};
+use crate::providers::{ScheduledActivityIdentifier, TagFilter, WorkItem};
 use std::time::Duration;
 
 /// Test: Fetch Returns Running State for Active Orchestration
@@ -36,6 +36,7 @@ pub async fn test_fetch_returns_running_state_for_active_orchestration<F: Provid
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider
@@ -67,7 +68,7 @@ pub async fn test_fetch_returns_running_state_for_active_orchestration<F: Provid
 
     // 2. Fetch the activity work item
     let result = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
 
@@ -113,6 +114,7 @@ pub async fn test_fetch_returns_terminal_state_when_orchestration_completed<F: P
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider
@@ -155,7 +157,7 @@ pub async fn test_fetch_returns_terminal_state_when_orchestration_completed<F: P
 
     // 2. Fetch the activity work item
     let result = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
 
@@ -200,6 +202,7 @@ pub async fn test_fetch_returns_terminal_state_when_orchestration_failed<F: Prov
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider
@@ -246,7 +249,7 @@ pub async fn test_fetch_returns_terminal_state_when_orchestration_failed<F: Prov
 
     // 2. Fetch the activity work item
     let result = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
 
@@ -292,6 +295,7 @@ pub async fn test_fetch_returns_terminal_state_when_orchestration_continued_as_n
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider
@@ -334,7 +338,7 @@ pub async fn test_fetch_returns_terminal_state_when_orchestration_continued_as_n
 
     // 2. Fetch the activity work item
     let result = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
 
@@ -363,13 +367,14 @@ pub async fn test_fetch_returns_missing_state_when_instance_deleted<F: ProviderF
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider.enqueue_for_worker(activity_item).await.unwrap();
 
     // 2. Fetch the activity work item
     let result = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
 
@@ -413,6 +418,7 @@ pub async fn test_renew_returns_running_when_orchestration_active<F: ProviderFac
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider
@@ -444,7 +450,7 @@ pub async fn test_renew_returns_running_when_orchestration_active<F: ProviderFac
 
     // 2. Fetch activity to get lock token
     let (_, lock_token, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -488,6 +494,7 @@ pub async fn test_renew_returns_terminal_when_orchestration_completed<F: Provide
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider
@@ -519,7 +526,7 @@ pub async fn test_renew_returns_terminal_when_orchestration_completed<F: Provide
 
     // 2. Fetch activity to get lock token
     let (_, lock_token, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -600,12 +607,13 @@ pub async fn test_renew_returns_missing_when_instance_deleted<F: ProviderFactory
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
     provider.enqueue_for_worker(activity_item).await.unwrap();
 
     // 2. Fetch activity to get lock token
     let (_, lock_token, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -634,12 +642,13 @@ pub async fn test_ack_work_item_none_deletes_without_enqueue<F: ProviderFactory>
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
     provider.enqueue_for_worker(activity_item).await.unwrap();
 
     // 2. Fetch activity
     let (_, lock_token, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -649,7 +658,7 @@ pub async fn test_ack_work_item_none_deletes_without_enqueue<F: ProviderFactory>
 
     // 4. Verify worker queue is empty
     let result = provider
-        .fetch_work_item(Duration::from_millis(100), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_millis(100), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
     assert!(result.is_none(), "Worker queue should be empty");
@@ -710,6 +719,7 @@ pub async fn test_cancelled_activities_deleted_from_worker_queue<F: ProviderFact
         name: "Activity1".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
     let activity2 = WorkItem::ActivityExecute {
         instance: "inst-cancel-delete".to_string(),
@@ -718,6 +728,7 @@ pub async fn test_cancelled_activities_deleted_from_worker_queue<F: ProviderFact
         name: "Activity2".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
     let activity3 = WorkItem::ActivityExecute {
         instance: "inst-cancel-delete".to_string(),
@@ -726,6 +737,7 @@ pub async fn test_cancelled_activities_deleted_from_worker_queue<F: ProviderFact
         name: "Activity3".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider
@@ -757,7 +769,7 @@ pub async fn test_cancelled_activities_deleted_from_worker_queue<F: ProviderFact
 
     // 2. Verify all 3 activities are in worker queue (fetch one to confirm)
     let (_item1, token1, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .expect("Should have activity in queue");
@@ -813,7 +825,7 @@ pub async fn test_cancelled_activities_deleted_from_worker_queue<F: ProviderFact
 
     // 4. Verify only activity 3 remains in worker queue
     let (remaining_item, _, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .expect("Should have activity 3 remaining");
@@ -830,7 +842,7 @@ pub async fn test_cancelled_activities_deleted_from_worker_queue<F: ProviderFact
 
     // Verify no more activities
     let no_more = provider
-        .fetch_work_item(Duration::from_millis(100), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_millis(100), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
     assert!(no_more.is_none(), "Should have no more activities");
@@ -852,11 +864,12 @@ pub async fn test_ack_work_item_fails_when_entry_deleted<F: ProviderFactory>(fac
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
     provider.enqueue_for_worker(activity_item).await.unwrap();
 
     let (_, lock_token, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -899,11 +912,12 @@ pub async fn test_renew_fails_when_entry_deleted<F: ProviderFactory>(factory: &F
         name: "TestActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
     provider.enqueue_for_worker(activity_item).await.unwrap();
 
     let (_, lock_token, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -1020,6 +1034,7 @@ pub async fn test_batch_cancellation_deletes_multiple_activities<F: ProviderFact
             name: format!("Activity{i}"),
             input: "{}".to_string(),
             session_id: None,
+            tag: None,
         })
         .collect();
 
@@ -1092,7 +1107,7 @@ pub async fn test_batch_cancellation_deletes_multiple_activities<F: ProviderFact
 
     // 3. Verify worker queue is empty
     let remaining = provider
-        .fetch_work_item(Duration::from_millis(100), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_millis(100), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
     assert!(
@@ -1144,6 +1159,7 @@ pub async fn test_same_activity_in_worker_items_and_cancelled_is_noop<F: Provide
         name: "DroppedActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     let cancelled_activity = ScheduledActivityIdentifier {
@@ -1160,6 +1176,7 @@ pub async fn test_same_activity_in_worker_items_and_cancelled_is_noop<F: Provide
         name: "NormalActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     };
 
     // 4. Ack with the activity in BOTH worker_items and cancelled_activities
@@ -1193,7 +1210,7 @@ pub async fn test_same_activity_in_worker_items_and_cancelled_is_noop<F: Provide
 
     // 5. Verify only the normal activity (id=3) is in the worker queue
     let (remaining_item, remaining_token, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .expect("Should have the normal activity in queue");
@@ -1214,7 +1231,7 @@ pub async fn test_same_activity_in_worker_items_and_cancelled_is_noop<F: Provide
 
     // 6. Verify no more activities in queue
     let no_more = provider
-        .fetch_work_item(Duration::from_millis(100), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_millis(100), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
     assert!(
@@ -1258,6 +1275,7 @@ pub async fn test_orphan_activity_after_instance_force_deletion<F: ProviderFacto
         name: "TestActivity".to_string(),
         input: "test-input".to_string(),
         session_id: None,
+        tag: None,
     };
 
     provider
@@ -1311,7 +1329,7 @@ pub async fn test_orphan_activity_after_instance_force_deletion<F: ProviderFacto
     // 3. Activity should still be fetchable from the worker queue
     //    (worker queue rows may or may not survive deletion — both behaviors are valid)
     let work_item_result = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
 

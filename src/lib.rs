@@ -434,7 +434,7 @@ pub use runtime::{
 // Re-export management types for convenience
 pub use providers::{
     ExecutionInfo, InstanceInfo, ProviderAdmin, QueueDepths, ScheduledActivityIdentifier, SessionFetchConfig,
-    SystemMetrics,
+    SystemMetrics, TagFilter,
 };
 
 // Re-export capability filtering types
@@ -598,6 +598,67 @@ impl<T: Send + 'static> DurableFuture<T> {
         };
 
         DurableFuture::new(token, kind, ctx, mapped)
+    }
+
+    /// Set a routing tag on this scheduled activity.
+    ///
+    /// Tags direct activities to specialized workers. A worker configured with
+    /// [`crate::providers::TagFilter::tags`]`(["gpu"])` will only process activities
+    /// tagged `"gpu"`.
+    ///
+    /// This method uses **mutate-after-emit**: the action has already been emitted to
+    /// the context's action list, and `with_tag` reaches back to modify it in place.
+    /// This is safe because actions are not drained until the replay engine polls
+    /// the orchestration future (which hasn't happened yet — we're still inside the
+    /// user's `async` block).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a non-activity `DurableFuture` (e.g., timer or sub-orchestration).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use duroxide::OrchestrationContext;
+    /// # async fn example(ctx: OrchestrationContext) -> Result<String, String> {
+    /// let result = ctx.schedule_activity("CompileRelease", "repo-url")
+    ///     .with_tag("build-machine")
+    ///     .await?;
+    /// # Ok(result)
+    /// # }
+    /// ```
+    pub fn with_tag(self, tag: impl Into<String>) -> Self {
+        match &self.kind {
+            ScheduleKind::Activity { .. } => {}
+            other => panic!("with_tag() can only be called on activity futures, got {:?}", other),
+        }
+
+        let tag_value = tag.into();
+        let mut inner = self.ctx.inner.lock().expect("Mutex should not be poisoned");
+        // Find the action with our token and set its tag.
+        // The token must exist: it was just emitted by schedule_activity_internal
+        // and emitted_actions is only drained when the replay engine polls
+        // (which hasn't happened yet — we're still in the user's async block).
+        let mut found = false;
+        for (token, action) in inner.emitted_actions.iter_mut() {
+            if *token == self.token {
+                match action {
+                    Action::CallActivity { tag, .. } => {
+                        *tag = Some(tag_value);
+                    }
+                    _ => panic!("Token matched but action is not CallActivity"),
+                }
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "with_tag(): token {} not found in emitted_actions — actions were drained before with_tag() was called",
+            self.token
+        );
+        drop(inner);
+        self
     }
 }
 
@@ -1049,6 +1110,11 @@ pub enum EventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         session_id: Option<String>,
+        /// Routing tag for directing this activity to specific workers.
+        /// `None` means default (untagged) queue.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        tag: Option<String>,
     },
 
     /// Activity completed successfully with a result.
@@ -1395,6 +1461,9 @@ pub enum Action {
         /// Optional session ID for worker affinity routing.
         /// When set, the activity is routed to the worker owning this session.
         session_id: Option<String>,
+        /// Optional routing tag for directing this activity to specific workers.
+        /// Set via `.with_tag()` on the returned `DurableFuture`.
+        tag: Option<String>,
     },
     /// Create a timer that will fire at the specified absolute time.
     /// scheduling_event_id is the event_id of the TimerCreated event.
@@ -1931,6 +2000,8 @@ pub struct ActivityContext {
     worker_id: String,
     /// Optional session ID when scheduled via `schedule_activity_on_session`.
     session_id: Option<String>,
+    /// Optional routing tag when scheduled via `.with_tag()`.
+    tag: Option<String>,
     /// Cancellation token for cooperative cancellation.
     /// Triggered when the parent orchestration reaches a terminal state.
     cancellation_token: tokio_util::sync::CancellationToken,
@@ -1954,6 +2025,7 @@ impl ActivityContext {
         activity_id: u64,
         worker_id: String,
         session_id: Option<String>,
+        tag: Option<String>,
         cancellation_token: tokio_util::sync::CancellationToken,
         store: std::sync::Arc<dyn crate::providers::Provider>,
     ) -> Self {
@@ -1966,6 +2038,7 @@ impl ActivityContext {
             activity_id,
             worker_id,
             session_id,
+            tag,
             cancellation_token,
             store,
         }
@@ -2006,6 +2079,13 @@ impl ActivityContext {
     /// Returns `None` for regular activities scheduled via `schedule_activity`.
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Returns the routing tag if this activity was scheduled via `.with_tag()`.
+    ///
+    /// Returns `None` for activities scheduled without a tag.
+    pub fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
     }
 
     /// Emit an INFO level trace entry associated with this activity.
@@ -3207,6 +3287,7 @@ impl OrchestrationContext {
             name: name.clone(),
             input: input.clone(),
             session_id,
+            tag: None,
         });
         drop(inner);
 

@@ -63,6 +63,7 @@ mod tests {
                     name: "a1".to_string(),
                     input: "i1".to_string(),
                     session_id: None,
+                    tag: None,
                 },
             ),
             Event::with_event_id(
@@ -74,6 +75,7 @@ mod tests {
                     name: "a2".to_string(),
                     input: "i2".to_string(),
                     session_id: None,
+                    tag: None,
                 },
             ),
         ];
@@ -178,6 +180,7 @@ mod tests {
                     name: "test".to_string(),
                     input: "test".to_string(),
                     session_id: None,
+                    tag: None,
                 },
             ),
             Event::with_event_id(
@@ -333,6 +336,7 @@ mod tests {
                 name: "test-activity".to_string(),
                 input: "test-input".to_string(),
                 session_id: None,
+                tag: None,
             },
         ));
         engine.prep_completions(messages);
@@ -394,6 +398,7 @@ mod tests {
                     name: "test-activity".to_string(),
                     input: "activity-input".to_string(),
                     session_id: None,
+                    tag: None,
                 },
             ),
             Event::with_event_id(
@@ -429,6 +434,7 @@ mod tests {
                     name: "test".to_string(),
                     input: "input".to_string(),
                     session_id: None,
+                    tag: None,
                 },
             )],
         );
@@ -457,6 +463,7 @@ mod tests {
                 name: "test".to_string(),
                 input: "input".to_string(),
                 session_id: None,
+                tag: None,
             },
         )];
         assert!(engine.made_progress());

@@ -4,7 +4,7 @@
 //! should return immediately when no work is available. Providers that do support long polling
 //! should block for up to the specified timeout.
 
-use crate::providers::Provider;
+use crate::providers::{Provider, TagFilter};
 use std::time::{Duration, Instant};
 
 /// Test for SHORT POLLING providers: Verify fetch returns immediately when no work exists.
@@ -103,7 +103,7 @@ pub async fn test_short_poll_work_item_returns_immediately(provider: &dyn Provid
 
     let start = Instant::now();
     let result = provider
-        .fetch_work_item(lock_timeout, poll_timeout, None)
+        .fetch_work_item(lock_timeout, poll_timeout, None, &TagFilter::default())
         .await
         .expect("Fetch failed");
     let elapsed = start.elapsed();
@@ -127,7 +127,7 @@ pub async fn test_long_poll_work_item_waits_for_timeout(provider: &dyn Provider)
 
     let start = Instant::now();
     let result = provider
-        .fetch_work_item(lock_timeout, poll_timeout, None)
+        .fetch_work_item(lock_timeout, poll_timeout, None, &TagFilter::default())
         .await
         .expect("Fetch failed");
     let elapsed = start.elapsed();

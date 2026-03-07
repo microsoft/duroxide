@@ -21,6 +21,138 @@ use tracing::warn;
 
 use super::super::{HistoryManager, Runtime, WorkItemReader};
 
+/// Validate runtime limits on the history delta and fail the orchestration if any are exceeded.
+///
+/// Currently enforces:
+/// - Custom status size limit ([`crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES`])
+/// - Tag name size limit ([`crate::runtime::limits::MAX_TAG_NAME_BYTES`])
+///
+/// Returns `true` if a limit was violated (orchestration marked as failed).
+fn validate_limits(
+    history_delta: &[Event],
+    history_mgr: &mut HistoryManager,
+    metadata: &mut ExecutionMetadata,
+    worker_items: &mut Vec<WorkItem>,
+    orchestrator_items: &mut Vec<WorkItem>,
+    instance: &str,
+    execution_id: u64,
+) -> bool {
+    // --- Custom status size ---
+    let last_custom_status = history_delta.iter().rev().find_map(|e| {
+        if let EventKind::CustomStatusUpdated { status: Some(ref s) } = e.kind {
+            Some(s.clone())
+        } else {
+            None
+        }
+    });
+
+    if let Some(ref s) = last_custom_status
+        && s.len() > crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES
+    {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            custom_status_bytes = s.len(),
+            max_bytes = crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES,
+            "Custom status exceeds size limit, failing orchestration"
+        );
+        fail_orchestration_for_limit(
+            format!(
+                "Custom status size ({} bytes) exceeds limit ({} bytes)",
+                s.len(),
+                crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES,
+            ),
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+        );
+        return true;
+    }
+
+    // --- Tag name size ---
+    let oversized_tag = history_delta.iter().find_map(|e| {
+        if let EventKind::ActivityScheduled {
+            tag: Some(ref t),
+            ref name,
+            ..
+        } = e.kind
+        {
+            if t.len() > crate::runtime::limits::MAX_TAG_NAME_BYTES {
+                Some((name.clone(), t.len()))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
+    if let Some((ref activity_name, tag_len)) = oversized_tag {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            activity_name = %activity_name,
+            tag_bytes = tag_len,
+            max_bytes = crate::runtime::limits::MAX_TAG_NAME_BYTES,
+            "Activity tag exceeds size limit, failing orchestration"
+        );
+        fail_orchestration_for_limit(
+            format!(
+                "Activity '{}' tag size ({} bytes) exceeds limit ({} bytes)",
+                activity_name,
+                tag_len,
+                crate::runtime::limits::MAX_TAG_NAME_BYTES,
+            ),
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+        );
+        return true;
+    }
+
+    false
+}
+
+/// Shared helper to fail an orchestration due to a limit violation.
+fn fail_orchestration_for_limit(
+    message: String,
+    history_mgr: &mut HistoryManager,
+    metadata: &mut ExecutionMetadata,
+    worker_items: &mut Vec<WorkItem>,
+    orchestrator_items: &mut Vec<WorkItem>,
+    instance: &str,
+    execution_id: u64,
+) {
+    let error = crate::ErrorDetails::Application {
+        kind: crate::AppErrorKind::OrchestrationFailed,
+        message,
+        retryable: false,
+    };
+
+    let failed_event = Event::with_event_id(
+        history_mgr.next_event_id(),
+        instance,
+        execution_id,
+        None,
+        EventKind::OrchestrationFailed { details: error.clone() },
+    );
+    history_mgr.append(failed_event);
+
+    metadata.status = Some("Failed".to_string());
+    metadata.output = Some(error.display_message());
+
+    worker_items.clear();
+    orchestrator_items.clear();
+}
+
 /// Error returned when orchestration processing fails before execution
 #[derive(Debug)]
 pub(crate) enum OrchestrationProcessingError {
@@ -491,55 +623,16 @@ impl Runtime {
         let mut metadata =
             Runtime::compute_execution_metadata(&history_delta_snapshot, &orchestrator_items, item.execution_id);
 
-        // Enforce custom status size limit by scanning history_delta for the last CustomStatusUpdated event.
-        // If the user set a status that exceeds the limit, fail the orchestration.
-        let last_custom_status = history_delta_snapshot.iter().rev().find_map(|e| {
-            if let EventKind::CustomStatusUpdated { status: Some(ref s) } = e.kind {
-                Some(s.clone())
-            } else {
-                None
-            }
-        });
-
-        if let Some(ref s) = last_custom_status
-            && s.len() > crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES
-        {
-            tracing::error!(
-                target: "duroxide::runtime",
-                instance_id = %instance,
-                execution_id = %execution_id_for_ack,
-                custom_status_bytes = s.len(),
-                max_bytes = crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES,
-                "Custom status exceeds size limit, failing orchestration"
-            );
-
-            let error = crate::ErrorDetails::Application {
-                kind: crate::AppErrorKind::OrchestrationFailed,
-                message: format!(
-                    "Custom status size ({} bytes) exceeds limit ({} bytes)",
-                    s.len(),
-                    crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES,
-                ),
-                retryable: false,
-            };
-
-            let failed_event = Event::with_event_id(
-                history_mgr.next_event_id(),
-                instance,
-                execution_id_for_ack,
-                None,
-                EventKind::OrchestrationFailed { details: error.clone() },
-            );
-            history_mgr.append(failed_event);
-
-            // Override metadata to mark as failed
-            metadata.status = Some("Failed".to_string());
-            metadata.output = Some(error.display_message());
-
-            // Drop any worker/orchestrator items — the orchestration is dead
-            worker_items.clear();
-            orchestrator_items.clear();
-        }
+        // Enforce runtime limits (custom status size, tag name size, etc.)
+        validate_limits(
+            &history_delta_snapshot,
+            &mut history_mgr,
+            &mut metadata,
+            &mut worker_items,
+            &mut orchestrator_items,
+            instance,
+            execution_id_for_ack,
+        );
 
         // Calculate metrics
         let duration_seconds = start_time.elapsed().as_secs_f64();

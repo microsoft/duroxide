@@ -10,7 +10,7 @@ use tracing::debug;
 use super::{
     DeleteInstanceResult, DispatcherCapabilityFilter, ExecutionInfo, InstanceFilter, InstanceInfo, OrchestrationItem,
     Provider, ProviderAdmin, ProviderError, PruneOptions, PruneResult, QueueDepths, ScheduledActivityIdentifier,
-    SessionFetchConfig, SystemMetrics, WorkItem,
+    SessionFetchConfig, SystemMetrics, TagFilter, WorkItem,
 };
 use crate::{Event, EventKind};
 
@@ -388,7 +388,8 @@ impl SqliteProvider {
                 instance_id TEXT,
                 execution_id TEXT,
                 activity_id INTEGER,
-                session_id TEXT
+                session_id TEXT,
+                tag TEXT
             )
             "#,
         )
@@ -433,6 +434,11 @@ impl SqliteProvider {
             .execute(pool)
             .await?;
 
+        // Activity tag routing index
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_worker_queue_tag ON worker_queue(tag)")
+            .execute(pool)
+            .await?;
+
         // Sessions table for worker-affinity routing
         sqlx::query(
             r#"
@@ -470,6 +476,40 @@ impl SqliteProvider {
     /// Get future timestamp in milliseconds
     fn timestamp_after(duration: Duration) -> i64 {
         Self::now_millis() + duration.as_millis() as i64
+    }
+
+    /// Build a SQL WHERE clause fragment for tag filtering.
+    ///
+    /// Returns a SQL expression to be used as `AND ({clause})`.
+    /// Uses positional parameters that must be bound AFTER any existing parameters
+    /// in the query.
+    fn build_tag_clause(filter: &TagFilter, start_param: usize) -> String {
+        match filter {
+            TagFilter::DefaultOnly => "q.tag IS NULL".to_string(),
+            TagFilter::Tags(set) => {
+                let placeholders: Vec<_> = (0..set.len()).map(|i| format!("?{}", start_param + i)).collect();
+                format!("q.tag IN ({})", placeholders.join(", "))
+            }
+            TagFilter::DefaultAnd(set) => {
+                let placeholders: Vec<_> = (0..set.len()).map(|i| format!("?{}", start_param + i)).collect();
+                format!("(q.tag IS NULL OR q.tag IN ({}))", placeholders.join(", "))
+            }
+            TagFilter::Any => "1".to_string(),  // Always match
+            TagFilter::None => "0".to_string(), // Never match
+        }
+    }
+
+    /// Collect tag values for binding to positional parameters.
+    /// Returns a stable-ordered Vec of tag strings to bind.
+    fn collect_tag_values(filter: &TagFilter) -> Vec<String> {
+        match filter {
+            TagFilter::Tags(set) | TagFilter::DefaultAnd(set) => {
+                let mut v: Vec<String> = set.iter().cloned().collect();
+                v.sort(); // Stable ordering for deterministic bind order
+                v
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Read history within a transaction
@@ -1257,20 +1297,22 @@ impl Provider for SqliteProvider {
         let now_ms = Self::now_millis();
         for item in worker_items {
             // Extract identity fields from ActivityExecute
-            let (activity_instance, activity_execution_id, activity_id, session_id) = match &item {
+            let (activity_instance, activity_execution_id, activity_id, session_id, tag) = match &item {
                 WorkItem::ActivityExecute {
                     instance,
                     execution_id,
                     id,
                     session_id,
+                    tag,
                     ..
                 } => (
                     Some(instance.as_str()),
                     Some(*execution_id),
                     Some(*id),
                     session_id.as_deref(),
+                    tag.as_deref(),
                 ),
-                _ => (None, None, None, None),
+                _ => (None, None, None, None, None),
             };
 
             let work_item = serde_json::to_string(&item).map_err(|e| {
@@ -1278,8 +1320,8 @@ impl Provider for SqliteProvider {
             })?;
             sqlx::query(
                 r#"
-                INSERT INTO worker_queue (work_item, visible_at, instance_id, execution_id, activity_id, session_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO worker_queue (work_item, visible_at, instance_id, execution_id, activity_id, session_id, tag)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(work_item)
@@ -1288,6 +1330,7 @@ impl Provider for SqliteProvider {
             .bind(activity_execution_id.map(|e| e as i64))
             .bind(activity_id.map(|a| a as i64))
             .bind(session_id)
+            .bind(tag)
             .execute(&mut *tx)
             .await
             .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
@@ -1518,20 +1561,22 @@ impl Provider for SqliteProvider {
         tracing::debug!(target: "duroxide::providers::sqlite", ?item, "enqueue_for_worker");
 
         // Extract identity fields from ActivityExecute for cancellation support
-        let (activity_instance, activity_execution_id, activity_id, session_id) = match &item {
+        let (activity_instance, activity_execution_id, activity_id, session_id, tag) = match &item {
             WorkItem::ActivityExecute {
                 instance,
                 execution_id,
                 id,
                 session_id,
+                tag,
                 ..
             } => (
                 Some(instance.as_str()),
                 Some(*execution_id),
                 Some(*id),
                 session_id.as_deref(),
+                tag.as_deref(),
             ),
-            _ => (None, None, None, None),
+            _ => (None, None, None, None, None),
         };
 
         let work_item = serde_json::to_string(&item)
@@ -1540,8 +1585,8 @@ impl Provider for SqliteProvider {
 
         sqlx::query(
             r#"
-            INSERT INTO worker_queue (work_item, visible_at, instance_id, execution_id, activity_id, session_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO worker_queue (work_item, visible_at, instance_id, execution_id, activity_id, session_id, tag)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(work_item)
@@ -1550,6 +1595,7 @@ impl Provider for SqliteProvider {
         .bind(activity_execution_id.map(|e| e as i64))
         .bind(activity_id.map(|a| a as i64))
         .bind(session_id)
+        .bind(tag)
         .execute(&self.pool)
         .await
         .map_err(|e| Self::sqlx_to_provider_error("enqueue_for_worker", e))?;
@@ -1562,7 +1608,13 @@ impl Provider for SqliteProvider {
         lock_timeout: Duration,
         _poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
+        // TagFilter::None means this worker doesn't process any activities
+        if matches!(tag_filter, TagFilter::None) {
+            return Ok(None);
+        }
+
         let mut tx = self
             .pool
             .begin()
@@ -1579,15 +1631,17 @@ impl Provider for SqliteProvider {
 
         let now_ms = Self::now_millis();
 
+        // Build tag filter SQL clause
+        // Session path uses ?1 (now_ms), ?2 (owner_id) → tags start at ?3
+        // Non-session path uses ?1 (now_ms) → tags start at ?2
+        let tag_start_param = if session.is_some() { 3 } else { 2 };
+        let tag_clause = Self::build_tag_clause(tag_filter, tag_start_param);
+        let tag_values = Self::collect_tag_values(tag_filter);
+
         // Session-aware vs non-session fetch
         let next_item = if let Some(config) = session {
-            // Session-aware fetch: find eligible items considering session routing
-            // LEFT JOIN brings in the session row only if it has an active lock.
-            // Eligible items are:
-            // 1. Non-session items (q.session_id IS NULL)
-            // 2. Items for sessions owned by this worker (s.worker_id = our id)
-            // 3. Items for claimable sessions (no active session row → s.session_id IS NULL after join)
-            sqlx::query(
+            // Session-aware fetch with tag filtering
+            let sql = format!(
                 r#"
                 SELECT q.id, q.work_item, q.attempt_count, q.session_id
                 FROM worker_queue q
@@ -1599,31 +1653,40 @@ impl Provider for SqliteProvider {
                     OR s.worker_id = ?2
                     OR s.session_id IS NULL
                   )
+                  AND ({tag_clause})
                 ORDER BY q.id
                 LIMIT 1
                 "#,
-            )
-            .bind(now_ms)
-            .bind(&config.owner_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("fetch_work_item", e))?
+            );
+            let mut query = sqlx::query(&sql).bind(now_ms).bind(&config.owner_id);
+            for val in &tag_values {
+                query = query.bind(val.as_str());
+            }
+            query
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Self::sqlx_to_provider_error("fetch_work_item", e))?
         } else {
-            // Non-session fetch: only non-session items
-            sqlx::query(
+            // Non-session fetch with tag filtering
+            let sql = format!(
                 r#"
                 SELECT q.id, q.work_item, q.attempt_count, q.session_id FROM worker_queue q
                 WHERE q.visible_at <= ?1
                   AND (q.lock_token IS NULL OR q.locked_until <= ?1)
                   AND q.session_id IS NULL
+                  AND ({tag_clause})
                 ORDER BY q.id
                 LIMIT 1
                 "#,
-            )
-            .bind(now_ms)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("fetch_work_item", e))?
+            );
+            let mut query = sqlx::query(&sql).bind(now_ms);
+            for val in &tag_values {
+                query = query.bind(val.as_str());
+            }
+            query
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Self::sqlx_to_provider_error("fetch_work_item", e))?
         };
 
         if next_item.is_none() {
@@ -3153,6 +3216,7 @@ mod tests {
                     name: "Activity1".to_string(),
                     input: "{}".to_string(),
                     session_id: None,
+                    tag: None,
                 },
             ),
             Event::with_event_id(
@@ -3164,6 +3228,7 @@ mod tests {
                     name: "Activity2".to_string(),
                     input: "{}".to_string(),
                     session_id: None,
+                    tag: None,
                 },
             ),
         ];
@@ -3176,6 +3241,7 @@ mod tests {
                 name: "Activity1".to_string(),
                 input: "{}".to_string(),
                 session_id: None,
+                tag: None,
             },
             WorkItem::ActivityExecute {
                 instance: "test-atomic".to_string(),
@@ -3184,6 +3250,7 @@ mod tests {
                 name: "Activity2".to_string(),
                 input: "{}".to_string(),
                 session_id: None,
+                tag: None,
             },
         ];
 
@@ -3206,12 +3273,12 @@ mod tests {
 
         // Verify worker items enqueued
         let (work1, token1, _) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
         let (work2, token2, _) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -3222,7 +3289,7 @@ mod tests {
         // No more work
         assert!(
             store
-                .fetch_work_item(lock_timeout, Duration::ZERO, None)
+                .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -3496,13 +3563,14 @@ mod tests {
             name: "TestActivity".to_string(),
             input: "test-input".to_string(),
             session_id: None,
+            tag: None,
         };
 
         store.enqueue_for_worker(work_item.clone()).await.unwrap();
 
         // Dequeue it
         let (dequeued, token, _) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -3511,7 +3579,7 @@ mod tests {
         // Can't dequeue again while locked
         assert!(
             store
-                .fetch_work_item(lock_timeout, Duration::ZERO, None)
+                .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -3534,7 +3602,7 @@ mod tests {
         // Queue should be empty
         assert!(
             store
-                .fetch_work_item(lock_timeout, Duration::ZERO, None)
+                .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -3845,12 +3913,13 @@ mod tests {
             name: "TestActivity".to_string(),
             input: "test-input".to_string(),
             session_id: None,
+            tag: None,
         };
         store.enqueue_for_worker(work_item).await.unwrap();
 
         // Fetch and lock it
         let (_, lock_token, _) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -3858,7 +3927,7 @@ mod tests {
         // Verify it's locked (can't fetch again)
         assert!(
             store
-                .fetch_work_item(lock_timeout, Duration::ZERO, None)
+                .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -3869,7 +3938,7 @@ mod tests {
 
         // Should be able to fetch again
         let (dequeued2, lock_token2, _) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -3902,12 +3971,13 @@ mod tests {
             name: "TestActivity".to_string(),
             input: "test-input".to_string(),
             session_id: None,
+            tag: None,
         };
         store.enqueue_for_worker(work_item).await.unwrap();
 
         // First fetch: attempt_count should be 1
         let (_, lock_token1, attempt1) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -3918,7 +3988,7 @@ mod tests {
 
         // Second fetch: attempt_count should be 2
         let (_, lock_token2, attempt2) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -3929,7 +3999,7 @@ mod tests {
 
         // Third fetch: attempt_count should be 2 (1 + 1 from new fetch)
         let (_, _lock_token3, attempt3) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -4003,12 +4073,13 @@ mod tests {
             name: "TestActivity".to_string(),
             input: "test-input".to_string(),
             session_id: None,
+            tag: None,
         };
         store.enqueue_for_worker(work_item).await.unwrap();
 
         // First fetch: attempt_count = 1
         let (_, lock_token1, attempt1) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -4019,7 +4090,7 @@ mod tests {
 
         // Second fetch: attempt_count = 1 (0 + 1)
         let (_, lock_token2, attempt2) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();
@@ -4030,7 +4101,7 @@ mod tests {
 
         // Third fetch: attempt_count = 1 (MAX(0, 0-1) + 1 = 0 + 1 = 1)
         let (_, _lock_token3, attempt3) = store
-            .fetch_work_item(lock_timeout, Duration::ZERO, None)
+            .fetch_work_item(lock_timeout, Duration::ZERO, None, &TagFilter::default())
             .await
             .unwrap()
             .unwrap();

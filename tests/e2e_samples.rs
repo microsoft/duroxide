@@ -1936,3 +1936,306 @@ async fn sample_config_hot_reload_persistent_events_fs() {
 
     rt.shutdown(None).await;
 }
+
+// ============================================================================
+// Activity Tagging Samples
+// ============================================================================
+
+/// Heterogeneous workers: route activities to specialized workers by tag.
+///
+/// Pattern: An orchestration fans out work across GPU and CPU workers.
+/// Each worker runtime is configured with a different `TagFilter` so it only
+/// picks up activities meant for its hardware class (GPU vs CPU).
+/// A generalist worker using `DefaultAnd` can handle untagged activities and
+/// a specific tag.
+///
+/// Highlights:
+/// - `.with_tag("gpu")` routes an activity to GPU-capable workers
+/// - `TagFilter::tags(["gpu"])` — specialist worker accepts only GPU work
+/// - `TagFilter::default_and(["cpu"])` — generalist handles untagged + CPU
+/// - `TagFilter::Any` — catch-all worker for draining / debugging
+/// - Tags are persisted in event history and replayed deterministically
+#[tokio::test]
+async fn sample_heterogeneous_workers_with_tags() {
+    use duroxide::TagFilter;
+    use duroxide::runtime::RuntimeOptions;
+
+    let (store, _temp_dir) = common::create_sqlite_store_disk().await;
+
+    let activity_registry = ActivityRegistry::builder()
+        .register("Render", |_ctx: ActivityContext, input: String| async move {
+            Ok(format!("rendered:{input}"))
+        })
+        .register("Encode", |_ctx: ActivityContext, input: String| async move {
+            Ok(format!("encoded:{input}"))
+        })
+        .register("Upload", |_ctx: ActivityContext, input: String| async move {
+            Ok(format!("uploaded:{input}"))
+        })
+        .build();
+
+    // Orchestration: fan out => GPU render, CPU encode, untagged upload
+    let orchestration = |ctx: OrchestrationContext, _input: String| async move {
+        // GPU-intensive rendering
+        let rendered = ctx.schedule_activity("Render", "frame42").with_tag("gpu").await?;
+
+        // CPU-intensive encoding (could run on a different machine class)
+        let encoded = ctx.schedule_activity("Encode", rendered).with_tag("cpu").await?;
+
+        // Plain upload — any default worker can handle this
+        let uploaded = ctx.schedule_activity("Upload", encoded).await?;
+
+        Ok(uploaded)
+    };
+
+    let orchestration_registry = OrchestrationRegistry::builder()
+        .register("VideoPipeline", orchestration)
+        .build();
+
+    // Single runtime with DefaultAnd(["gpu","cpu"]) — handles everything here,
+    // but in production you'd run separate runtimes per machine class.
+    let opts = RuntimeOptions {
+        worker_tag_filter: TagFilter::default_and(["gpu", "cpu"]),
+        ..Default::default()
+    };
+
+    let rt = runtime::Runtime::start_with_options(store.clone(), activity_registry, orchestration_registry, opts).await;
+
+    let client = Client::new(store.clone());
+    client
+        .start_orchestration("video-1", "VideoPipeline", "")
+        .await
+        .unwrap();
+
+    match client
+        .wait_for_orchestration("video-1", Duration::from_secs(5))
+        .await
+        .unwrap()
+    {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "uploaded:encoded:rendered:frame42");
+
+            // Verify tags are persisted in history
+            let history = store.read("video-1").await.unwrap();
+            let tags: Vec<Option<String>> = history
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::ActivityScheduled { tag, .. } => Some(tag.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                tags,
+                vec![Some("gpu".to_string()), Some("cpu".to_string()), None],
+                "History should preserve per-activity tags"
+            );
+        }
+        runtime::OrchestrationStatus::Failed { details, .. } => {
+            panic!("orchestration failed: {}", details.display_message())
+        }
+        other => panic!("unexpected status: {:?}", other),
+    }
+
+    rt.shutdown(None).await;
+}
+
+/// Starvation-safe tagged activity: protect against missing workers with a timeout.
+///
+/// Pattern: Schedule a tagged activity but race it against a timer so the
+/// orchestration never hangs indefinitely if no worker has the right TagFilter.
+/// This is the recommended safety pattern whenever you use `.with_tag()`.
+///
+/// Highlights:
+/// - `select2(tagged_activity, timer)` — first-to-complete wins
+/// - `Either2::Second` means the timer fired (no matching worker available)
+/// - Graceful fallback instead of unbounded hang
+/// - Works with any tag / TagFilter combination
+#[tokio::test]
+async fn sample_starvation_safe_tagged_activity() {
+    use duroxide::TagFilter;
+    use duroxide::runtime::RuntimeOptions;
+
+    let (store, _temp_dir) = common::create_sqlite_store_disk().await;
+
+    let activity_registry = ActivityRegistry::builder()
+        .register("GpuInference", |_ctx: ActivityContext, input: String| async move {
+            Ok(format!("inference:{input}"))
+        })
+        .register("CpuFallback", |_ctx: ActivityContext, input: String| async move {
+            Ok(format!("cpu_fallback:{input}"))
+        })
+        .build();
+
+    // Orchestration: try GPU, fall back to CPU if no GPU worker responds in time
+    let orchestration = |ctx: OrchestrationContext, input: String| async move {
+        let gpu_activity = ctx.schedule_activity("GpuInference", input.clone()).with_tag("gpu");
+        let timeout = ctx.schedule_timer(Duration::from_millis(500));
+
+        match ctx.select2(gpu_activity, timeout).await {
+            Either2::First(Ok(result)) => {
+                // GPU worker picked it up in time
+                Ok(result)
+            }
+            Either2::First(Err(e)) => Err(e),
+            Either2::Second(()) => {
+                // No GPU worker available — fall back to CPU
+                let result = ctx.schedule_activity("CpuFallback", input).await?;
+                Ok(result)
+            }
+        }
+    };
+
+    let orchestration_registry = OrchestrationRegistry::builder()
+        .register("InferenceWithFallback", orchestration)
+        .build();
+
+    // Only a DefaultOnly worker — no GPU workers exist
+    let opts = RuntimeOptions {
+        worker_tag_filter: TagFilter::default(),
+        ..Default::default()
+    };
+
+    let rt = runtime::Runtime::start_with_options(store.clone(), activity_registry, orchestration_registry, opts).await;
+
+    let client = Client::new(store.clone());
+    client
+        .start_orchestration("infer-1", "InferenceWithFallback", "model-v3")
+        .await
+        .unwrap();
+
+    match client
+        .wait_for_orchestration("infer-1", Duration::from_secs(10))
+        .await
+        .unwrap()
+    {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            // Timer wins, CPU fallback executes
+            assert_eq!(output, "cpu_fallback:model-v3");
+        }
+        runtime::OrchestrationStatus::Failed { details, .. } => {
+            panic!("orchestration failed: {}", details.display_message())
+        }
+        other => panic!("unexpected status: {:?}", other),
+    }
+
+    rt.shutdown(None).await;
+}
+
+/// Dual runtimes: orchestrator + specialist GPU worker on the same store.
+///
+/// Pattern: Two separate `Runtime` instances share the same backing store.
+/// Runtime A runs the orchestration dispatcher and handles untagged (default)
+/// activities. Runtime B is a worker-only node that handles only gpu-tagged
+/// activities. The orchestration schedules both kinds, proving that the two
+/// runtimes cooperate to drive it to completion.
+///
+/// Highlights:
+/// - Two `Runtime::start_with_options` on the same store (shared queue)
+/// - Runtime A: orchestration dispatcher + `DefaultOnly` worker
+/// - Runtime B: orchestration dispatcher disabled (`orchestration_concurrency: 0`)
+///   + `Tags(["gpu"])` worker — pure activity executor
+/// - The orchestration completes only if **both** runtimes participate
+#[tokio::test]
+async fn sample_dual_runtime_tag_cooperation() {
+    use duroxide::TagFilter;
+    use duroxide::runtime::RuntimeOptions;
+
+    let (store, _temp_dir) = common::create_sqlite_store_disk().await;
+
+    // --- Shared registries (both runtimes need the same activity names) ---
+    let make_activities = || {
+        ActivityRegistry::builder()
+            .register("PreProcess", |_ctx: ActivityContext, input: String| async move {
+                Ok(format!("preprocessed:{input}"))
+            })
+            .register("GpuTrain", |_ctx: ActivityContext, input: String| async move {
+                // In production this would run on a GPU node
+                Ok(format!("trained:{input}"))
+            })
+            .register("SaveModel", |_ctx: ActivityContext, input: String| async move {
+                Ok(format!("saved:{input}"))
+            })
+            .build()
+    };
+
+    let make_orchestrations = || {
+        OrchestrationRegistry::builder()
+            .register("MLPipeline", |ctx: OrchestrationContext, input: String| async move {
+                // Step 1: CPU preprocessing (untagged — handled by Runtime A)
+                let preprocessed = ctx.schedule_activity("PreProcess", input).await?;
+
+                // Step 2: GPU training (tagged — handled by Runtime B)
+                let model = ctx.schedule_activity("GpuTrain", preprocessed).with_tag("gpu").await?;
+
+                // Step 3: Save model (untagged — handled by Runtime A)
+                let saved = ctx.schedule_activity("SaveModel", model).await?;
+
+                Ok(saved)
+            })
+            .build()
+    };
+
+    // --- Runtime A: orchestrator + default worker (CPU work) ---
+    let rt_a = runtime::Runtime::start_with_options(
+        store.clone(),
+        make_activities(),
+        make_orchestrations(),
+        RuntimeOptions {
+            worker_tag_filter: TagFilter::default(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // --- Runtime B: GPU worker only (no orchestration dispatcher) ---
+    let rt_b = runtime::Runtime::start_with_options(
+        store.clone(),
+        make_activities(),
+        make_orchestrations(),
+        RuntimeOptions {
+            orchestration_concurrency: 0, // worker-only node
+            worker_tag_filter: TagFilter::tags(["gpu"]),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Start the orchestration — it needs BOTH runtimes to complete
+    let client = Client::new(store.clone());
+    client
+        .start_orchestration("ml-1", "MLPipeline", "dataset-v5")
+        .await
+        .unwrap();
+
+    match client
+        .wait_for_orchestration("ml-1", Duration::from_secs(10))
+        .await
+        .unwrap()
+    {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "saved:trained:preprocessed:dataset-v5");
+
+            // Verify the tag routing in history
+            let history = store.read("ml-1").await.unwrap();
+            let scheduled: Vec<(&str, Option<&str>)> = history
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::ActivityScheduled { name, tag, .. } => Some((name.as_str(), tag.as_deref())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                scheduled,
+                vec![("PreProcess", None), ("GpuTrain", Some("gpu")), ("SaveModel", None),],
+                "History should show correct tag routing"
+            );
+        }
+        runtime::OrchestrationStatus::Failed { details, .. } => {
+            panic!("orchestration failed: {}", details.display_message())
+        }
+        other => panic!("unexpected status: {:?}", other),
+    }
+
+    rt_b.shutdown(None).await;
+    rt_a.shutdown(None).await;
+}

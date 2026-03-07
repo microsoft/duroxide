@@ -4,7 +4,7 @@
 //! Sessions pin activities with the same session_id to the same worker.
 
 use crate::provider_validation::ProviderFactory;
-use crate::providers::{SessionFetchConfig, WorkItem};
+use crate::providers::{SessionFetchConfig, TagFilter, WorkItem};
 use std::time::Duration;
 
 /// Helper to create a session-bound activity work item
@@ -16,6 +16,7 @@ fn session_activity(instance: &str, id: u64, session_id: &str) -> WorkItem {
         name: "SessionActivity".to_string(),
         input: "{}".to_string(),
         session_id: Some(session_id.to_string()),
+        tag: None,
     }
 }
 
@@ -28,6 +29,7 @@ fn plain_activity(instance: &str, id: u64) -> WorkItem {
         name: "PlainActivity".to_string(),
         input: "{}".to_string(),
         session_id: None,
+        tag: None,
     }
 }
 
@@ -62,6 +64,7 @@ pub async fn test_non_session_items_fetchable_by_any_worker(factory: &dyn Provid
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -82,6 +85,7 @@ pub async fn test_session_item_claimable_when_no_session(factory: &dyn ProviderF
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -109,6 +113,7 @@ pub async fn test_session_affinity_same_worker(factory: &dyn ProviderFactory) {
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -127,6 +132,7 @@ pub async fn test_session_affinity_same_worker(factory: &dyn ProviderFactory) {
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -150,6 +156,7 @@ pub async fn test_session_affinity_blocks_other_worker(factory: &dyn ProviderFac
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -168,6 +175,7 @@ pub async fn test_session_affinity_blocks_other_worker(factory: &dyn ProviderFac
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -191,6 +199,7 @@ pub async fn test_different_sessions_different_workers(factory: &dyn ProviderFac
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -207,6 +216,7 @@ pub async fn test_different_sessions_different_workers(factory: &dyn ProviderFac
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -229,6 +239,7 @@ pub async fn test_different_sessions_different_workers(factory: &dyn ProviderFac
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -243,6 +254,7 @@ pub async fn test_different_sessions_different_workers(factory: &dyn ProviderFac
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -266,6 +278,7 @@ pub async fn test_mixed_session_and_non_session_items(factory: &dyn ProviderFact
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -285,6 +298,7 @@ pub async fn test_mixed_session_and_non_session_items(factory: &dyn ProviderFact
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -309,7 +323,12 @@ pub async fn test_session_claimable_after_lock_expiry(factory: &dyn ProviderFact
         .unwrap();
     let cfg = session_config_with_lock("worker-A", Duration::from_millis(50));
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -330,6 +349,7 @@ pub async fn test_session_claimable_after_lock_expiry(factory: &dyn ProviderFact
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -349,7 +369,7 @@ pub async fn test_none_session_skips_session_items(factory: &dyn ProviderFactory
 
     // Fetch with session=None — should only get the plain item
     let result = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
     assert!(result.is_some(), "Should fetch a non-session item with session=None");
@@ -361,7 +381,7 @@ pub async fn test_none_session_skips_session_items(factory: &dyn ProviderFactory
 
     // Second fetch with session=None — no more non-session items
     let result2 = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap();
     assert!(result2.is_none(), "Session item should be invisible to None fetch");
@@ -372,6 +392,7 @@ pub async fn test_none_session_skips_session_items(factory: &dyn ProviderFactory
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -408,6 +429,7 @@ pub async fn test_some_session_returns_all_items(factory: &dyn ProviderFactory) 
                 Duration::from_secs(5),
                 Duration::ZERO,
                 Some(&session_config("shared-proc")),
+                &TagFilter::default(),
             )
             .await
             .unwrap()
@@ -429,6 +451,7 @@ pub async fn test_some_session_returns_all_items(factory: &dyn ProviderFactory) 
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("shared-proc")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -450,7 +473,12 @@ pub async fn test_renew_session_lock_active(factory: &dyn ProviderFactory) {
         .unwrap();
     let cfg = session_config_with_lock("worker-A", Duration::from_secs(5));
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -473,6 +501,7 @@ pub async fn test_renew_session_lock_active(factory: &dyn ProviderFactory) {
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -501,6 +530,7 @@ pub async fn test_renew_session_lock_skips_idle(factory: &dyn ProviderFactory) {
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -541,7 +571,12 @@ pub async fn test_cleanup_removes_expired_no_items(factory: &dyn ProviderFactory
         .unwrap();
     let cfg = session_config_with_lock("worker-A", Duration::from_millis(50));
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -569,7 +604,12 @@ pub async fn test_cleanup_keeps_sessions_with_pending_items(factory: &dyn Provid
         .unwrap();
     let cfg = session_config_with_lock("worker-A", Duration::from_millis(50));
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -603,7 +643,12 @@ pub async fn test_cleanup_keeps_active_sessions(factory: &dyn ProviderFactory) {
         .unwrap();
     let cfg = session_config_with_lock("worker-A", Duration::from_secs(300));
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -638,6 +683,7 @@ pub async fn test_ack_updates_session_last_activity(factory: &dyn ProviderFactor
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -689,6 +735,7 @@ pub async fn test_renew_work_item_updates_session_last_activity(factory: &dyn Pr
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -737,6 +784,7 @@ pub async fn test_session_items_processed_in_order(factory: &dyn ProviderFactory
                 Duration::from_secs(5),
                 Duration::ZERO,
                 Some(&session_config("worker-A")),
+                &TagFilter::default(),
             )
             .await
             .unwrap()
@@ -763,6 +811,7 @@ pub async fn test_non_session_items_returned_with_session_config(factory: &dyn P
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -778,6 +827,7 @@ pub async fn test_non_session_items_returned_with_session_config(factory: &dyn P
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -815,6 +865,7 @@ pub async fn test_shared_worker_id_any_caller_can_fetch_owned_session(factory: &
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("process-1")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -831,6 +882,7 @@ pub async fn test_shared_worker_id_any_caller_can_fetch_owned_session(factory: &
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("process-1")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -850,6 +902,7 @@ pub async fn test_shared_worker_id_any_caller_can_fetch_owned_session(factory: &
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("process-2")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -884,6 +937,7 @@ pub async fn test_concurrent_session_claim_only_one_wins(factory: &dyn ProviderF
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -896,6 +950,7 @@ pub async fn test_concurrent_session_claim_only_one_wins(factory: &dyn ProviderF
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -922,7 +977,12 @@ pub async fn test_session_takeover_after_lock_expiry(factory: &dyn ProviderFacto
         .unwrap();
     let cfg_a = session_config_with_lock("worker-A", Duration::from_millis(50));
     let (_, token_a, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg_a))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg_a),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -943,6 +1003,7 @@ pub async fn test_session_takeover_after_lock_expiry(factory: &dyn ProviderFacto
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -968,7 +1029,12 @@ pub async fn test_cleanup_then_new_item_recreates_session(factory: &dyn Provider
         .unwrap();
     let cfg = session_config_with_lock("worker-A", Duration::from_millis(50));
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -996,6 +1062,7 @@ pub async fn test_cleanup_then_new_item_recreates_session(factory: &dyn Provider
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -1023,6 +1090,7 @@ pub async fn test_abandoned_session_item_retryable(factory: &dyn ProviderFactory
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -1041,6 +1109,7 @@ pub async fn test_abandoned_session_item_retryable(factory: &dyn ProviderFactory
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -1059,6 +1128,7 @@ pub async fn test_abandoned_session_item_retryable(factory: &dyn ProviderFactory
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -1082,6 +1152,7 @@ pub async fn test_abandoned_session_item_ignore_attempt(factory: &dyn ProviderFa
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -1103,6 +1174,7 @@ pub async fn test_abandoned_session_item_ignore_attempt(factory: &dyn ProviderFa
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap()
@@ -1123,7 +1195,12 @@ pub async fn test_renew_session_lock_after_expiry_returns_zero(factory: &dyn Pro
         .unwrap();
     let cfg = session_config_with_lock("worker-A", Duration::from_millis(50));
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1153,7 +1230,12 @@ pub async fn test_original_worker_reclaims_expired_session(factory: &dyn Provide
         .unwrap();
     let cfg = session_config_with_lock("worker-A", Duration::from_millis(50));
     let (_, token1, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1174,6 +1256,7 @@ pub async fn test_original_worker_reclaims_expired_session(factory: &dyn Provide
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -1200,7 +1283,7 @@ pub async fn test_activity_lock_expires_session_lock_valid_same_worker_refetches
     let short_work_lock = Duration::from_millis(500);
     let cfg = session_config("worker-A"); // session lock = 30s
     let (_, _token_a, _) = provider
-        .fetch_work_item(short_work_lock, Duration::ZERO, Some(&cfg))
+        .fetch_work_item(short_work_lock, Duration::ZERO, Some(&cfg), &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -1215,6 +1298,7 @@ pub async fn test_activity_lock_expires_session_lock_valid_same_worker_refetches
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -1229,6 +1313,7 @@ pub async fn test_activity_lock_expires_session_lock_valid_same_worker_refetches
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -1257,7 +1342,7 @@ pub async fn test_session_lock_expires_new_owner_gets_redelivery(factory: &dyn P
     let long_activity = Duration::from_secs(5);
     let cfg_a = session_config_with_lock("worker-A", short_session);
     let (_, _token_a, _) = provider
-        .fetch_work_item(long_activity, Duration::ZERO, Some(&cfg_a))
+        .fetch_work_item(long_activity, Duration::ZERO, Some(&cfg_a), &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -1274,7 +1359,12 @@ pub async fn test_session_lock_expires_new_owner_gets_redelivery(factory: &dyn P
     // Worker-B claims the session (session lock expired) and gets the new item
     let cfg_b = session_config("worker-B");
     let result_b = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg_b))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg_b),
+            &TagFilter::default(),
+        )
         .await
         .unwrap();
     assert!(
@@ -1293,7 +1383,12 @@ pub async fn test_session_lock_expires_new_owner_gets_redelivery(factory: &dyn P
 
     // Worker-B (now session owner) should pick up the redelivered item 1
     let result_b2 = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg_b))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg_b),
+            &TagFilter::default(),
+        )
         .await
         .unwrap();
     assert!(
@@ -1321,7 +1416,12 @@ pub async fn test_session_lock_expires_same_worker_reacquires(factory: &dyn Prov
     let short_session = Duration::from_millis(200);
     let cfg_a = session_config_with_lock("worker-A", short_session);
     let (_, token_a, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg_a))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg_a),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1338,7 +1438,12 @@ pub async fn test_session_lock_expires_same_worker_reacquires(factory: &dyn Prov
 
     // Worker-A fetches again — should reclaim its own expired session
     let result_a = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg_a))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg_a),
+            &TagFilter::default(),
+        )
         .await
         .unwrap();
     assert!(result_a.is_some(), "Worker-A should reacquire its own expired session");
@@ -1362,7 +1467,7 @@ pub async fn test_both_locks_expire_different_worker_claims(factory: &dyn Provid
     let short_lock = Duration::from_millis(200);
     let cfg = session_config_with_lock("worker-A", short_lock);
     let (_, _token_a, _) = provider
-        .fetch_work_item(short_lock, Duration::ZERO, Some(&cfg))
+        .fetch_work_item(short_lock, Duration::ZERO, Some(&cfg), &TagFilter::default())
         .await
         .unwrap()
         .unwrap();
@@ -1376,6 +1481,7 @@ pub async fn test_both_locks_expire_different_worker_claims(factory: &dyn Provid
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -1405,7 +1511,12 @@ pub async fn test_session_lock_expires_activity_lock_valid_ack_succeeds(factory:
     let short_session_lock = Duration::from_millis(200);
     let cfg = session_config_with_lock("worker-A", short_session_lock);
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(30),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1446,7 +1557,12 @@ pub async fn test_session_lock_renewal_extends_past_original_timeout(factory: &d
         .unwrap();
     let cfg = session_config_with_lock("worker-A", session_lock_dur);
     let (_, token, _) = provider
-        .fetch_work_item(Duration::from_secs(5), Duration::ZERO, Some(&cfg))
+        .fetch_work_item(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Some(&cfg),
+            &TagFilter::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1475,6 +1591,7 @@ pub async fn test_session_lock_renewal_extends_past_original_timeout(factory: &d
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-B")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();
@@ -1489,6 +1606,7 @@ pub async fn test_session_lock_renewal_extends_past_original_timeout(factory: &d
             Duration::from_secs(5),
             Duration::ZERO,
             Some(&session_config("worker-A")),
+            &TagFilter::default(),
         )
         .await
         .unwrap();

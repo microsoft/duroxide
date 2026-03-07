@@ -31,6 +31,12 @@ mod tests {
         test_session_lock_renewal_extends_past_original_timeout, test_session_takeover_after_lock_expiry,
         test_shared_worker_id_any_caller_can_fetch_owned_session, test_some_session_returns_all_items,
     };
+    use duroxide::provider_validations::tag_filtering::{
+        test_any_filter_fetches_everything, test_default_and_fetches_untagged_and_matching,
+        test_default_only_fetches_untagged, test_multi_runtime_tag_isolation, test_multi_tag_filter,
+        test_none_filter_returns_nothing, test_tag_round_trip_preservation, test_tag_survives_abandon_and_refetch,
+        test_tags_fetches_only_matching,
+    };
     use duroxide::provider_validations::{
         ProviderFactory,
         // Bulk deletion tests
@@ -1099,5 +1105,51 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_custom_status_default_on_new_instance() {
         test_custom_status_default_on_new_instance(&SqliteTestFactory).await;
+    }
+
+    // Tag filtering tests
+    #[tokio::test]
+    async fn test_sqlite_tag_default_only_fetches_untagged() {
+        test_default_only_fetches_untagged(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_tags_fetches_only_matching() {
+        test_tags_fetches_only_matching(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_default_and_fetches_untagged_and_matching() {
+        test_default_and_fetches_untagged_and_matching(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_none_filter_returns_nothing() {
+        test_none_filter_returns_nothing(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_multi_tag_filter() {
+        test_multi_tag_filter(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_round_trip_preservation() {
+        test_tag_round_trip_preservation(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_any_filter_fetches_everything() {
+        test_any_filter_fetches_everything(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_survives_abandon_and_refetch() {
+        test_tag_survives_abandon_and_refetch(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_tag_multi_runtime_isolation() {
+        test_multi_runtime_tag_isolation(&SqliteTestFactory).await;
     }
 }

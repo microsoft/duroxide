@@ -4,7 +4,7 @@
 
 use duroxide::providers::{
     DispatcherCapabilityFilter, ExecutionMetadata, OrchestrationItem, Provider, ProviderError,
-    ScheduledActivityIdentifier, SessionFetchConfig, WorkItem,
+    ScheduledActivityIdentifier, SessionFetchConfig, TagFilter, WorkItem,
 };
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{self, RuntimeOptions};
@@ -71,12 +71,14 @@ impl Provider for LongPollingSqliteProvider {
         lock_timeout: Duration,
         poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
         // Clone session config for use in closure iterations
         let session_owned = session.cloned();
+        let tag_filter = tag_filter.clone();
         self.poll_until(poll_timeout, || {
             self.inner
-                .fetch_work_item(lock_timeout, Duration::ZERO, session_owned.as_ref())
+                .fetch_work_item(lock_timeout, Duration::ZERO, session_owned.as_ref(), &tag_filter)
         })
         .await
     }

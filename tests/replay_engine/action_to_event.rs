@@ -160,6 +160,7 @@ fn schedule_activity_on_session_creates_activity_scheduled_event_with_session_id
             name,
             input,
             session_id,
+            ..
         } => {
             assert_eq!(name, "MyActivity");
             assert_eq!(input, "my-input");
@@ -185,6 +186,7 @@ fn schedule_activity_on_session_session_id_mismatch_causes_nondeterminism() {
                 name: "MyActivity".to_string(),
                 input: "my-input".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];
@@ -470,4 +472,175 @@ fn detached_orchestration_then_activity_replays_correctly() {
     // - Orchestration emits: StartOrchestrationDetached, then CallActivity
     // - Engine correctly matches both
     assert_completed(&replay_result, "activity-result");
+}
+
+// ============================================================================
+// Tests: Activity Tags via with_tag()
+// ============================================================================
+
+/// Handler that schedules a tagged activity.
+pub struct TaggedActivityHandler {
+    activity_name: String,
+    activity_input: String,
+    tag: String,
+}
+
+impl TaggedActivityHandler {
+    pub fn new(name: &str, input: &str, tag: &str) -> Arc<Self> {
+        Arc::new(Self {
+            activity_name: name.to_string(),
+            activity_input: input.to_string(),
+            tag: tag.to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl OrchestrationHandler for TaggedActivityHandler {
+    async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+        let result = ctx
+            .schedule_activity(&self.activity_name, &self.activity_input)
+            .with_tag(&self.tag)
+            .await?;
+        Ok(result)
+    }
+}
+
+/// Scheduling an activity with .with_tag() creates an ActivityScheduled event with the tag.
+#[test]
+fn with_tag_sets_tag_on_emitted_event() {
+    let history = vec![started_event(1)];
+    let mut engine = create_engine(history);
+
+    let handler = TaggedActivityHandler::new("GpuWork", "data", "gpu");
+    let result = execute(&mut engine, handler);
+    assert_continue(&result);
+
+    let activity_events: Vec<_> = engine
+        .history_delta()
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::ActivityScheduled { .. }))
+        .collect();
+
+    assert_eq!(activity_events.len(), 1);
+
+    match &activity_events[0].kind {
+        EventKind::ActivityScheduled { name, tag, .. } => {
+            assert_eq!(name, "GpuWork");
+            assert_eq!(tag.as_deref(), Some("gpu"));
+        }
+        _ => panic!("Expected ActivityScheduled event"),
+    }
+}
+
+/// Scheduling an activity without .with_tag() produces tag: None.
+#[test]
+fn no_with_tag_leaves_none() {
+    let history = vec![started_event(1)];
+    let mut engine = create_engine(history);
+
+    let handler = SingleActivityHandler::new("PlainWork", "data");
+    let result = execute(&mut engine, handler);
+    assert_continue(&result);
+
+    let activity_events: Vec<_> = engine
+        .history_delta()
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::ActivityScheduled { .. }))
+        .collect();
+
+    assert_eq!(activity_events.len(), 1);
+
+    match &activity_events[0].kind {
+        EventKind::ActivityScheduled { tag, .. } => {
+            assert_eq!(tag, &None);
+        }
+        _ => panic!("Expected ActivityScheduled event"),
+    }
+}
+
+/// On replay, a tag mismatch between an existing ActivityScheduled event and a new action
+/// must surface as nondeterminism.
+#[test]
+fn tag_mismatch_on_replay_causes_nondeterminism() {
+    let history = vec![
+        started_event(1),
+        // Existing schedule has no tag
+        duroxide::Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::ActivityScheduled {
+                name: "GpuWork".to_string(),
+                input: "data".to_string(),
+                session_id: None,
+                tag: None,
+            },
+        ),
+    ];
+    let mut engine = create_engine(history);
+
+    // Handler schedules the same activity but WITH a tag.
+    // This must fail determinism checks.
+    let handler = TaggedActivityHandler::new("GpuWork", "data", "gpu");
+    let result = execute(&mut engine, handler);
+
+    assert_nondeterminism(&result);
+}
+
+/// Changing a tag value between deployments (e.g. "gpu" → "cpu") also causes nondeterminism.
+#[test]
+fn tag_value_change_on_replay_causes_nondeterminism() {
+    let history = vec![
+        started_event(1),
+        // Existing schedule has tag "gpu"
+        duroxide::Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::ActivityScheduled {
+                name: "Render".to_string(),
+                input: "data".to_string(),
+                session_id: None,
+                tag: Some("gpu".to_string()),
+            },
+        ),
+    ];
+    let mut engine = create_engine(history);
+
+    // New code changed the tag from "gpu" to "cpu"
+    let handler = TaggedActivityHandler::new("Render", "data", "cpu");
+    let result = execute(&mut engine, handler);
+
+    assert_nondeterminism(&result);
+}
+
+/// Removing a tag (Some("gpu") → None) on replay causes nondeterminism.
+#[test]
+fn tag_removal_on_replay_causes_nondeterminism() {
+    let history = vec![
+        started_event(1),
+        // Existing schedule has tag "gpu"
+        duroxide::Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::ActivityScheduled {
+                name: "Render".to_string(),
+                input: "data".to_string(),
+                session_id: None,
+                tag: Some("gpu".to_string()),
+            },
+        ),
+    ];
+    let mut engine = create_engine(history);
+
+    // New code removed the tag entirely
+    let handler = SingleActivityHandler::new("Render", "data");
+    let result = execute(&mut engine, handler);
+
+    assert_nondeterminism(&result);
 }

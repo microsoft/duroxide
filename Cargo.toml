@@ -1,6 +1,6 @@
 [package]
 name = "duroxide"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2024"
 description = "Durable code execution framework for Rust"
 license = "MIT"

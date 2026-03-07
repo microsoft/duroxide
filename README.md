@@ -8,8 +8,8 @@
 
 A lightweight and embeddable durable execution runtime for Rust. Inspired by the [Durable Task Framework](https://github.com/Azure/durabletask) and [Temporal](https://temporal.io/).
 
-> **[Latest Release: v0.1.21](https://crates.io/crates/duroxide/0.1.21)** — Fix orphan queue message handling, new provider validation test.
-> See [CHANGELOG.md](CHANGELOG.md#0121---2026-03-06) for release notes.
+> **[Latest Release: v0.1.22](https://crates.io/crates/duroxide/0.1.22)** — Activity tag routing for worker specialization, flaky test fixes.
+> See [CHANGELOG.md](CHANGELOG.md#0122---2026-03-07) for release notes. [Proposal](docs/proposals/activity-tags.md)
 
 ### What you can build with this
 - Function chaining: model a multi-step process as sequential awaits where each step depends on prior results.
@@ -20,6 +20,7 @@ A lightweight and embeddable durable execution runtime for Rust. Inspired by the
 - Built-in activity retry: `ctx.schedule_activity_with_retry()` with configurable backoff (exponential, linear, fixed) and per-attempt timeouts.
 - Cooperative activity cancellation: in-flight activities receive cancellation signals via `ActivityContext` when orchestration is cancelled; activities can clean up gracefully or be forcibly aborted after a grace period.
 - Session affinity: route activities to the same worker for in-memory state reuse across turns. `ctx.schedule_activity_on_session(name, input, session_id)` pins work by session ID. Sessions are automatically managed with heartbeat leases, idle timeout, and crash recovery.
+- **Worker specialization (activity tags):** route activities to specialized worker pools via `.with_tag("gpu")`. Workers declare which tags they accept via `RuntimeOptions { worker_tag_filter: TagFilter::tags(["gpu"]) }`. Tags compose with sessions, retry, join/select, and cancellation.
 
 These patterns are enabled by deterministic replay, correlation IDs, durable timers, and external event handling.
 

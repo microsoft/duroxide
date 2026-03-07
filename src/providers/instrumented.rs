@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::{
     DispatcherCapabilityFilter, ExecutionMetadata, OrchestrationItem, Provider, ProviderAdmin, ProviderError,
-    ScheduledActivityIdentifier, SessionFetchConfig, WorkItem,
+    ScheduledActivityIdentifier, SessionFetchConfig, TagFilter, WorkItem,
 };
 use crate::Event;
 use crate::runtime::observability::MetricsProvider;
@@ -192,9 +192,13 @@ impl Provider for InstrumentedProvider {
         lock_timeout: Duration,
         poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
         let start = std::time::Instant::now();
-        let result = self.inner.fetch_work_item(lock_timeout, poll_timeout, session).await;
+        let result = self
+            .inner
+            .fetch_work_item(lock_timeout, poll_timeout, session, tag_filter)
+            .await;
         let duration = start.elapsed();
 
         self.record_operation(

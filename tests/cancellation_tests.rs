@@ -9,7 +9,7 @@ use duroxide::EventKind;
 use duroxide::providers::error::ProviderError;
 use duroxide::providers::{
     DispatcherCapabilityFilter, ExecutionMetadata, OrchestrationItem, Provider, ProviderAdmin,
-    ScheduledActivityIdentifier, SessionFetchConfig, WorkItem,
+    ScheduledActivityIdentifier, SessionFetchConfig, TagFilter, WorkItem,
 };
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{self};
@@ -2022,8 +2022,11 @@ impl Provider for RecordingProvider {
         lock_timeout: Duration,
         poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
-        self.inner.fetch_work_item(lock_timeout, poll_timeout, session).await
+        self.inner
+            .fetch_work_item(lock_timeout, poll_timeout, session, tag_filter)
+            .await
     }
 
     async fn ack_orchestration_item(

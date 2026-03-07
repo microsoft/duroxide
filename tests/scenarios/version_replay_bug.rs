@@ -406,6 +406,7 @@ fn unit_workitem_reader_nth_execution_must_preserve_version() {
                 name: "SomeActivity".to_string(),
                 input: "activity-input".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];
@@ -562,6 +563,7 @@ fn unit_input_comes_from_extract_context_not_workitem_reader() {
                 name: "SomeActivity".to_string(),
                 input: "activity-input".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];
@@ -627,6 +629,7 @@ fn unit_nth_execution_history_starts_with_orchestration_started() {
                 name: "SomeActivity".to_string(),
                 input: "activity-input".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];
@@ -835,6 +838,7 @@ fn unit_completion_only_replay_uses_nth_execution_input() {
                 name: "SomeActivity".to_string(),
                 input: "activity-input".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];

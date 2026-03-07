@@ -306,9 +306,10 @@ async fn fetch_work_item(
     lock_timeout: Duration,
     _poll_timeout: Duration,  // Ignored
     session: Option<&SessionFetchConfig>,
+    tag_filter: &TagFilter,
 ) -> Result<Option<...>, ProviderError> {
     // Query immediately, return None if nothing available
-    self.try_fetch_and_lock(session).await
+    self.try_fetch_and_lock(session, tag_filter).await
 }
 
 // Long-polling (Redis style) - uses poll_timeout
@@ -317,6 +318,7 @@ async fn fetch_work_item(
     lock_timeout: Duration,
     poll_timeout: Duration,  // Used
     session: Option<&SessionFetchConfig>,
+    tag_filter: &TagFilter,
 ) -> Result<Option<...>, ProviderError> {
     // Block up to poll_timeout waiting for work
     match self.blpop("worker_queue", poll_timeout).await {
@@ -424,6 +426,7 @@ impl Provider for MyProvider {
         lock_timeout: Duration,
         poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
         todo!("Fetch and lock from worker queue")
     }
@@ -672,6 +675,7 @@ async fn fetch_work_item(
     lock_timeout: Duration,
     _poll_timeout: Duration,  // Ignored for SQLite (short-polling)
     session: Option<&SessionFetchConfig>,
+    tag_filter: &TagFilter,
 ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
     let now = current_time_ms();
     let lock_token = uuid::Uuid::new_v4().to_string();
@@ -680,6 +684,7 @@ async fn fetch_work_item(
     // Atomically find and lock one item
     // When session is Some, include session-bound items owned by this worker;
     // when session is None, only return non-session items.
+    // Filter by tag_filter to implement worker specialization.
     let result = sqlx::query!(
         "UPDATE worker_queue
          SET lock_token = ?, locked_until = ?, attempt_count = attempt_count + 1
@@ -1305,6 +1310,7 @@ async fn fetch_work_item(
     lock_timeout: Duration,
     _poll_timeout: Duration,  // For long-polling providers
     session: Option<&SessionFetchConfig>,
+    tag_filter: &TagFilter,
 ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
     let now = current_time_ms();
     let lock_token = uuid::Uuid::new_v4().to_string();
@@ -1923,6 +1929,15 @@ Before considering your provider complete:
 - [ ] `cleanup_orphaned_sessions()` removes expired sessions with no work
 - [ ] `ack_work_item()` piggybacks `last_activity_at` update (with `locked_until > now` guard)
 - [ ] `renew_work_item_lock()` piggybacks `last_activity_at` update (with `locked_until > now` guard)
+
+### Activity Tag Filtering
+- [ ] `fetch_work_item()` with `DefaultOnly` returns only untagged items (`tag IS NULL`)
+- [ ] `fetch_work_item()` with `Tags(["a"])` returns only items tagged `"a"`
+- [ ] `fetch_work_item()` with `DefaultAnd(["a"])` returns untagged + items tagged `"a"`
+- [ ] `fetch_work_item()` with `Any` returns all items regardless of tag
+- [ ] `fetch_work_item()` with `None` returns no items
+- [ ] `enqueue_for_worker()` persists the `tag` from `WorkItem::ActivityExecute`
+- [ ] Tag persisted both in standalone enqueue and ack-enqueue paths
 
 ### Orchestrator Queue
 - [ ] `fetch_orchestration_item()` acquires instance-level lock

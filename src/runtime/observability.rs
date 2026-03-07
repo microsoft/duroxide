@@ -374,6 +374,7 @@ impl MetricsProvider {
         outcome: &str,
         duration_seconds: f64,
         retry_attempt: u32,
+        tag: Option<&str>,
     ) {
         let retry_label = match retry_attempt {
             0 => "0",
@@ -382,11 +383,14 @@ impl MetricsProvider {
             _ => "3+",
         };
 
+        let tag_label = tag.unwrap_or("default");
+
         counter!(
             "duroxide_activity_executions_total",
             "activity_name" => activity_name.to_string(),
             "outcome" => outcome.to_string(),
             "retry_attempt" => retry_label.to_string(),
+            "tag" => tag_label.to_string(),
         )
         .increment(1);
 
@@ -394,6 +398,7 @@ impl MetricsProvider {
             "duroxide_activity_duration_seconds",
             "activity_name" => activity_name.to_string(),
             "outcome" => outcome.to_string(),
+            "tag" => tag_label.to_string(),
         )
         .record(duration_seconds);
 

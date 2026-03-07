@@ -5,7 +5,7 @@
 use duroxide::Event;
 use duroxide::EventKind;
 use duroxide::providers::sqlite::SqliteProvider;
-use duroxide::providers::{ExecutionMetadata, Provider, WorkItem};
+use duroxide::providers::{ExecutionMetadata, Provider, TagFilter, WorkItem};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -175,6 +175,7 @@ async fn test_fetch_orchestration_item_existing_instance() {
                     name: "TestActivity".to_string(),
                     input: "activity-input".to_string(),
                     session_id: None,
+                    tag: None,
                 },
             )],
         )
@@ -288,6 +289,7 @@ async fn test_ack_orchestration_item_atomic() {
                 name: "TestActivity".to_string(),
                 input: "activity-input".to_string(),
                 session_id: None,
+                tag: None,
             },
         ),
     ];
@@ -299,6 +301,7 @@ async fn test_ack_orchestration_item_atomic() {
         name: "TestActivity".to_string(),
         input: "activity-input".to_string(),
         session_id: None,
+        tag: None,
     }];
 
     // Ack with updates
@@ -323,7 +326,7 @@ async fn test_ack_orchestration_item_atomic() {
 
     // Verify worker item was enqueued
     let (worker_item, _, _) = store
-        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None)
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
         .await
         .unwrap()
         .unwrap();

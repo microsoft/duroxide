@@ -11,7 +11,7 @@ use duroxide::providers::error::ProviderError;
 use duroxide::providers::sqlite::SqliteProvider;
 use duroxide::providers::{
     DispatcherCapabilityFilter, ExecutionMetadata, OrchestrationItem, Provider, ProviderAdmin,
-    ScheduledActivityIdentifier, SessionFetchConfig, WorkItem,
+    ScheduledActivityIdentifier, SessionFetchConfig, TagFilter, WorkItem,
 };
 use duroxide::{Event, EventKind};
 use std::sync::Arc;
@@ -148,8 +148,12 @@ impl Provider for PoisonInjectingProvider {
         lock_timeout: Duration,
         poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
-        let result = self.inner.fetch_work_item(lock_timeout, poll_timeout, session).await?;
+        let result = self
+            .inner
+            .fetch_work_item(lock_timeout, poll_timeout, session, tag_filter)
+            .await?;
 
         if let Some((item, lock_token, real_attempt_count)) = result {
             // Check if we need to skip this fetch
@@ -315,8 +319,11 @@ impl Provider for FilterBypassProvider {
         lock_timeout: Duration,
         poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
-        self.inner.fetch_work_item(lock_timeout, poll_timeout, session).await
+        self.inner
+            .fetch_work_item(lock_timeout, poll_timeout, session, tag_filter)
+            .await
     }
 
     async fn ack_orchestration_item(
@@ -508,6 +515,7 @@ impl Provider for FailingProvider {
         lock_timeout: Duration,
         poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
         if self.fail_next_fetch_work_item.swap(false, Ordering::SeqCst) {
             Err(ProviderError::retryable(
@@ -515,7 +523,9 @@ impl Provider for FailingProvider {
                 "simulated transient infrastructure failure",
             ))
         } else {
-            self.inner.fetch_work_item(lock_timeout, poll_timeout, session).await
+            self.inner
+                .fetch_work_item(lock_timeout, poll_timeout, session, tag_filter)
+                .await
         }
     }
 

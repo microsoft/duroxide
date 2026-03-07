@@ -1636,11 +1636,13 @@ fn action_to_event(action: &Action, instance: &str, execution_id: u64, event_id:
             name,
             input,
             session_id,
+            tag,
             ..
         } => EventKind::ActivityScheduled {
             name: name.clone(),
             input: input.clone(),
             session_id: session_id.clone(),
+            tag: tag.clone(),
         },
         Action::CreateTimer { fire_at_ms, .. } => EventKind::TimerCreated {
             fire_at_ms: *fire_at_ms,
@@ -1689,12 +1691,14 @@ fn update_action_event_id(action: Action, event_id: u64) -> Action {
             name,
             input,
             session_id,
+            tag,
             ..
         } => Action::CallActivity {
             scheduling_event_id: event_id,
             name,
             input,
             session_id,
+            tag,
         },
         Action::CreateTimer { fire_at_ms, .. } => Action::CreateTimer {
             scheduling_event_id: event_id,
@@ -1775,14 +1779,16 @@ fn action_matches_event_kind(action: &Action, event_kind: &EventKind) -> bool {
                 name,
                 input,
                 session_id,
+                tag,
                 ..
             },
             EventKind::ActivityScheduled {
                 name: en,
                 input: ei,
                 session_id: es,
+                tag: et,
             },
-        ) => name == en && input == ei && session_id == es,
+        ) => name == en && input == ei && session_id == es && tag == et,
 
         (Action::CreateTimer { fire_at_ms, .. }, EventKind::TimerCreated { fire_at_ms: ef }) => {
             // Allow some tolerance for timer fire_at_ms since it's computed at different times

@@ -27,8 +27,8 @@ This document provides a complete reference of all metrics emitted by duroxide v
 | `duroxide_orchestrator_queue_depth` | Gauge | Runtime | _(none)_ | ✅ `test_queue_depth_gauges_initialization` | ✅ Code Review | Observable gauge with callback, initialized via `initialize_gauges()` |
 | `duroxide_worker_queue_depth` | Gauge | Runtime | _(none)_ | ✅ `test_queue_depth_gauges_tracking` | ✅ Code Review | Observable gauge with callback, initialized via `initialize_gauges()` |
 | **Activity Execution** |
-| `duroxide_activity_executions_total` | Counter | Activity | `activity_name`, `outcome`, `retry_attempt` | ✅ `metrics_capture_activity_and_orchestration_outcomes` | ✅ Code Review | Tracks all outcomes including app_error |
-| `duroxide_activity_duration_seconds` | Histogram | Activity | `activity_name`, `outcome` | ✅ `test_activity_duration_tracking` | ✅ Code Review | Buckets: 0.01-300s |
+| `duroxide_activity_executions_total` | Counter | Activity | `activity_name`, `outcome`, `retry_attempt`, `tag` | ✅ `metrics_capture_activity_and_orchestration_outcomes` | ✅ Code Review | Tracks all outcomes including app_error |
+| `duroxide_activity_duration_seconds` | Histogram | Activity | `activity_name`, `outcome`, `tag` | ✅ `test_activity_duration_tracking` | ✅ Code Review | Buckets: 0.01-300s |
 | `duroxide_activity_infrastructure_errors_total` | Counter | Activity | `activity_name` | ✅ `metrics_capture_activity_and_orchestration_outcomes` | ✅ Code Review | Infra-specific errors |
 | `duroxide_activity_configuration_errors_total` | Counter | Activity | `activity_name` | ✅ `test_error_classification_metrics` | ✅ Code Review | Config-specific errors |
 | **Poison Message** |
@@ -381,6 +381,7 @@ duroxide_orchestrator_queue_depth / duroxide_worker_queue_depth
   - `"1"` - First retry
   - `"2"` - Second retry
   - `"3+"` - Third or later retry
+- `tag` (string) - Activity routing tag (`"default"` when untagged)
 
 **Purpose:** Identify flaky activities, track retry rates, track all error types including application errors
 
@@ -411,6 +412,7 @@ rate(duroxide_activity_executions_total{retry_attempt!="0"}[5m])
 **Labels:**
 - `activity_name` (string) - Activity name
 - `outcome` (string) - Execution outcome (success, app_error, infra_error, config_error)
+- `tag` (string) - Activity routing tag (`"default"` when untagged)
 
 **Buckets:** `[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]` seconds
 

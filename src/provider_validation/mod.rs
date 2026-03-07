@@ -37,6 +37,8 @@ pub mod prune;
 pub mod queue_semantics;
 #[cfg(feature = "provider-test")]
 pub mod sessions;
+#[cfg(feature = "provider-test")]
+pub mod tag_filtering;
 
 #[cfg(feature = "provider-test")]
 use crate::INITIAL_EXECUTION_ID;

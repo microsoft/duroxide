@@ -449,6 +449,78 @@ let result = ctx.schedule_activity_on_session("RunTurn", &input, &session_id).aw
 
 See the [Session Affinity Pattern](#session-affinity-pattern) section below for usage patterns.
 
+#### Activity Tags (Worker Specialization)
+
+Tags route activities to specialized worker pools. An orchestration marks an
+activity with a tag using `.with_tag()`, and the worker runtime filters its
+queue to only dequeue matching tags.
+
+```rust
+// Tag an activity for a GPU worker pool
+let result = ctx.schedule_activity("RenderFrame", input)
+    .with_tag("gpu")
+    .await?;
+
+// Tags work with typed activities too
+let result: RenderResult = ctx.schedule_activity_typed("RenderFrame", &input)
+    .with_tag("gpu")
+    .await?;
+
+// Tags can be combined with sessions
+let result = ctx.schedule_activity_on_session("CacheLookup", input, &session_id)
+    .with_tag("cache-node")
+    .await?;
+```
+
+**Worker-side configuration:**
+
+```rust
+use duroxide::{RuntimeOptions, TagFilter};
+
+// Worker that only processes GPU-tagged activities
+let opts = RuntimeOptions {
+    worker_tag_filter: TagFilter::tags(["gpu"]),
+    ..Default::default()
+};
+
+// Worker that processes untagged + GPU-tagged activities
+let opts = RuntimeOptions {
+    worker_tag_filter: TagFilter::default_and(["gpu"]),
+    ..Default::default()
+};
+```
+
+**`TagFilter` variants:**
+| Variant | Behavior |
+|---------|----------|
+| `TagFilter::DefaultOnly` (default) | Only untagged activities |
+| `TagFilter::tags(["a", "b"])` | Only activities tagged `"a"` or `"b"` |
+| `TagFilter::default_and(["a"])` | Untagged **or** tagged `"a"` |
+| `TagFilter::Any` | All activities regardless of tag (generalist worker) |
+| `TagFilter::None` | Never matches (no activities fetched) |
+
+**Key properties:**
+- Tags are **persisted in event history** — replays see the exact same tag
+- `.with_tag()` is a **mutate-after-emit** pattern that updates the already-emitted action
+- Tags are purely a **routing concern** — they don't affect activity behavior
+- Tags are **per-activity, not per-orchestration** — different activities in the same orchestration can have different tags
+- Maximum 5 distinct tags per `TagFilter` (enforced at construction)
+
+**⚠️ Starvation warning:** If you tag an activity `"gpu"` but no running worker has a matching `TagFilter`, the activity sits in the queue **indefinitely** — no timeout, no error. Protect against this with a `select2` timeout:
+
+```rust
+let activity = ctx.schedule_activity("GpuRender", input).with_tag("gpu");
+let timeout = ctx.schedule_timer(Duration::from_secs(30));
+
+match ctx.select2(activity, timeout).await {
+    Either2::First(Ok(result)) => Ok(result),
+    Either2::First(Err(e)) => Err(e),
+    Either2::Second(()) => Err("No GPU worker available".to_string()),
+}
+```
+
+**⚠️ Replay determinism:** Changing, adding, or removing a `.with_tag()` call in orchestration code will cause a **nondeterminism error** on replay of any in-flight instance whose history was recorded with the old tag. This follows the same rules as renaming activities — the tag is part of the event identity.
+
 #### Scheduling Activities with Retry
 
 ```rust

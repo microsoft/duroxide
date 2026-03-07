@@ -1494,19 +1494,19 @@ async fn test_metrics_activity_outcomes() {
     let metrics = MetricsProvider::new(&config).unwrap();
 
     // Success
-    metrics.record_activity_execution("TestActivity", "success", 0.5, 0);
+    metrics.record_activity_execution("TestActivity", "success", 0.5, 0, None);
     assert_eq!(metrics.snapshot().activity_success, 1);
 
     // App error
-    metrics.record_activity_execution("TestActivity", "app_error", 0.1, 1);
+    metrics.record_activity_execution("TestActivity", "app_error", 0.1, 1, Some("gpu"));
     assert_eq!(metrics.snapshot().activity_app_errors, 1);
 
     // Infrastructure error
-    metrics.record_activity_execution("TestActivity", "infra_error", 0.2, 2);
+    metrics.record_activity_execution("TestActivity", "infra_error", 0.2, 2, None);
     assert_eq!(metrics.snapshot().activity_infra_errors, 1);
 
     // Config error
-    metrics.record_activity_execution("TestActivity", "config_error", 0.3, 0);
+    metrics.record_activity_execution("TestActivity", "config_error", 0.3, 0, Some("build"));
     assert_eq!(metrics.snapshot().activity_config_errors, 1);
 }
 
