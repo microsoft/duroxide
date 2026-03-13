@@ -187,6 +187,10 @@ impl Provider for LongPollingSqliteProvider {
     ) -> Result<Option<(Option<String>, u64)>, ProviderError> {
         self.inner.get_custom_status(instance, last_seen_version).await
     }
+
+    async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
+        self.inner.get_kv_value(instance, key).await
+    }
 }
 
 // --- Tests ---

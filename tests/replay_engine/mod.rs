@@ -16,6 +16,7 @@ mod failure_handling;
 mod fresh_execution;
 mod history_corruption;
 mod is_replaying;
+mod kv;
 mod nondeterminism;
 mod panic_handling;
 mod partial_completion;

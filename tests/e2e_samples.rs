@@ -2260,3 +2260,262 @@ async fn sample_dual_runtime_tag_cooperation() {
     rt_b.shutdown(None).await;
     rt_a.shutdown(None).await;
 }
+
+/// KV Store: Client ↔ Orchestration request/response via KV + external events.
+///
+/// Pattern: A long-running "server" orchestration receives requests via external
+/// events and writes responses to its KV store. Clients poll `client.get_value()`
+/// to read responses. This eliminates the need for a separate response channel.
+///
+/// Highlights:
+/// - `ctx.set_value()` / `ctx.get_value()` for in-orchestration state
+/// - `client.get_value()` for external reads of orchestration KV
+/// - `ctx.schedule_wait()` to receive requests as external events
+/// - Request/response correlation via KV keys like `"response:{op_id}"`
+/// - KV survives replay — safe across restarts
+#[tokio::test]
+async fn sample_kv_request_response() {
+    let (store, _temp_dir) = common::create_sqlite_store_disk().await;
+
+    let activities = ActivityRegistry::builder()
+        .register("ProcessCommand", |_ctx: ActivityContext, input: String| async move {
+            // Simulate processing: reverse the input string
+            Ok(input.chars().rev().collect::<String>())
+        })
+        .build();
+
+    let orchestrations = OrchestrationRegistry::builder()
+        .register(
+            "RequestServer",
+            |ctx: OrchestrationContext, _input: String| async move {
+                ctx.set_value("status", "ready");
+
+                // Process up to 3 requests then shut down
+                for _ in 0..3 {
+                    // Wait for a request event
+                    let request_json = ctx.schedule_wait("request").await;
+                    let request: serde_json::Value = serde_json::from_str(&request_json).unwrap();
+                    let op_id = request["op_id"].as_str().unwrap().to_string();
+                    let command = request["command"].as_str().unwrap().to_string();
+
+                    ctx.set_value("status", "processing");
+
+                    // Process the command via an activity
+                    let result = ctx
+                        .schedule_activity("ProcessCommand", command)
+                        .await
+                        .unwrap_or_else(|e| format!("error: {e}"));
+
+                    // Write response to KV keyed by op_id
+                    ctx.set_value(format!("response:{op_id}"), &result);
+                    ctx.set_value("status", "ready");
+                }
+
+                ctx.set_value("status", "shutdown");
+                Ok("served 3 requests".to_string())
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_options(store.clone(), activities, orchestrations, Default::default()).await;
+
+    let client = Client::new(store.clone());
+
+    // Start the server orchestration
+    client
+        .start_orchestration("req-resp-server", "RequestServer", "")
+        .await
+        .unwrap();
+
+    // Wait for the server to be ready
+    let status = client
+        .wait_for_value("req-resp-server", "status", Duration::from_secs(5))
+        .await
+        .expect("Server never became ready");
+    assert_eq!(status, "ready");
+
+    // Send 3 requests and verify each response
+    let requests = vec![("op-1", "hello"), ("op-2", "world"), ("op-3", "rust")];
+
+    for (op_id, command) in &requests {
+        let event_data = serde_json::json!({ "op_id": op_id, "command": command }).to_string();
+        client
+            .raise_event("req-resp-server", "request", &event_data)
+            .await
+            .unwrap();
+
+        // Wait for response
+        let response_key = format!("response:{op_id}");
+        let response = client
+            .wait_for_value("req-resp-server", &response_key, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|_| panic!("Timed out waiting for response to {op_id}"));
+
+        let expected: String = command.chars().rev().collect();
+        assert_eq!(
+            response, expected,
+            "Response for {op_id} should be the reversed command"
+        );
+    }
+
+    // Wait for server to complete
+    match client
+        .wait_for_orchestration("req-resp-server", Duration::from_secs(5))
+        .await
+        .unwrap()
+    {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "served 3 requests");
+        }
+        other => panic!("Expected Completed, got: {other:?}"),
+    }
+
+    // All KV values still accessible after completion
+    assert_eq!(
+        client.get_value("req-resp-server", "status").await.unwrap(),
+        Some("shutdown".to_string())
+    );
+    assert_eq!(
+        client.get_value("req-resp-server", "response:op-1").await.unwrap(),
+        Some("olleh".to_string())
+    );
+    assert_eq!(
+        client.get_value("req-resp-server", "response:op-2").await.unwrap(),
+        Some("dlrow".to_string())
+    );
+    assert_eq!(
+        client.get_value("req-resp-server", "response:op-3").await.unwrap(),
+        Some("tsur".to_string())
+    );
+
+    rt.shutdown(None).await;
+}
+
+/// KV Store: Cross-orchestration reads via `get_value_from_instance()`.
+///
+/// Pattern: Orchestration B reads KV values set by Orchestration A using
+/// the system activity `get_value_from_instance()`. This enables coordination
+/// between independent orchestrations without shared state or external systems.
+///
+/// Highlights:
+/// - `ctx.get_value_from_instance()` reads another orchestration's KV via a system activity
+/// - Cross-instance reads are replay-safe (recorded as `ActivityCompleted`)
+/// - Values set by one orchestration are immediately visible to others (after ack)
+/// - `client.wait_for_value()` for efficient polling
+#[tokio::test]
+async fn sample_kv_cross_orchestration_read() {
+    let (store, _temp_dir) = common::create_sqlite_store_disk().await;
+
+    let activities = ActivityRegistry::builder()
+        .register("ComputeResult", |_ctx: ActivityContext, input: String| async move {
+            let n: i64 = input.parse().map_err(|e| format!("parse: {e}"))?;
+            Ok((n * n).to_string())
+        })
+        .build();
+
+    let orchestrations = OrchestrationRegistry::builder()
+        // Producer: computes values and stores them in KV
+        .register("Producer", |ctx: OrchestrationContext, input: String| async move {
+            let n: i64 = input.parse().unwrap();
+            ctx.set_value("status", "computing");
+
+            let squared = ctx.schedule_activity("ComputeResult", n.to_string()).await?;
+            ctx.set_value("result", &squared);
+            ctx.set_value("status", "done");
+
+            // Wait for consumer to acknowledge before completing
+            ctx.schedule_wait("ack").await;
+            Ok(format!("produced:{squared}"))
+        })
+        // Consumer: reads the producer's KV values
+        .register(
+            "Consumer",
+            |ctx: OrchestrationContext, producer_id: String| async move {
+                // Poll producer's status via cross-instance read
+                let mut attempts = 0;
+                loop {
+                    let status = ctx
+                        .get_value_from_instance(&producer_id, "status")
+                        .await
+                        .map_err(|e| format!("read status: {e}"))?;
+                    if status.as_deref() == Some("done") {
+                        break;
+                    }
+                    attempts += 1;
+                    if attempts > 20 {
+                        return Err("producer never finished".to_string());
+                    }
+                    ctx.schedule_timer(Duration::from_millis(100)).await;
+                }
+
+                // Read the computed result from producer's KV
+                let result = ctx
+                    .get_value_from_instance(&producer_id, "result")
+                    .await
+                    .map_err(|e| format!("read result: {e}"))?;
+
+                let result = result.ok_or_else(|| "result key missing".to_string())?;
+
+                Ok(format!("consumed:{result}"))
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_options(store.clone(), activities, orchestrations, Default::default()).await;
+
+    let client = Client::new(store.clone());
+
+    // Start the producer
+    client.start_orchestration("producer-1", "Producer", "7").await.unwrap();
+
+    // Wait for producer to have a result via client polling
+    let result = client
+        .wait_for_value("producer-1", "result", Duration::from_secs(5))
+        .await
+        .expect("Producer never set result");
+    assert_eq!(result, "49"); // 7*7
+
+    // Start the consumer, pointing it at the producer
+    client
+        .start_orchestration("consumer-1", "Consumer", "producer-1")
+        .await
+        .unwrap();
+
+    // Wait for consumer to complete
+    match client
+        .wait_for_orchestration("consumer-1", Duration::from_secs(10))
+        .await
+        .unwrap()
+    {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "consumed:49");
+        }
+        other => panic!("Expected consumer Completed, got: {other:?}"),
+    }
+
+    // Acknowledge the producer so it completes too
+    client.raise_event("producer-1", "ack", "").await.unwrap();
+
+    match client
+        .wait_for_orchestration("producer-1", Duration::from_secs(5))
+        .await
+        .unwrap()
+    {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "produced:49");
+        }
+        other => panic!("Expected producer Completed, got: {other:?}"),
+    }
+
+    // Cross-instance reads also work via client after both are terminal
+    assert_eq!(
+        client.get_value("producer-1", "result").await.unwrap(),
+        Some("49".to_string())
+    );
+    assert_eq!(
+        client.get_value("producer-1", "status").await.unwrap(),
+        Some("done".to_string())
+    );
+
+    rt.shutdown(None).await;
+}

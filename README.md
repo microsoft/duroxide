@@ -21,6 +21,7 @@ A lightweight and embeddable durable execution runtime for Rust. Inspired by the
 - Cooperative activity cancellation: in-flight activities receive cancellation signals via `ActivityContext` when orchestration is cancelled; activities can clean up gracefully or be forcibly aborted after a grace period.
 - Session affinity: route activities to the same worker for in-memory state reuse across turns. `ctx.schedule_activity_on_session(name, input, session_id)` pins work by session ID. Sessions are automatically managed with heartbeat leases, idle timeout, and crash recovery.
 - **Worker specialization (activity tags):** route activities to specialized worker pools via `.with_tag("gpu")`. Workers declare which tags they accept via `RuntimeOptions { worker_tag_filter: TagFilter::tags(["gpu"]) }`. Tags compose with sessions, retry, join/select, and cancellation.
+- **Durable KV store:** per-instance key-value state via `ctx.set_value(key, value)` / `ctx.get_value(key)`. Values survive replay and `continue_as_new`. External clients can read KV via `client.get_value(instance, key)`. Cross-instance reads via `ctx.get_value_from_instance(instance, key)`. Max 10 keys, 16KB per value.
 
 These patterns are enabled by deterministic replay, correlation IDs, durable timers, and external event handling.
 

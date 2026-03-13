@@ -298,6 +298,10 @@ pub struct OrchestrationItem {
     /// `Err(ProviderError::permanent(...))` when deserialization fails after acquiring
     /// a lock. This ensures the lock lifecycle stays clean (Ok = lock held, Err = no lock).
     pub history_error: Option<String>,
+
+    /// KV snapshot loaded from the materialized `kv_store` table at fetch time.
+    /// Seeds the orchestration's in-memory `kv_state` before the turn executes.
+    pub kv_snapshot: std::collections::HashMap<String, String>,
 }
 
 /// Execution metadata computed by the runtime to be persisted by the provider.
@@ -2096,6 +2100,12 @@ pub trait Provider: Any + Send + Sync {
         _instance: &str,
         _last_seen_version: u64,
     ) -> Result<Option<(Option<String>, u64)>, ProviderError>;
+
+    /// Read a single KV entry for the given instance.
+    ///
+    /// Returns `Ok(Some(value))` if the key exists, `Ok(None)` otherwise.
+    /// Reads directly from the materialized `kv_store` table (not history events).
+    async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError>;
 }
 
 /// Management and observability provider interface.

@@ -32,3 +32,14 @@ pub const MAX_WORKER_TAGS: usize = 5;
 /// the same pattern as [`MAX_CUSTOM_STATUS_BYTES`]. If exceeded, the
 /// orchestration is failed with an Infrastructure error.
 pub const MAX_TAG_NAME_BYTES: usize = 256;
+
+/// Maximum number of KV keys per orchestration instance.
+///
+/// Enforced in `validate_limits()` after the orchestration turn completes.
+/// If exceeded, the orchestration is failed with a non-retryable application error.
+pub const MAX_KV_KEYS: usize = 10;
+
+/// Maximum size of a single KV value in bytes (16 KiB).
+///
+/// Enforced in `validate_limits()` by scanning `KeyValueSet` events in the history delta.
+pub const MAX_KV_VALUE_BYTES: usize = 16 * 1024;

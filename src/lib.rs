@@ -787,6 +787,7 @@ pub(crate) const SYSCALL_ACTIVITY_PREFIX: &str = "__duroxide_syscall:";
 // Built-in system activity names (constructed from prefix)
 pub(crate) const SYSCALL_ACTIVITY_NEW_GUID: &str = "__duroxide_syscall:new_guid";
 pub(crate) const SYSCALL_ACTIVITY_UTC_NOW_MS: &str = "__duroxide_syscall:utc_now_ms";
+pub(crate) const SYSCALL_ACTIVITY_GET_KV_VALUE: &str = "__duroxide_syscall:get_kv_value";
 
 use crate::_typed_codec::Codec;
 // LogLevel is now defined locally in this file
@@ -1225,6 +1226,20 @@ pub enum EventKind {
     #[cfg(feature = "replay-version-test")]
     #[serde(rename = "ExternalEvent2")]
     ExternalEvent2 { name: String, topic: String, data: String },
+
+    // === Key-Value Store Events ===
+    /// A key-value pair was set via `ctx.set_value()`.
+    /// Fire-and-forget metadata action (like `CustomStatusUpdated`).
+    #[serde(rename = "KeyValueSet")]
+    KeyValueSet { key: String, value: String },
+
+    /// A single key was cleared via `ctx.clear_value()`.
+    #[serde(rename = "KeyValueCleared")]
+    KeyValueCleared { key: String },
+
+    /// All key-value pairs were cleared via `ctx.clear_all_values()`.
+    #[serde(rename = "KeyValuesCleared")]
+    KeyValuesCleared,
 }
 
 impl Event {
@@ -1508,6 +1523,17 @@ pub enum Action {
         name: String,
         topic: String,
     },
+
+    // === Key-Value Store Actions ===
+    /// Set a key-value pair on this orchestration instance.
+    /// Fire-and-forget metadata action (like `UpdateCustomStatus`).
+    SetKeyValue { key: String, value: String },
+
+    /// Clear a single key from the KV store.
+    ClearKeyValue { key: String },
+
+    /// Clear all keys from the KV store.
+    ClearKeyValues,
 }
 
 /// Result delivered to a durable future upon completion.
@@ -1599,6 +1625,11 @@ struct CtxInner {
     /// Updated by `CustomStatusUpdated` events during replay and by `set_custom_status()` / `reset_custom_status()` calls.
     /// `None` means no custom status has been set (either never set, or cleared via `reset_custom_status()`).
     accumulated_custom_status: Option<String>,
+
+    /// Instance-scoped key-value store.
+    /// Seeded from the provider's materialized `kv_store` table at fetch time,
+    /// then kept current by `set_value`/`clear_value`/`clear_all_values` calls.
+    kv_state: std::collections::HashMap<String, String>,
 }
 
 impl CtxInner {
@@ -1647,6 +1678,8 @@ impl CtxInner {
             logging_enabled_this_poll: false,
 
             accumulated_custom_status: None,
+
+            kv_state: std::collections::HashMap::new(),
         }
     }
 
@@ -3175,6 +3208,114 @@ impl OrchestrationContext {
     /// from the previous execution.
     pub fn get_custom_status(&self) -> Option<String> {
         self.inner.lock().unwrap().accumulated_custom_status.clone()
+    }
+
+    // =========================================================================
+    // Key-Value Store
+    // =========================================================================
+
+    /// Set a key-value pair scoped to this orchestration instance.
+    ///
+    /// Emits a `KeyValueSet` history event. The provider materializes this
+    /// into the `kv_store` table during ack.
+    pub fn set_value(&self, key: impl Into<String>, value: impl Into<String>) {
+        let key: String = key.into();
+        let value: String = value.into();
+        let mut inner = self.inner.lock().unwrap();
+        inner.kv_state.insert(key.clone(), value.clone());
+        inner.emit_action(Action::SetKeyValue { key, value });
+    }
+
+    /// Set a typed value (serialized as JSON) scoped to this orchestration instance.
+    pub fn set_value_typed<T: serde::Serialize>(&self, key: impl Into<String>, value: &T) {
+        let serialized = serde_json::to_string(value).expect("KV value serialization should not fail");
+        self.set_value(key, serialized);
+    }
+
+    /// Read a KV entry from in-memory state.
+    ///
+    /// Pure read — no provider call, no event emitted, fully deterministic.
+    /// Returns `None` if the key has never been set or was cleared.
+    pub fn get_value(&self, key: &str) -> Option<String> {
+        self.inner.lock().unwrap().kv_state.get(key).cloned()
+    }
+
+    /// Read a typed KV entry. Returns `None` if the key doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the key exists but deserialization fails.
+    pub fn get_value_typed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, String> {
+        match self.get_value(key) {
+            None => Ok(None),
+            Some(s) => serde_json::from_str(&s)
+                .map(Some)
+                .map_err(|e| format!("KV deserialization error for key '{}': {}", key, e)),
+        }
+    }
+
+    /// Clear a single key from the KV store.
+    ///
+    /// Emits a `KeyValueCleared` history event. After this call,
+    /// `get_value(key)` returns `None`.
+    pub fn clear_value(&self, key: impl Into<String>) {
+        let key: String = key.into();
+        let mut inner = self.inner.lock().unwrap();
+        inner.kv_state.remove(&key);
+        inner.emit_action(Action::ClearKeyValue { key });
+    }
+
+    /// Clear all keys from the KV store.
+    ///
+    /// Emits a `KeyValuesCleared` history event. After this call,
+    /// `get_value(key)` returns `None` for all keys.
+    pub fn clear_all_values(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.kv_state.clear();
+        inner.emit_action(Action::ClearKeyValues);
+    }
+
+    /// Read a KV entry from another orchestration instance.
+    ///
+    /// This is modeled as a system activity — under the covers it schedules
+    /// `__duroxide_syscall:get_kv_value` which calls `client.get_value()`.
+    /// Returns the value at the time the activity executes (not replay-cached on first run).
+    /// On replay, the recorded result is returned — no provider call.
+    pub fn get_value_from_instance(
+        &self,
+        instance_id: impl Into<String>,
+        key: impl Into<String>,
+    ) -> DurableFuture<Result<Option<String>, String>> {
+        let input = serde_json::json!({
+            "instance_id": instance_id.into(),
+            "key": key.into(),
+        })
+        .to_string();
+        self.schedule_activity(SYSCALL_ACTIVITY_GET_KV_VALUE, input)
+            .map(|result| match result {
+                Ok(json_str) => serde_json::from_str::<Option<String>>(&json_str)
+                    .map_err(|e| format!("get_value_from_instance deserialization error: {e}")),
+                Err(e) => Err(e),
+            })
+    }
+
+    /// Typed variant of `get_value_from_instance`.
+    ///
+    /// Deserializes the returned JSON string into `T`.
+    /// Returns `Ok(None)` if the key doesn't exist in the remote instance.
+    pub fn get_value_from_instance_typed<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        instance_id: impl Into<String>,
+        key: impl Into<String>,
+    ) -> DurableFuture<Result<Option<T>, String>> {
+        self.get_value_from_instance(instance_id, key)
+            .map(|result| match result {
+                Ok(None) => Ok(None),
+                Ok(Some(s)) => serde_json::from_str::<T>(&s)
+                    .map(Some)
+                    .map_err(|e| format!("get_value_from_instance_typed deserialization error: {e}")),
+                Err(e) => Err(e),
+            })
     }
 }
 

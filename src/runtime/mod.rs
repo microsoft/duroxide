@@ -19,8 +19,9 @@ use tracing::warn;
 // ============================================================================
 
 /// Inject built-in system activities into the activity registry.
-/// This adds the new_guid and utc_now_ms activities that are used by
-/// `OrchestrationContext::new_guid()` and `OrchestrationContext::utc_now()`.
+/// This adds the new_guid, utc_now_ms, and get_kv_value activities that are used by
+/// `OrchestrationContext::new_guid()`, `OrchestrationContext::utc_now()`,
+/// and `OrchestrationContext::get_value_from_instance()`.
 fn inject_builtin_activities(user_registry: registry::ActivityRegistry) -> registry::ActivityRegistry {
     registry::ActivityRegistry::builder_from(&user_registry)
         .register_builtin(
@@ -36,6 +37,25 @@ fn inject_builtin_activities(user_registry: registry::ActivityRegistry) -> regis
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 Ok(ms.to_string())
+            },
+        )
+        .register_builtin(
+            crate::SYSCALL_ACTIVITY_GET_KV_VALUE,
+            |ctx: crate::ActivityContext, input: String| async move {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&input).map_err(|e| format!("get_kv_value: invalid input: {e}"))?;
+                let instance_id = parsed["instance_id"]
+                    .as_str()
+                    .ok_or_else(|| "get_kv_value: missing instance_id".to_string())?;
+                let key = parsed["key"]
+                    .as_str()
+                    .ok_or_else(|| "get_kv_value: missing key".to_string())?;
+                let client = ctx.get_client();
+                let value = client
+                    .get_value(instance_id, key)
+                    .await
+                    .map_err(|e| format!("get_kv_value client error: {e}"))?;
+                serde_json::to_string(&value).map_err(|e| format!("get_kv_value serialization error: {e}"))
             },
         )
         .build_result()
@@ -905,7 +925,7 @@ impl Runtime {
             );
         }
 
-        // Inject built-in system activities (new_guid, utc_now_ms)
+        // Inject built-in system activities (new_guid, utc_now_ms, get_kv_value)
         let activity_registry = inject_builtin_activities(activity_registry);
 
         // Wrap activity registry in Arc for internal sharing across worker threads

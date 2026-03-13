@@ -380,6 +380,7 @@ Here's every method you need to implement, organized by complexity:
 |--------|---------|
 | `latest_execution_id()` | Performance optimization |
 | `read_with_execution()` | Read specific execution's history |
+| `get_kv_value()` | Read a KV entry for an instance |
 | `list_instances()` | Management API |
 | `list_executions()` | Management API |
 
@@ -531,6 +532,16 @@ impl Provider for MyProvider {
         last_seen_version: u64,
     ) -> Result<Option<(Option<String>, u64)>, ProviderError> {
         todo!("Return (custom_status, version) if version > last_seen_version")
+    }
+    
+    // === KV Store ===
+    
+    async fn get_kv_value(
+        &self,
+        instance: &str,
+        key: &str,
+    ) -> Result<Option<String>, ProviderError> {
+        todo!("Read from kv_store table")
     }
 }
 ```
@@ -798,9 +809,10 @@ The `ack_orchestration_item()` method is the heart of the provider. It must atom
 2. Append new events to history
 3. Update instance metadata
 4. Enqueue new work items
-5. Delete cancelled activities (lock stealing)
-6. Delete processed messages
-7. Release the instance lock
+5. Materialize KV events (`KeyValueSet`, `KeyValueCleared`, `KeyValuesCleared`) into the `kv_store` table
+6. Delete cancelled activities (lock stealing)
+7. Delete processed messages
+8. Release the instance lock
 
 All of this must succeed or fail together. See [Detailed Method Implementations](#ack_orchestration_item---the-atomic-commit) for the full implementation.
 
@@ -869,7 +881,7 @@ Several operations must be atomic (all-or-nothing):
 | Operation | Must Be Atomic |
 |-----------|----------------|
 | `ack_work_item()` | Delete + enqueue completion |
-| `ack_orchestration_item()` | All 7 steps (see above) |
+| `ack_orchestration_item()` | All 8 steps (see above) |
 | `fetch_orchestration_item()` | Lock instance + tag messages |
 
 Use database transactions to ensure atomicity.
@@ -1753,6 +1765,15 @@ CREATE TABLE sessions (
     last_activity_at INTEGER NOT NULL
 );
 
+-- KV store (per-instance durable state)
+CREATE TABLE kv_store (
+    instance_id  TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    value        TEXT NOT NULL,
+    execution_id INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, key)
+);
+
 -- Indexes
 CREATE INDEX idx_orch_queue_fetch ON orchestrator_queue (visible_at, instance_id) 
     WHERE lock_token IS NULL;
@@ -1960,6 +1981,19 @@ Before considering your provider complete:
 - [ ] `get_custom_status()` returns `Ok(Some((status, version)))` when `version > last_seen_version`
 - [ ] `get_custom_status()` returns `Ok(None)` when version unchanged
 - [ ] `get_custom_status()` returns `Ok(None)` for non-existent instances
+
+### KV Store
+- [ ] `ack_orchestration_item()` materializes `KeyValueSet` events into `kv_store` table
+- [ ] `ack_orchestration_item()` materializes `KeyValueCleared` events (deletes key)
+- [ ] `ack_orchestration_item()` materializes `KeyValuesCleared` events (deletes all keys for instance)
+- [ ] `ack_orchestration_item()` updates `execution_id` on overwrite (last-writer-wins)
+- [ ] `fetch_orchestration_item()` loads `kv_snapshot` from `kv_store` table
+- [ ] `get_kv_value()` returns `Ok(Some(value))` for existing keys
+- [ ] `get_kv_value()` returns `Ok(None)` for missing keys or nonexistent instances
+- [ ] Pruning removes KV entries whose `execution_id` is pruned (orphan cleanup)
+- [ ] Pruning preserves KV entries overwritten by a surviving execution
+- [ ] Instance deletion cascades to `kv_store` entries
+- [ ] KV entries are isolated between instances (same key name, different values)
 
 ### Concurrency
 - [ ] Lock acquisition is atomic (no check-then-set)

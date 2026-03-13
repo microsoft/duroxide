@@ -26,8 +26,11 @@ use super::super::{HistoryManager, Runtime, WorkItemReader};
 /// Currently enforces:
 /// - Custom status size limit ([`crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES`])
 /// - Tag name size limit ([`crate::runtime::limits::MAX_TAG_NAME_BYTES`])
+/// - KV value size limit ([`crate::runtime::limits::MAX_KV_VALUE_BYTES`])
+/// - KV key count limit ([`crate::runtime::limits::MAX_KV_KEYS`])
 ///
 /// Returns `true` if a limit was violated (orchestration marked as failed).
+#[allow(clippy::too_many_arguments)]
 fn validate_limits(
     history_delta: &[Event],
     history_mgr: &mut HistoryManager,
@@ -36,6 +39,7 @@ fn validate_limits(
     orchestrator_items: &mut Vec<WorkItem>,
     instance: &str,
     execution_id: u64,
+    kv_snapshot: &std::collections::HashMap<String, String>,
 ) -> bool {
     // --- Custom status size ---
     let last_custom_status = history_delta.iter().rev().find_map(|e| {
@@ -107,6 +111,89 @@ fn validate_limits(
                 activity_name,
                 tag_len,
                 crate::runtime::limits::MAX_TAG_NAME_BYTES,
+            ),
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+        );
+        return true;
+    }
+
+    // --- KV value size ---
+    let oversized_kv = history_delta.iter().find_map(|e| {
+        if let EventKind::KeyValueSet { ref key, ref value } = e.kind {
+            if value.len() > crate::runtime::limits::MAX_KV_VALUE_BYTES {
+                Some((key.clone(), value.len()))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
+    if let Some((ref key, value_len)) = oversized_kv {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            key = %key,
+            value_bytes = value_len,
+            max_bytes = crate::runtime::limits::MAX_KV_VALUE_BYTES,
+            "KV value exceeds size limit, failing orchestration"
+        );
+        fail_orchestration_for_limit(
+            format!(
+                "KV value for key '{}' ({} bytes) exceeds limit ({} bytes)",
+                key,
+                value_len,
+                crate::runtime::limits::MAX_KV_VALUE_BYTES,
+            ),
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+        );
+        return true;
+    }
+
+    // --- KV key count ---
+    // Compute effective key count by applying delta events to the snapshot
+    let mut effective_keys: std::collections::HashSet<String> = kv_snapshot.keys().cloned().collect();
+    for event in history_delta {
+        match &event.kind {
+            EventKind::KeyValueSet { key, .. } => {
+                effective_keys.insert(key.clone());
+            }
+            EventKind::KeyValueCleared { key } => {
+                effective_keys.remove(key);
+            }
+            EventKind::KeyValuesCleared => {
+                effective_keys.clear();
+            }
+            _ => {}
+        }
+    }
+
+    if effective_keys.len() > crate::runtime::limits::MAX_KV_KEYS {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            kv_key_count = effective_keys.len(),
+            max_keys = crate::runtime::limits::MAX_KV_KEYS,
+            "KV key count exceeds limit, failing orchestration"
+        );
+        fail_orchestration_for_limit(
+            format!(
+                "KV key count ({}) exceeds limit ({})",
+                effective_keys.len(),
+                crate::runtime::limits::MAX_KV_KEYS,
             ),
             history_mgr,
             metadata,
@@ -551,6 +638,7 @@ impl Runtime {
                         &workitem_reader,
                         execution_id_to_use,
                         worker_id,
+                        item.kv_snapshot.clone(),
                     )
                     .await;
 
@@ -623,7 +711,7 @@ impl Runtime {
         let mut metadata =
             Runtime::compute_execution_metadata(&history_delta_snapshot, &orchestrator_items, item.execution_id);
 
-        // Enforce runtime limits (custom status size, tag name size, etc.)
+        // Enforce runtime limits (custom status size, tag name size, KV limits, etc.)
         validate_limits(
             &history_delta_snapshot,
             &mut history_mgr,
@@ -632,6 +720,7 @@ impl Runtime {
             &mut orchestrator_items,
             instance,
             execution_id_for_ack,
+            &item.kv_snapshot,
         );
 
         // Calculate metrics
@@ -933,6 +1022,7 @@ impl Runtime {
         workitem_reader: &WorkItemReader,
         execution_id: u64,
         worker_id: &str,
+        kv_snapshot: std::collections::HashMap<String, String>,
     ) -> Result<(Vec<WorkItem>, Vec<WorkItem>, Vec<ScheduledActivityIdentifier>), OrchestrationProcessingError> {
         let mut worker_items = Vec::new();
         let mut orchestrator_items = Vec::new();
@@ -1011,6 +1101,7 @@ impl Runtime {
                     worker_id,
                     handler,
                     resolved_version.to_string(),
+                    kv_snapshot,
                 )
                 .await;
 

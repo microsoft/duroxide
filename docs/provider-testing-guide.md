@@ -679,6 +679,34 @@ The validation test suite includes **166 individual test functions** organized i
     - `test_multi_runtime_tag_isolation` - Concurrent runtimes with different TagFilters (mutual exclusion, partial overlap, full overlap)
     - `test_tag_preserved_through_ack_orchestration_item` - Tags on worker items survive the ack_orchestration_item path (enqueue via orchestrator ack → fetch with tag filter)
 
+18. **KV Store Tests (26 tests)** - `duroxide::provider_validations::kv_store`
+    - `test_kv_set_and_get` - Set a key and retrieve it
+    - `test_kv_overwrite` - Overwriting an existing key returns the new value
+    - `test_kv_clear_single` - Clear a single key
+    - `test_kv_clear_all` - Clear all keys for an instance
+    - `test_kv_get_nonexistent` - Get missing key returns None
+    - `test_kv_snapshot_in_fetch` - Fetch returns KV snapshot
+    - `test_kv_snapshot_after_clear_single` - Snapshot omits cleared key
+    - `test_kv_snapshot_after_clear_all` - Snapshot empty after clear-all
+    - `test_kv_execution_id_tracking` - Last-writer-wins for pruning
+    - `test_kv_cross_execution_overwrite` - Value updated across executions
+    - `test_kv_cross_execution_remove_readd` - Clear in exec 2, re-add in exec 3
+    - `test_kv_prune_preserves_overwritten` - Pruned execution's key survives if overwritten
+    - `test_kv_prune_removes_orphan_keys` - Orphan keys deleted on prune
+    - `test_kv_instance_isolation` - Same key name, different instances, different values
+    - `test_kv_delete_instance_cascades` - Deleting instance removes all KV
+    - `test_kv_clear_nonexistent_key` - Clearing missing key is idempotent
+    - `test_kv_get_unknown_instance` - get_kv_value for nonexistent instance returns None
+    - `test_kv_set_after_clear` - Clear-all then set in same ack
+    - `test_kv_empty_value` - Empty string value is valid (not None)
+    - `test_kv_large_value` - 16KB value stored and retrieved correctly
+    - `test_kv_special_chars_in_key` - Unicode, spaces, dots, slashes in key names
+    - `test_kv_snapshot_empty` - Fresh instance has empty KV snapshot
+    - `test_kv_snapshot_cross_execution` - Keys from multiple executions in snapshot
+    - `test_kv_prune_current_execution_protected` - Single execution's KV survives prune
+    - `test_kv_delete_instance_with_children` - Parent deletion cascades child KV
+    - `test_kv_clear_isolation` - Clearing one instance doesn't affect another
+
 ### Running Individual Test Functions
 
 Each validation test should be run individually. This provides:
@@ -1050,7 +1078,7 @@ This generates `stress-test-results.md` with:
 
 - **Test Implementation**: `src/provider_validation/` (individual test modules)
 - **Test API**: `src/provider_validations.rs` (test function exports)
-- **Example Usage**: `tests/sqlite_provider_validations.rs` (complete example with all 176 tests)
+- **Example Usage**: `tests/sqlite_provider_validations.rs` (complete example with all 202 tests)
 - **Test Specification**: See individual test function documentation
 - **Provider Guide**: `docs/provider-implementation-guide.md`
 - **Built-in Providers**: `src/providers/sqlite.rs`

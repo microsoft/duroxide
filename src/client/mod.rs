@@ -870,6 +870,105 @@ impl Client {
         Err(ClientError::Timeout)
     }
 
+    // ===== Key-Value Store =====
+
+    /// Read a single KV entry for a given instance.
+    ///
+    /// Reads directly from the provider's materialized `kv_store` table.
+    /// Returns `Ok(None)` if the key doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError` if the provider fails to read.
+    pub async fn get_value(&self, instance: &str, key: &str) -> Result<Option<String>, ClientError> {
+        self.store.get_kv_value(instance, key).await.map_err(ClientError::from)
+    }
+
+    /// Read a typed KV entry for a given instance.
+    ///
+    /// Deserializes the stored JSON value into `T`.
+    /// Returns `Ok(None)` if the key doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError` if the provider fails or deserialization fails.
+    pub async fn get_value_typed<T: serde::de::DeserializeOwned>(
+        &self,
+        instance: &str,
+        key: &str,
+    ) -> Result<Option<T>, ClientError> {
+        match self.get_value(instance, key).await? {
+            None => Ok(None),
+            Some(s) => serde_json::from_str(&s)
+                .map(Some)
+                .map_err(|e| ClientError::InvalidInput {
+                    message: format!("KV deserialization error: {e}"),
+                }),
+        }
+    }
+
+    /// Poll a KV key until it becomes `Some`, or timeout.
+    ///
+    /// Uses exponential backoff (same as [`wait_for_orchestration`](Self::wait_for_orchestration)).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let value = client.wait_for_value(
+    ///     "my-instance", "response:op-1",
+    ///     Duration::from_secs(5),
+    /// ).await?;
+    /// println!("Got: {value}");
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError::Timeout` if the key is still `None` after `timeout`.
+    /// Returns `ClientError` if a provider read fails.
+    pub async fn wait_for_value(
+        &self,
+        instance: &str,
+        key: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, ClientError> {
+        let deadline = std::time::Instant::now() + timeout;
+        // quick path
+        if let Some(val) = self.get_value(instance, key).await? {
+            return Ok(val);
+        }
+        // poll with backoff
+        let mut delay_ms: u64 = INITIAL_POLL_DELAY_MS;
+        while std::time::Instant::now() < deadline {
+            if let Some(val) = self.get_value(instance, key).await? {
+                return Ok(val);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            delay_ms = (delay_ms.saturating_mul(POLL_DELAY_MULTIPLIER)).min(MAX_POLL_DELAY_MS);
+        }
+        Err(ClientError::Timeout)
+    }
+
+    /// Poll a typed KV key until it becomes `Some`, or timeout.
+    ///
+    /// Same as [`wait_for_value`](Self::wait_for_value) but deserializes
+    /// the JSON value into `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError::Timeout` if the key is still `None` after `timeout`.
+    /// Returns `ClientError` if a provider read or deserialization fails.
+    pub async fn wait_for_value_typed<T: serde::de::DeserializeOwned>(
+        &self,
+        instance: &str,
+        key: &str,
+        timeout: std::time::Duration,
+    ) -> Result<T, ClientError> {
+        let raw = self.wait_for_value(instance, key, timeout).await?;
+        serde_json::from_str(&raw).map_err(|e| ClientError::InvalidInput {
+            message: format!("KV deserialization error: {e}"),
+        })
+    }
+
     // ===== Capability Discovery =====
 
     /// Check if management capabilities are available.

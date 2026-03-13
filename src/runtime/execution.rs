@@ -29,6 +29,7 @@ impl Runtime {
         worker_id: &str,
         handler: Arc<dyn OrchestrationHandler>,
         orchestration_version: String,
+        kv_snapshot: std::collections::HashMap<String, String>,
     ) -> (
         Vec<Event>,
         Vec<WorkItem>,
@@ -94,7 +95,8 @@ impl Runtime {
         // Get the persisted history length for is_replaying tracking
         let persisted_len = history_mgr.original_len();
         let mut turn = ReplayEngine::new(instance.to_string(), execution_id, current_execution_history)
-            .with_persisted_history_len(persisted_len);
+            .with_persisted_history_len(persisted_len)
+            .with_kv_snapshot(kv_snapshot);
 
         // Prep completions from incoming messages
         if !messages.is_empty() {

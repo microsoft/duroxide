@@ -59,6 +59,10 @@ pub struct ReplayEngine {
     /// Events beyond this index in baseline_history are NEW this turn (not replay).
     /// Used to correctly track is_replaying state.
     persisted_history_len: usize,
+
+    /// KV snapshot loaded from the provider at fetch time.
+    /// Seeded into `ctx.inner.kv_state` before the orchestration turn executes.
+    kv_snapshot: std::collections::HashMap<String, String>,
 }
 
 impl ReplayEngine {
@@ -78,6 +82,7 @@ impl ReplayEngine {
             next_event_id,
             abort_error: None,
             persisted_history_len: persisted_len,
+            kv_snapshot: std::collections::HashMap::new(),
         }
     }
 
@@ -92,6 +97,12 @@ impl ReplayEngine {
     /// OrchestrationStarted on the first turn.
     pub fn with_persisted_history_len(mut self, len: usize) -> Self {
         self.persisted_history_len = len;
+        self
+    }
+
+    /// Set the KV snapshot to seed into the orchestration context.
+    pub fn with_kv_snapshot(mut self, snapshot: std::collections::HashMap<String, String>) -> Self {
+        self.kv_snapshot = snapshot;
         self
     }
 
@@ -532,6 +543,11 @@ impl ReplayEngine {
             Some(worker_id.to_string()),
         );
 
+        // Seed KV state from provider snapshot before orchestration code runs.
+        if !self.kv_snapshot.is_empty() {
+            ctx.inner.lock().expect("Mutex should not be poisoned").kv_state = self.kv_snapshot.clone();
+        }
+
         let ctx_for_future = ctx.clone();
         let h = handler.clone();
         let inp = input.clone();
@@ -680,16 +696,11 @@ impl ReplayEngine {
                     .accumulated_custom_status = Some(status.clone());
             }
             EventKind::OrchestrationStarted { .. } => {}
-            EventKind::CustomStatusUpdated { status } => {
-                ctx.inner
-                    .lock()
-                    .expect("Mutex should not be poisoned")
-                    .accumulated_custom_status = status.clone();
-
+            EventKind::CustomStatusUpdated { .. } => {
                 // Consume the corresponding UpdateCustomStatus action from emitted_actions.
                 // During replay the orchestration re-executes set_custom_status/reset_custom_status
-                // which emits an UpdateCustomStatus action. We must pop it so subsequent schedule
-                // events match correctly.
+                // which already mutated accumulated_custom_status and emitted an action.
+                // We only need to validate action-event consistency.
                 if let Some((_, action)) = emitted_actions.pop_front()
                     && !action_matches_event_kind(&action, &event.kind)
                 {
@@ -701,6 +712,41 @@ impl ReplayEngine {
                 // If no action was emitted (e.g., first execution seeded initial_custom_status),
                 // that is fine — the event came from OrchestrationStarted carry-forward.
             }
+
+            // KV events: consume the matching action emitted by the orchestration's
+            // set_value/clear_value/clear_all_values calls. The orchestration already
+            // mutated kv_state directly, so we only need to validate action-event consistency.
+            EventKind::KeyValueSet { .. } => {
+                if let Some((_, action)) = emitted_actions.pop_front()
+                    && !action_matches_event_kind(&action, &event.kind)
+                {
+                    return Err(TurnResult::Failed(nondeterminism_error(&format!(
+                        "kv set mismatch: action={:?} vs event={:?}",
+                        action, event.kind
+                    ))));
+                }
+            }
+            EventKind::KeyValueCleared { .. } => {
+                if let Some((_, action)) = emitted_actions.pop_front()
+                    && !action_matches_event_kind(&action, &event.kind)
+                {
+                    return Err(TurnResult::Failed(nondeterminism_error(&format!(
+                        "kv clear mismatch: action={:?} vs event={:?}",
+                        action, event.kind
+                    ))));
+                }
+            }
+            EventKind::KeyValuesCleared => {
+                if let Some((_, action)) = emitted_actions.pop_front()
+                    && !action_matches_event_kind(&action, &event.kind)
+                {
+                    return Err(TurnResult::Failed(nondeterminism_error(&format!(
+                        "kv clear_all mismatch: action={:?} vs event={:?}",
+                        action, event.kind
+                    ))));
+                }
+            }
+
             EventKind::ActivityScheduled { name, input: inp, .. } => {
                 self.match_and_bind_schedule(
                     ctx,
@@ -1677,6 +1723,13 @@ fn action_to_event(action: &Action, instance: &str, execution_id: u64, event_id:
         }
         // UpdateCustomStatus becomes a CustomStatusUpdated history event
         Action::UpdateCustomStatus { status } => EventKind::CustomStatusUpdated { status: status.clone() },
+        // KV actions become KV events
+        Action::SetKeyValue { key, value } => EventKind::KeyValueSet {
+            key: key.clone(),
+            value: value.clone(),
+        },
+        Action::ClearKeyValue { key } => EventKind::KeyValueCleared { key: key.clone() },
+        Action::ClearKeyValues => EventKind::KeyValuesCleared,
     };
 
     Some(Event::with_event_id(event_id, instance, execution_id, None, kind))
@@ -1757,6 +1810,8 @@ fn update_action_event_id(action: Action, event_id: u64) -> Action {
         Action::ContinueAsNew { .. } => action,
         // UpdateCustomStatus doesn't have scheduling_event_id
         Action::UpdateCustomStatus { .. } => action,
+        // KV actions don't have scheduling_event_id
+        Action::SetKeyValue { .. } | Action::ClearKeyValue { .. } | Action::ClearKeyValues => action,
     }
 }
 
@@ -1827,6 +1882,11 @@ fn action_matches_event_kind(action: &Action, event_kind: &EventKind) -> bool {
 
         // UpdateCustomStatus matches CustomStatusUpdated by kind only (value may differ across code versions)
         (Action::UpdateCustomStatus { .. }, EventKind::CustomStatusUpdated { .. }) => true,
+
+        // KV actions match KV events by kind only (like custom status)
+        (Action::SetKeyValue { .. }, EventKind::KeyValueSet { .. }) => true,
+        (Action::ClearKeyValue { .. }, EventKind::KeyValueCleared { .. }) => true,
+        (Action::ClearKeyValues, EventKind::KeyValuesCleared) => true,
 
         _ => false,
     }

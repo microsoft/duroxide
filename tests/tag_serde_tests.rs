@@ -764,3 +764,58 @@ async fn e2e_dropped_tagged_future_triggers_cancellation() {
 
     rt.shutdown(None).await;
 }
+
+// =============================================================================
+// KV EventKind serde roundtrip tests
+// =============================================================================
+
+#[test]
+fn kv_event_kinds_roundtrip() {
+    use duroxide::EventKind;
+
+    let cases: Vec<EventKind> = vec![
+        EventKind::KeyValueSet {
+            key: "my_key".to_string(),
+            value: "my_value".to_string(),
+        },
+        EventKind::KeyValueCleared {
+            key: "clear_me".to_string(),
+        },
+        EventKind::KeyValuesCleared,
+    ];
+
+    for kind in &cases {
+        let json = serde_json::to_string(kind).unwrap();
+        let deser: EventKind = serde_json::from_str(&json).unwrap();
+
+        match (kind, &deser) {
+            (EventKind::KeyValueSet { key: k1, value: v1 }, EventKind::KeyValueSet { key: k2, value: v2 }) => {
+                assert_eq!(k1, k2);
+                assert_eq!(v1, v2);
+            }
+            (EventKind::KeyValueCleared { key: k1 }, EventKind::KeyValueCleared { key: k2 }) => {
+                assert_eq!(k1, k2);
+            }
+            (EventKind::KeyValuesCleared, EventKind::KeyValuesCleared) => {}
+            _ => panic!("roundtrip mismatch: serialized {kind:?} but got {deser:?}"),
+        }
+    }
+}
+
+#[test]
+fn kv_event_kinds_backward_compat() {
+    use duroxide::EventKind;
+
+    // Verify specific JSON tags are correct for backward compatibility
+    let json = r#"{"type":"KeyValueSet","key":"k","value":"v"}"#;
+    let kind: EventKind = serde_json::from_str(json).unwrap();
+    assert!(matches!(kind, EventKind::KeyValueSet { .. }));
+
+    let json = r#"{"type":"KeyValueCleared","key":"k"}"#;
+    let kind: EventKind = serde_json::from_str(json).unwrap();
+    assert!(matches!(kind, EventKind::KeyValueCleared { .. }));
+
+    let json = r#"{"type":"KeyValuesCleared"}"#;
+    let kind: EventKind = serde_json::from_str(json).unwrap();
+    assert!(matches!(kind, EventKind::KeyValuesCleared));
+}

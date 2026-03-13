@@ -22,6 +22,8 @@ pub mod instance_creation;
 #[cfg(feature = "provider-test")]
 pub mod instance_locking;
 #[cfg(feature = "provider-test")]
+pub mod kv_store;
+#[cfg(feature = "provider-test")]
 pub mod lock_expiration;
 #[cfg(feature = "provider-test")]
 pub mod long_polling;

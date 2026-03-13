@@ -233,7 +233,7 @@ impl SqliteProvider {
             r#"SELECT id, instance_id, lock_token, locked_until, work_item FROM orchestrator_queue ORDER BY id LIMIT 10"#
         ).fetch_all(&mut *conn).await {
             out.push_str("orchestrator_queue.sample:\n");
-            for r in rows { let id: i64 = r.try_get("id").unwrap_or_default(); let inst: String = r.try_get("instance_id").unwrap_or_default(); let lock: Option<String> = r.try_get("lock_token").ok(); let until: Option<i64> = r.try_get("locked_until").ok(); let item: String = r.try_get("work_item").unwrap_or_default(); out.push_str(&format!("  id={id}, inst={inst}, lock={lock:?}, until={until:?}, item={item}\n")); }
+            for r in rows { let id: i64 = r.try_get("id").unwrap_or_default(); let inst: String = r.try_get("instance_id").unwrap_or_default(); let lock: Option<String> = r.try_get("lock_token").unwrap_or_default(); let until: Option<i64> = r.try_get("locked_until").unwrap_or_default(); let item: String = r.try_get("work_item").unwrap_or_default(); out.push_str(&format!("  id={id}, inst={inst}, lock={lock:?}, until={until:?}, item={item}\n")); }
         }
 
         // Worker queue count and sample
@@ -251,8 +251,8 @@ impl SqliteProvider {
             out.push_str("worker_queue.sample:\n");
             for r in rows {
                 let id: i64 = r.try_get("id").unwrap_or_default();
-                let lock: Option<String> = r.try_get("lock_token").unwrap_or(None);
-                let until: Option<i64> = r.try_get("locked_until").unwrap_or(None);
+                let lock: Option<String> = r.try_get("lock_token").unwrap_or_default();
+                let until: Option<i64> = r.try_get("locked_until").unwrap_or_default();
                 let item: String = r.try_get("work_item").unwrap_or_default();
                 out.push_str(&format!("  id={id}, lock={lock:?}, until={until:?}, item={item}\n"));
             }
@@ -453,6 +453,25 @@ impl SqliteProvider {
         .execute(pool)
         .await?;
 
+        // KV store: instance-scoped key-value pairs, materialized from history events.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kv_store (
+                instance_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                execution_id INTEGER NOT NULL,
+                PRIMARY KEY (instance_id, key)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_kv_store_execution ON kv_store(instance_id, execution_id)")
+            .execute(pool)
+            .await?;
+
         Ok(())
     }
 
@@ -563,6 +582,31 @@ impl SqliteProvider {
         Ok(events)
     }
 
+    /// Load KV snapshot within an existing transaction.
+    async fn get_kv_snapshot_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
+        let rows = sqlx::query("SELECT key, value FROM kv_store WHERE instance_id = ?")
+            .bind(instance)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("get_kv_snapshot_in_tx", e))?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let k: String = row
+                .try_get("key")
+                .map_err(|e| Self::sqlx_to_provider_error("get_kv_snapshot_in_tx", e))?;
+            let v: String = row
+                .try_get("value")
+                .map_err(|e| Self::sqlx_to_provider_error("get_kv_snapshot_in_tx", e))?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
     /// Append history within a transaction
     async fn append_history_in_tx(
         &self,
@@ -605,6 +649,9 @@ impl SqliteProvider {
                 EventKind::QueueSubscriptionCancelled { .. } => "ExternalSubscribedPersistentCancelled",
                 EventKind::OrchestrationChained { .. } => "OrchestrationChained",
                 EventKind::CustomStatusUpdated { .. } => "CustomStatusUpdated",
+                EventKind::KeyValueSet { .. } => "KeyValueSet",
+                EventKind::KeyValueCleared { .. } => "KeyValueCleared",
+                EventKind::KeyValuesCleared => "KeyValuesCleared",
                 #[cfg(feature = "replay-version-test")]
                 EventKind::ExternalSubscribed2 { .. } => "ExternalSubscribed2",
                 #[cfg(feature = "replay-version-test")]
@@ -940,6 +987,7 @@ impl Provider for SqliteProvider {
                             history: vec![],
                             messages: work_items,
                             history_error: Some(error_msg),
+                            kv_snapshot: std::collections::HashMap::new(),
                         },
                         lock_token,
                         max_attempt_count,
@@ -1032,6 +1080,9 @@ impl Provider for SqliteProvider {
             }
         };
 
+        // Load KV snapshot for seeding orchestration context
+        let kv_snapshot = self.get_kv_snapshot_in_tx(&mut tx, &instance_id).await?;
+
         tx.commit()
             .await
             .map_err(|e| Self::sqlx_to_provider_error("fetch_orchestration_item", e))?;
@@ -1040,6 +1091,7 @@ impl Provider for SqliteProvider {
             instance = %instance_id,
             messages = work_items.len(),
             history_len = history.len(),
+            kv_keys = kv_snapshot.len(),
             "Fetched orchestration item"
         );
 
@@ -1052,6 +1104,7 @@ impl Provider for SqliteProvider {
                 messages: work_items,
                 history,
                 history_error: None,
+                kv_snapshot,
             },
             lock_token,
             max_attempt_count,
@@ -1285,6 +1338,46 @@ impl Provider for SqliteProvider {
             }
             None => {
                 // No CustomStatusUpdated in delta — preserve existing value
+            }
+        }
+
+        // Materialize KV mutations from history_delta into the kv_store table.
+        // Pattern: scan delta for KV events, apply UPSERT/DELETE to the materialized table.
+        for event in &history_delta {
+            match &event.kind {
+                EventKind::KeyValueSet { key, value } => {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO kv_store (instance_id, key, value, execution_id)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(instance_id, key)
+                        DO UPDATE SET value = excluded.value, execution_id = excluded.execution_id
+                        "#,
+                    )
+                    .bind(&instance_id)
+                    .bind(key)
+                    .bind(value)
+                    .bind(execution_id as i64)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+                }
+                EventKind::KeyValueCleared { key } => {
+                    sqlx::query("DELETE FROM kv_store WHERE instance_id = ? AND key = ?")
+                        .bind(&instance_id)
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+                }
+                EventKind::KeyValuesCleared => {
+                    sqlx::query("DELETE FROM kv_store WHERE instance_id = ?")
+                        .bind(&instance_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+                }
+                _ => {}
             }
         }
 
@@ -2183,6 +2276,23 @@ impl Provider for SqliteProvider {
             None => Ok(None),
         }
     }
+
+    async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
+        let row = sqlx::query("SELECT value FROM kv_store WHERE instance_id = ? AND key = ?")
+            .bind(instance)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("get_kv_value", e))?;
+
+        Ok(match row {
+            Some(r) => Some(
+                r.try_get("value")
+                    .map_err(|e| Self::sqlx_to_provider_error("get_kv_value", e))?,
+            ),
+            None => None,
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -2729,6 +2839,17 @@ impl ProviderAdmin for SqliteProvider {
             .await
             .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
 
+        // Delete KV store entries
+        let del_kv_sql = format!("DELETE FROM kv_store WHERE instance_id IN ({placeholders})");
+        let mut del_query = sqlx::query(&del_kv_sql);
+        for id in ids {
+            del_query = del_query.bind(id);
+        }
+        del_query
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
+
         // Delete instances
         let del_instances_sql = format!("DELETE FROM instances WHERE instance_id IN ({placeholders})");
         let mut del_query = sqlx::query(&del_instances_sql);
@@ -2925,6 +3046,15 @@ impl ProviderAdmin for SqliteProvider {
 
             // Delete execution
             sqlx::query("DELETE FROM executions WHERE instance_id = ? AND execution_id = ?")
+                .bind(instance_id)
+                .bind(exec_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::sqlx_to_provider_error("prune_executions", e))?;
+
+            // Delete KV entries whose last-writing execution matches the pruned one.
+            // Keys overwritten by a later execution survive (their execution_id differs).
+            sqlx::query("DELETE FROM kv_store WHERE instance_id = ? AND execution_id = ?")
                 .bind(instance_id)
                 .bind(exec_id)
                 .execute(&mut *tx)

@@ -283,6 +283,10 @@ impl Provider for PoisonInjectingProvider {
     ) -> Result<Option<(Option<String>, u64)>, ProviderError> {
         self.inner.get_custom_status(instance, last_seen_version).await
     }
+
+    async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
+        self.inner.get_kv_value(instance, key).await
+    }
 }
 
 /// A provider wrapper that bypasses the capability filter on fetch_orchestration_item.
@@ -431,6 +435,10 @@ impl Provider for FilterBypassProvider {
         last_seen_version: u64,
     ) -> Result<Option<(Option<String>, u64)>, ProviderError> {
         self.inner.get_custom_status(instance, last_seen_version).await
+    }
+
+    async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
+        self.inner.get_kv_value(instance, key).await
     }
 }
 
@@ -672,5 +680,9 @@ impl Provider for FailingProvider {
         last_seen_version: u64,
     ) -> Result<Option<(Option<String>, u64)>, ProviderError> {
         self.inner.get_custom_status(instance, last_seen_version).await
+    }
+
+    async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
+        self.inner.get_kv_value(instance, key).await
     }
 }

@@ -1157,4 +1157,146 @@ mod tests {
     async fn test_sqlite_tag_preserved_through_ack_orchestration_item() {
         test_tag_preserved_through_ack_orchestration_item(&SqliteTestFactory).await;
     }
+
+    // KV store tests
+    use duroxide::provider_validations::kv_store::{
+        test_kv_clear_all, test_kv_clear_isolation, test_kv_clear_nonexistent_key, test_kv_clear_single,
+        test_kv_cross_execution_overwrite, test_kv_cross_execution_remove_readd, test_kv_delete_instance_cascades,
+        test_kv_delete_instance_with_children, test_kv_empty_value, test_kv_execution_id_tracking,
+        test_kv_get_nonexistent, test_kv_get_unknown_instance, test_kv_instance_isolation, test_kv_large_value,
+        test_kv_overwrite, test_kv_prune_current_execution_protected, test_kv_prune_preserves_overwritten,
+        test_kv_prune_removes_orphan_keys, test_kv_set_after_clear, test_kv_set_and_get,
+        test_kv_snapshot_after_clear_all, test_kv_snapshot_after_clear_single, test_kv_snapshot_cross_execution,
+        test_kv_snapshot_empty, test_kv_snapshot_in_fetch, test_kv_special_chars_in_key,
+    };
+
+    #[tokio::test]
+    async fn test_sqlite_kv_set_and_get() {
+        test_kv_set_and_get(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_overwrite() {
+        test_kv_overwrite(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_clear_single() {
+        test_kv_clear_single(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_clear_all() {
+        test_kv_clear_all(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_get_nonexistent() {
+        test_kv_get_nonexistent(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_snapshot_in_fetch() {
+        test_kv_snapshot_in_fetch(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_snapshot_after_clear_single() {
+        test_kv_snapshot_after_clear_single(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_snapshot_after_clear_all() {
+        test_kv_snapshot_after_clear_all(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_execution_id_tracking() {
+        test_kv_execution_id_tracking(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_cross_execution_overwrite() {
+        test_kv_cross_execution_overwrite(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_cross_execution_remove_readd() {
+        test_kv_cross_execution_remove_readd(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_prune_preserves_overwritten() {
+        test_kv_prune_preserves_overwritten(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_prune_removes_orphan_keys() {
+        test_kv_prune_removes_orphan_keys(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_instance_isolation() {
+        test_kv_instance_isolation(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delete_instance_cascades() {
+        test_kv_delete_instance_cascades(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_clear_nonexistent_key() {
+        test_kv_clear_nonexistent_key(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_get_unknown_instance() {
+        test_kv_get_unknown_instance(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_set_after_clear() {
+        test_kv_set_after_clear(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_empty_value() {
+        test_kv_empty_value(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_large_value() {
+        test_kv_large_value(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_special_chars_in_key() {
+        test_kv_special_chars_in_key(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_snapshot_empty() {
+        test_kv_snapshot_empty(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_snapshot_cross_execution() {
+        test_kv_snapshot_cross_execution(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_prune_current_execution_protected() {
+        test_kv_prune_current_execution_protected(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delete_instance_with_children() {
+        test_kv_delete_instance_with_children(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_clear_isolation() {
+        test_kv_clear_isolation(&SqliteTestFactory).await;
+    }
 }

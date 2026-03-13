@@ -335,6 +335,10 @@ async fn safe_orchestration(ctx: OrchestrationContext, count: i32) -> Result<Str
         .map_err(|e| e.to_string())?
         .as_millis() as u64;
     
+    // ✅ KV store (durable state)
+    ctx.set_value("progress", "step_3");
+    let val = ctx.get_value("progress");
+    
     Ok("done".to_string())
 }
 ```
@@ -668,6 +672,44 @@ durable and replayable. The status survives `continue_as_new` — the last value
 carried forward to the new execution. Clients read it via `wait_for_status_change()`
 (see Client API).
 
+#### KV Store (Durable Key-Value State)
+
+Store per-instance key-value pairs that survive replay, `continue_as_new`, and are
+visible to external clients. Use for progress tracking, configuration, or cross-instance
+communication.
+
+```rust
+// Set a value (fire-and-forget, no await needed)
+ctx.set_value("progress", "step_3_of_5");
+
+// Set with automatic JSON serialization
+ctx.set_value_typed("config", &MyConfig { retries: 3 });
+
+// Read local KV state (replay-safe, returns current snapshot)
+let val: Option<String> = ctx.get_value("progress");
+
+// Read with automatic deserialization
+let config: Option<MyConfig> = ctx.get_value_typed::<MyConfig>("config").unwrap();
+
+// Read KV from another running instance (cross-instance, requires await)
+let other_val = ctx.get_value_from_instance("other-instance-id", "status").await?;
+
+// Clear a single key
+ctx.clear_value("progress");
+
+// Clear all keys for this instance
+ctx.clear_all_values();
+```
+
+**Behavior:**
+- KV operations (`set_value`, `clear_value`, `clear_all_values`) are fire-and-forget — they don't suspend the orchestration
+- Values survive `continue_as_new` (carried to the new execution)
+- Values are visible to external clients via `client.get_value(instance, key)`
+- Local reads (`get_value`) return the current in-memory snapshot (replay-safe)
+- Cross-instance reads (`get_value_from_instance`) are async and hit the provider
+- **Limits:** Max 10 keys per instance (`MAX_KV_KEYS`), max 16KB per value (`MAX_KV_VALUE_BYTES`)
+- Exceeding limits fails the orchestration turn
+
 #### Sub-Orchestrations
 
 ```rust
@@ -996,6 +1038,34 @@ let result: OrderResult = client
 - Returns when terminal state reached or timeout
 - Only returns `Completed` or `Failed`, never `Running` or `NotFound`
 
+#### Read KV Values
+
+Read durable key-value state from any orchestration instance, even while running.
+
+```rust
+// Read a single KV value
+let val: Option<String> = client.get_value("order-123", "status").await?;
+
+// Read with automatic deserialization
+let config: MyConfig = client.get_value_typed::<MyConfig>("order-123", "config").await?
+    .expect("config should exist");
+
+// Poll until a value appears (with timeout)
+let val = client.wait_for_value("order-123", "ready_flag", Duration::from_secs(10)).await?;
+
+// Poll with typed deserialization
+let result: MyResult = client
+    .wait_for_value_typed::<MyResult>("order-123", "result", Duration::from_secs(30))
+    .await?
+    .expect("result should exist");
+```
+
+**Behavior:**
+- `get_value` reads directly from the provider (no history replay needed)
+- `wait_for_value` polls with exponential backoff until the key exists or timeout
+- Values survive `continue_as_new` and are readable after orchestration completion
+- Returns `None` for nonexistent keys or instances
+
 ### Management Operations (Optional)
 
 These methods require a provider that implements `ProviderAdmin`. Check availability first:
@@ -1226,6 +1296,10 @@ match client.wait_for_orchestration("test", Duration::from_secs(10)).await {
 | `get_orchestration_status()` | Check status | `Result<OrchestrationStatus, ClientError>` |
 | `wait_for_orchestration()` | Wait for completion | `Result<OrchestrationStatus, ClientError>` |
 | `wait_for_status_change()` | Poll custom status | `Result<OrchestrationStatus, ClientError>` |
+| `get_value()` | Read KV value | `Result<Option<String>, ClientError>` |
+| `get_value_typed()` | Read KV value (deserialized) | `Result<Option<T>, ClientError>` |
+| `wait_for_value()` | Poll for KV value | `Result<Option<String>, ClientError>` |
+| `wait_for_value_typed()` | Poll for KV value (deserialized) | `Result<Option<T>, ClientError>` |
 | `has_management_capability()` | Check feature availability | `bool` |
 | `list_all_instances()` | List instances | `Result<Vec<String>, ClientError>` |
 | `list_instances_by_status()` | Filter by status | `Result<Vec<String>, ClientError>` |
@@ -2554,6 +2628,11 @@ async fn fast_updates(ctx: OrchestrationContext, items_json: String) -> Result<(
 | `continue_as_new(input)` | `impl Future` (never resolves) | Reset history, keep running |
 | `new_guid()` | `impl Future<Output = Result<String, String>>` | Correlation IDs |
 | `utc_now()` | `impl Future<Output = Result<u64, String>>` | Timestamps |
+| `set_value(key, value)` | `()` | Store durable KV pair |
+| `get_value(key)` | `Option<String>` | Read local KV |
+| `clear_value(key)` | `()` | Remove a KV entry |
+| `clear_all_values()` | `()` | Remove all KV entries |
+| `get_value_from_instance(id, key)` | `impl Future<Output = Result<Option<String>, String>>` | Cross-instance KV read |
 | `trace_info/warn/error(msg)` | `()` | Logging |
 
 ---
