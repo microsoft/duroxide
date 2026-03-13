@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.24] - 2026-03-12
+
+**Release:** <https://crates.io/crates/duroxide/0.1.24>
+
+**Proposal:** [Orchestration KV Store](https://github.com/microsoft/duroxide/blob/main/docs/proposals/orchestration-kv-store.md)
+
+### Added
+
+- **Durable KV store for per-instance state** — Store key-value pairs scoped to orchestration
+  instances via `ctx.set_value(key, value)` / `ctx.get_value(key)`. Values survive replay,
+  `continue_as_new`, and are readable by external clients. Cross-instance reads via
+  `ctx.get_value_from_instance(instance, key)`.
+  - `ctx.set_value()`, `ctx.get_value()`, `ctx.clear_value()`, `ctx.clear_all_values()`
+  - Typed variants: `ctx.set_value_typed()`, `ctx.get_value_typed()`
+  - Cross-instance: `ctx.get_value_from_instance()`, `ctx.get_value_from_instance_typed()`
+  - Client API: `client.get_value()`, `client.get_value_typed()`, `client.wait_for_value()`,
+    `client.wait_for_value_typed()`
+  - Provider trait: `get_kv_value()` for materialized KV reads
+  - SQLite migration `20240110000000_add_kv_store.sql` adding `kv_store` table
+  - KV materialization in `ack_orchestration_item` (KeyValueSet, KeyValueCleared, KeyValuesCleared)
+  - KV snapshot loading in `fetch_orchestration_item`
+  - Replay engine: KV action matching with nondeterminism detection
+  - Limits: `MAX_KV_KEYS=10`, `MAX_KV_VALUE_BYTES=16KB`
+  - Execution ID tracking (last-writer-wins) for pruning safety
+  - Instance deletion cascades to KV cleanup
+
+- **26 provider validation tests** for KV store (`src/provider_validation/kv_store.rs`)
+
+- **15 replay engine tests** for KV action matching and nondeterminism detection
+
+- **45 E2E tests** for KV store including single-thread, stress, cross-instance,
+  sub-orchestration isolation, and request/response patterns
+
+- **2 serde backward-compatibility tests** for KV event kinds
+
+### Documentation
+
+- Updated ORCHESTRATION-GUIDE.md with KV Store API reference and Client KV operations
+- Updated provider-implementation-guide.md with `kv_store` table schema, `get_kv_value()`,
+  KV materialization in ack, and validation checklist
+- Updated provider-testing-guide.md with KV test category (176 → 202 total tests)
+- Updated README.md with KV store feature
+
 ## [0.1.23] - 2026-03-07
 
 **Release:** <https://crates.io/crates/duroxide/0.1.23>
