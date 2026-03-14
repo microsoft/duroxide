@@ -300,8 +300,18 @@ pub struct OrchestrationItem {
     pub history_error: Option<String>,
 
     /// KV snapshot loaded from the materialized `kv_store` table at fetch time.
-    /// Seeds the orchestration's in-memory `kv_state` before the turn executes.
-    pub kv_snapshot: std::collections::HashMap<String, String>,
+    /// Seeds the orchestration's in-memory `kv_state` and `kv_metadata` before the turn executes.
+    pub kv_snapshot: std::collections::HashMap<String, KvEntry>,
+}
+
+/// A single entry in the KV store snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvEntry {
+    /// The stored value.
+    pub value: String,
+    /// Timestamp (ms since epoch) when this key was last written.
+    /// Set by the runtime at `set_kv_value()` time, persisted by the provider.
+    pub last_updated_at_ms: u64,
 }
 
 /// Execution metadata computed by the runtime to be persisted by the provider.
@@ -2106,6 +2116,15 @@ pub trait Provider: Any + Send + Sync {
     /// Returns `Ok(Some(value))` if the key exists, `Ok(None)` otherwise.
     /// Reads directly from the materialized `kv_store` table (not history events).
     async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError>;
+
+    /// Read all KV entries for the given instance.
+    ///
+    /// Returns a map of key→value pairs. Returns an empty map if no keys exist.
+    /// Reads directly from the materialized `kv_store` table (not history events).
+    async fn get_kv_all_values(
+        &self,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError>;
 }
 
 /// Management and observability provider interface.

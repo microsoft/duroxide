@@ -461,6 +461,7 @@ impl SqliteProvider {
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
                 execution_id INTEGER NOT NULL,
+                last_updated_at_ms INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (instance_id, key)
             )
             "#,
@@ -587,8 +588,8 @@ impl SqliteProvider {
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         instance: &str,
-    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
-        let rows = sqlx::query("SELECT key, value FROM kv_store WHERE instance_id = ?")
+    ) -> Result<std::collections::HashMap<String, crate::providers::KvEntry>, ProviderError> {
+        let rows = sqlx::query("SELECT key, value, last_updated_at_ms FROM kv_store WHERE instance_id = ?")
             .bind(instance)
             .fetch_all(&mut **tx)
             .await
@@ -602,7 +603,16 @@ impl SqliteProvider {
             let v: String = row
                 .try_get("value")
                 .map_err(|e| Self::sqlx_to_provider_error("get_kv_snapshot_in_tx", e))?;
-            map.insert(k, v);
+            let ts: i64 = row
+                .try_get("last_updated_at_ms")
+                .map_err(|e| Self::sqlx_to_provider_error("get_kv_snapshot_in_tx", e))?;
+            map.insert(
+                k,
+                crate::providers::KvEntry {
+                    value: v,
+                    last_updated_at_ms: ts as u64,
+                },
+            );
         }
         Ok(map)
     }
@@ -1345,19 +1355,24 @@ impl Provider for SqliteProvider {
         // Pattern: scan delta for KV events, apply UPSERT/DELETE to the materialized table.
         for event in &history_delta {
             match &event.kind {
-                EventKind::KeyValueSet { key, value } => {
+                EventKind::KeyValueSet {
+                    key,
+                    value,
+                    last_updated_at_ms,
+                } => {
                     sqlx::query(
                         r#"
-                        INSERT INTO kv_store (instance_id, key, value, execution_id)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO kv_store (instance_id, key, value, execution_id, last_updated_at_ms)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(instance_id, key)
-                        DO UPDATE SET value = excluded.value, execution_id = excluded.execution_id
+                        DO UPDATE SET value = excluded.value, execution_id = excluded.execution_id, last_updated_at_ms = excluded.last_updated_at_ms
                         "#,
                     )
                     .bind(&instance_id)
                     .bind(key)
                     .bind(value)
                     .bind(execution_id as i64)
+                    .bind(*last_updated_at_ms as i64)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
@@ -2293,6 +2308,29 @@ impl Provider for SqliteProvider {
             None => None,
         })
     }
+
+    async fn get_kv_all_values(
+        &self,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
+        let rows = sqlx::query("SELECT key, value FROM kv_store WHERE instance_id = ?")
+            .bind(instance)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let k: String = row
+                .try_get("key")
+                .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
+            let v: String = row
+                .try_get("value")
+                .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
 }
 
 #[async_trait::async_trait]
@@ -3046,15 +3084,6 @@ impl ProviderAdmin for SqliteProvider {
 
             // Delete execution
             sqlx::query("DELETE FROM executions WHERE instance_id = ? AND execution_id = ?")
-                .bind(instance_id)
-                .bind(exec_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Self::sqlx_to_provider_error("prune_executions", e))?;
-
-            // Delete KV entries whose last-writing execution matches the pruned one.
-            // Keys overwritten by a later execution survive (their execution_id differs).
-            sqlx::query("DELETE FROM kv_store WHERE instance_id = ? AND execution_id = ?")
                 .bind(instance_id)
                 .bind(exec_id)
                 .execute(&mut *tx)

@@ -381,6 +381,7 @@ Here's every method you need to implement, organized by complexity:
 | `latest_execution_id()` | Performance optimization |
 | `read_with_execution()` | Read specific execution's history |
 | `get_kv_value()` | Read a KV entry for an instance |
+| `get_kv_all_values()` | Read all KV entries for an instance |
 | `list_instances()` | Management API |
 | `list_executions()` | Management API |
 
@@ -542,6 +543,13 @@ impl Provider for MyProvider {
         key: &str,
     ) -> Result<Option<String>, ProviderError> {
         todo!("Read from kv_store table")
+    }
+
+    async fn get_kv_all_values(
+        &self,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
+        todo!("Read all entries from kv_store table for instance")
     }
 }
 ```
@@ -1767,10 +1775,11 @@ CREATE TABLE sessions (
 
 -- KV store (per-instance durable state)
 CREATE TABLE kv_store (
-    instance_id  TEXT NOT NULL,
-    key          TEXT NOT NULL,
-    value        TEXT NOT NULL,
-    execution_id INTEGER NOT NULL,
+    instance_id        TEXT NOT NULL,
+    key                TEXT NOT NULL,
+    value              TEXT NOT NULL,
+    execution_id       INTEGER NOT NULL,
+    last_updated_at_ms INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (instance_id, key)
 );
 
@@ -1983,15 +1992,15 @@ Before considering your provider complete:
 - [ ] `get_custom_status()` returns `Ok(None)` for non-existent instances
 
 ### KV Store
-- [ ] `ack_orchestration_item()` materializes `KeyValueSet` events into `kv_store` table
+- [ ] `ack_orchestration_item()` materializes `KeyValueSet` events into `kv_store` table (including `last_updated_at_ms`)
 - [ ] `ack_orchestration_item()` materializes `KeyValueCleared` events (deletes key)
 - [ ] `ack_orchestration_item()` materializes `KeyValuesCleared` events (deletes all keys for instance)
-- [ ] `ack_orchestration_item()` updates `execution_id` on overwrite (last-writer-wins)
-- [ ] `fetch_orchestration_item()` loads `kv_snapshot` from `kv_store` table
+- [ ] `ack_orchestration_item()` updates `execution_id` and `last_updated_at_ms` on overwrite (last-writer-wins)
+- [ ] `fetch_orchestration_item()` loads `kv_snapshot` from `kv_store` table (with `KvEntry { value, last_updated_at_ms }`)
 - [ ] `get_kv_value()` returns `Ok(Some(value))` for existing keys
 - [ ] `get_kv_value()` returns `Ok(None)` for missing keys or nonexistent instances
-- [ ] Pruning removes KV entries whose `execution_id` is pruned (orphan cleanup)
-- [ ] Pruning preserves KV entries overwritten by a surviving execution
+- [ ] `get_kv_all_values()` returns all key-value pairs for an instance
+- [ ] KV entries are **instance-scoped** — execution pruning does NOT delete KV entries
 - [ ] Instance deletion cascades to `kv_store` entries
 - [ ] KV entries are isolated between instances (same key name, different values)
 

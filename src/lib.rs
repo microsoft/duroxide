@@ -1228,16 +1228,23 @@ pub enum EventKind {
     ExternalEvent2 { name: String, topic: String, data: String },
 
     // === Key-Value Store Events ===
-    /// A key-value pair was set via `ctx.set_value()`.
+    /// A key-value pair was set via `ctx.set_kv_value()`.
     /// Fire-and-forget metadata action (like `CustomStatusUpdated`).
     #[serde(rename = "KeyValueSet")]
-    KeyValueSet { key: String, value: String },
+    KeyValueSet {
+        key: String,
+        value: String,
+        /// Timestamp (ms since epoch) when this key was written.
+        /// Set by the runtime, persisted by the provider. Defaults to 0 for pre-upgrade events.
+        #[serde(default)]
+        last_updated_at_ms: u64,
+    },
 
-    /// A single key was cleared via `ctx.clear_value()`.
+    /// A single key was cleared via `ctx.clear_kv_value()`.
     #[serde(rename = "KeyValueCleared")]
     KeyValueCleared { key: String },
 
-    /// All key-value pairs were cleared via `ctx.clear_all_values()`.
+    /// All key-value pairs were cleared via `ctx.clear_all_kv_values()`.
     #[serde(rename = "KeyValuesCleared")]
     KeyValuesCleared,
 }
@@ -1527,7 +1534,11 @@ pub enum Action {
     // === Key-Value Store Actions ===
     /// Set a key-value pair on this orchestration instance.
     /// Fire-and-forget metadata action (like `UpdateCustomStatus`).
-    SetKeyValue { key: String, value: String },
+    SetKeyValue {
+        key: String,
+        value: String,
+        last_updated_at_ms: u64,
+    },
 
     /// Clear a single key from the KV store.
     ClearKeyValue { key: String },
@@ -1626,10 +1637,16 @@ struct CtxInner {
     /// `None` means no custom status has been set (either never set, or cleared via `reset_custom_status()`).
     accumulated_custom_status: Option<String>,
 
-    /// Instance-scoped key-value store.
+    /// Instance-scoped key-value store (values only).
     /// Seeded from the provider's materialized `kv_store` table at fetch time,
-    /// then kept current by `set_value`/`clear_value`/`clear_all_values` calls.
+    /// then kept current by `set_kv_value`/`clear_kv_value`/`clear_all_kv_values` calls.
     kv_state: std::collections::HashMap<String, String>,
+
+    /// Per-key `last_updated_at_ms` timestamps, seeded from the provider snapshot.
+    /// Used by `prune_kv_values_updated_before()` for deterministic pruning decisions.
+    /// Keys written during the current turn are marked with `u64::MAX` (never prunable
+    /// until the next turn, when their real timestamp will appear in the snapshot).
+    kv_metadata: std::collections::HashMap<String, u64>,
 }
 
 impl CtxInner {
@@ -1680,6 +1697,7 @@ impl CtxInner {
             accumulated_custom_status: None,
 
             kv_state: std::collections::HashMap::new(),
+            kv_metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -3217,26 +3235,33 @@ impl OrchestrationContext {
     /// Set a key-value pair scoped to this orchestration instance.
     ///
     /// Emits a `KeyValueSet` history event. The provider materializes this
-    /// into the `kv_store` table during ack.
-    pub fn set_value(&self, key: impl Into<String>, value: impl Into<String>) {
+    /// into the `kv_store` table during ack. The `last_updated_at_ms` timestamp
+    /// is stamped from the current wall clock and persisted in the event.
+    pub fn set_kv_value(&self, key: impl Into<String>, value: impl Into<String>) {
         let key: String = key.into();
         let value: String = value.into();
         let mut inner = self.inner.lock().unwrap();
+        let last_updated_at_ms = inner.now_ms();
         inner.kv_state.insert(key.clone(), value.clone());
-        inner.emit_action(Action::SetKeyValue { key, value });
+        inner.kv_metadata.insert(key.clone(), last_updated_at_ms);
+        inner.emit_action(Action::SetKeyValue {
+            key,
+            value,
+            last_updated_at_ms,
+        });
     }
 
     /// Set a typed value (serialized as JSON) scoped to this orchestration instance.
-    pub fn set_value_typed<T: serde::Serialize>(&self, key: impl Into<String>, value: &T) {
+    pub fn set_kv_value_typed<T: serde::Serialize>(&self, key: impl Into<String>, value: &T) {
         let serialized = serde_json::to_string(value).expect("KV value serialization should not fail");
-        self.set_value(key, serialized);
+        self.set_kv_value(key, serialized);
     }
 
     /// Read a KV entry from in-memory state.
     ///
     /// Pure read — no provider call, no event emitted, fully deterministic.
     /// Returns `None` if the key has never been set or was cleared.
-    pub fn get_value(&self, key: &str) -> Option<String> {
+    pub fn get_kv_value(&self, key: &str) -> Option<String> {
         self.inner.lock().unwrap().kv_state.get(key).cloned()
     }
 
@@ -3245,8 +3270,8 @@ impl OrchestrationContext {
     /// # Errors
     ///
     /// Returns `Err` if the key exists but deserialization fails.
-    pub fn get_value_typed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, String> {
-        match self.get_value(key) {
+    pub fn get_kv_value_typed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, String> {
+        match self.get_kv_value(key) {
             None => Ok(None),
             Some(s) => serde_json::from_str(&s)
                 .map(Some)
@@ -3254,34 +3279,82 @@ impl OrchestrationContext {
         }
     }
 
+    /// Return a snapshot of all KV entries as a `HashMap`.
+    ///
+    /// Pure read from in-memory state — no provider call, no event emitted.
+    pub fn get_kv_all_values(&self) -> std::collections::HashMap<String, String> {
+        self.inner.lock().unwrap().kv_state.clone()
+    }
+
+    /// Return a list of all KV keys.
+    ///
+    /// Pure read from in-memory state — no provider call, no event emitted.
+    pub fn get_kv_all_keys(&self) -> Vec<String> {
+        self.inner.lock().unwrap().kv_state.keys().cloned().collect()
+    }
+
+    /// Return the number of KV entries.
+    ///
+    /// Pure read from in-memory state — no provider call, no event emitted.
+    pub fn get_kv_length(&self) -> usize {
+        self.inner.lock().unwrap().kv_state.len()
+    }
+
     /// Clear a single key from the KV store.
     ///
     /// Emits a `KeyValueCleared` history event. After this call,
-    /// `get_value(key)` returns `None`.
-    pub fn clear_value(&self, key: impl Into<String>) {
+    /// `get_kv_value(key)` returns `None`.
+    pub fn clear_kv_value(&self, key: impl Into<String>) {
         let key: String = key.into();
         let mut inner = self.inner.lock().unwrap();
         inner.kv_state.remove(&key);
+        inner.kv_metadata.remove(&key);
         inner.emit_action(Action::ClearKeyValue { key });
     }
 
     /// Clear all keys from the KV store.
     ///
     /// Emits a `KeyValuesCleared` history event. After this call,
-    /// `get_value(key)` returns `None` for all keys.
-    pub fn clear_all_values(&self) {
+    /// `get_kv_value(key)` returns `None` for all keys.
+    pub fn clear_all_kv_values(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.kv_state.clear();
+        inner.kv_metadata.clear();
         inner.emit_action(Action::ClearKeyValues);
+    }
+
+    /// Remove KV entries whose persisted `last_updated_at_ms` is older than `updated_before_ms`.
+    ///
+    /// This helper scans the snapshot metadata loaded from the provider and emits
+    /// `clear_kv_value()` for each qualifying key. Keys written during the current
+    /// turn are never prunable (they haven't been acked yet).
+    ///
+    /// Returns the number of keys cleared.
+    pub fn prune_kv_values_updated_before(&self, updated_before_ms: u64) -> usize {
+        let keys_to_clear: Vec<String> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .kv_metadata
+                .iter()
+                .filter(|(_, ts)| **ts < updated_before_ms)
+                .filter(|(key, _)| inner.kv_state.contains_key(*key))
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        let count = keys_to_clear.len();
+        for key in keys_to_clear {
+            self.clear_kv_value(key);
+        }
+        count
     }
 
     /// Read a KV entry from another orchestration instance.
     ///
     /// This is modeled as a system activity — under the covers it schedules
-    /// `__duroxide_syscall:get_kv_value` which calls `client.get_value()`.
+    /// `__duroxide_syscall:get_kv_value` which calls `client.get_kv_value()`.
     /// Returns the value at the time the activity executes (not replay-cached on first run).
     /// On replay, the recorded result is returned — no provider call.
-    pub fn get_value_from_instance(
+    pub fn get_kv_value_from_instance(
         &self,
         instance_id: impl Into<String>,
         key: impl Into<String>,
@@ -3294,26 +3367,26 @@ impl OrchestrationContext {
         self.schedule_activity(SYSCALL_ACTIVITY_GET_KV_VALUE, input)
             .map(|result| match result {
                 Ok(json_str) => serde_json::from_str::<Option<String>>(&json_str)
-                    .map_err(|e| format!("get_value_from_instance deserialization error: {e}")),
+                    .map_err(|e| format!("get_kv_value_from_instance deserialization error: {e}")),
                 Err(e) => Err(e),
             })
     }
 
-    /// Typed variant of `get_value_from_instance`.
+    /// Typed variant of `get_kv_value_from_instance`.
     ///
     /// Deserializes the returned JSON string into `T`.
     /// Returns `Ok(None)` if the key doesn't exist in the remote instance.
-    pub fn get_value_from_instance_typed<T: serde::de::DeserializeOwned + Send + 'static>(
+    pub fn get_kv_value_from_instance_typed<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         instance_id: impl Into<String>,
         key: impl Into<String>,
     ) -> DurableFuture<Result<Option<T>, String>> {
-        self.get_value_from_instance(instance_id, key)
+        self.get_kv_value_from_instance(instance_id, key)
             .map(|result| match result {
                 Ok(None) => Ok(None),
                 Ok(Some(s)) => serde_json::from_str::<T>(&s)
                     .map(Some)
-                    .map_err(|e| format!("get_value_from_instance_typed deserialization error: {e}")),
+                    .map_err(|e| format!("get_kv_value_from_instance_typed deserialization error: {e}")),
                 Err(e) => Err(e),
             })
     }

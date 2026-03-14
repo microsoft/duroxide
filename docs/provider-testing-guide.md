@@ -685,14 +685,14 @@ The validation test suite includes **166 individual test functions** organized i
     - `test_kv_clear_single` - Clear a single key
     - `test_kv_clear_all` - Clear all keys for an instance
     - `test_kv_get_nonexistent` - Get missing key returns None
-    - `test_kv_snapshot_in_fetch` - Fetch returns KV snapshot
+    - `test_kv_snapshot_in_fetch` - Fetch returns KV snapshot (with `KvEntry { value, last_updated_at_ms }`)
     - `test_kv_snapshot_after_clear_single` - Snapshot omits cleared key
     - `test_kv_snapshot_after_clear_all` - Snapshot empty after clear-all
-    - `test_kv_execution_id_tracking` - Last-writer-wins for pruning
+    - `test_kv_execution_id_tracking` - Last-writer-wins for execution_id tracking
     - `test_kv_cross_execution_overwrite` - Value updated across executions
     - `test_kv_cross_execution_remove_readd` - Clear in exec 2, re-add in exec 3
     - `test_kv_prune_preserves_overwritten` - Pruned execution's key survives if overwritten
-    - `test_kv_prune_removes_orphan_keys` - Orphan keys deleted on prune
+    - `test_kv_prune_preserves_all_keys` - KV entries are instance-scoped and survive execution pruning
     - `test_kv_instance_isolation` - Same key name, different instances, different values
     - `test_kv_delete_instance_cascades` - Deleting instance removes all KV
     - `test_kv_clear_nonexistent_key` - Clearing missing key is idempotent

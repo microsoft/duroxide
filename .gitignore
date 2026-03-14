@@ -36,3 +36,9 @@ perf.data
 perf.data.old
 *.local.*
 .claude/
+
+# sqlite-objs build artifacts
+sqlite-objs/target/
+
+# Environment files
+.env

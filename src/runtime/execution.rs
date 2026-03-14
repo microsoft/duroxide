@@ -29,7 +29,7 @@ impl Runtime {
         worker_id: &str,
         handler: Arc<dyn OrchestrationHandler>,
         orchestration_version: String,
-        kv_snapshot: std::collections::HashMap<String, String>,
+        kv_snapshot: std::collections::HashMap<String, crate::providers::KvEntry>,
     ) -> (
         Vec<Event>,
         Vec<WorkItem>,

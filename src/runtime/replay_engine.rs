@@ -61,8 +61,8 @@ pub struct ReplayEngine {
     persisted_history_len: usize,
 
     /// KV snapshot loaded from the provider at fetch time.
-    /// Seeded into `ctx.inner.kv_state` before the orchestration turn executes.
-    kv_snapshot: std::collections::HashMap<String, String>,
+    /// Seeded into `ctx.inner.kv_state` and `ctx.inner.kv_metadata` before the orchestration turn executes.
+    kv_snapshot: std::collections::HashMap<String, crate::providers::KvEntry>,
 }
 
 impl ReplayEngine {
@@ -101,7 +101,7 @@ impl ReplayEngine {
     }
 
     /// Set the KV snapshot to seed into the orchestration context.
-    pub fn with_kv_snapshot(mut self, snapshot: std::collections::HashMap<String, String>) -> Self {
+    pub fn with_kv_snapshot(mut self, snapshot: std::collections::HashMap<String, crate::providers::KvEntry>) -> Self {
         self.kv_snapshot = snapshot;
         self
     }
@@ -545,7 +545,11 @@ impl ReplayEngine {
 
         // Seed KV state from provider snapshot before orchestration code runs.
         if !self.kv_snapshot.is_empty() {
-            ctx.inner.lock().expect("Mutex should not be poisoned").kv_state = self.kv_snapshot.clone();
+            let mut inner = ctx.inner.lock().expect("Mutex should not be poisoned");
+            for (key, entry) in &self.kv_snapshot {
+                inner.kv_state.insert(key.clone(), entry.value.clone());
+                inner.kv_metadata.insert(key.clone(), entry.last_updated_at_ms);
+            }
         }
 
         let ctx_for_future = ctx.clone();
@@ -714,7 +718,7 @@ impl ReplayEngine {
             }
 
             // KV events: consume the matching action emitted by the orchestration's
-            // set_value/clear_value/clear_all_values calls. The orchestration already
+            // set_kv_value/clear_kv_value/clear_all_kv_values calls. The orchestration already
             // mutated kv_state directly, so we only need to validate action-event consistency.
             EventKind::KeyValueSet { .. } => {
                 if let Some((_, action)) = emitted_actions.pop_front()
@@ -1724,9 +1728,14 @@ fn action_to_event(action: &Action, instance: &str, execution_id: u64, event_id:
         // UpdateCustomStatus becomes a CustomStatusUpdated history event
         Action::UpdateCustomStatus { status } => EventKind::CustomStatusUpdated { status: status.clone() },
         // KV actions become KV events
-        Action::SetKeyValue { key, value } => EventKind::KeyValueSet {
+        Action::SetKeyValue {
+            key,
+            value,
+            last_updated_at_ms,
+        } => EventKind::KeyValueSet {
             key: key.clone(),
             value: value.clone(),
+            last_updated_at_ms: *last_updated_at_ms,
         },
         Action::ClearKeyValue { key } => EventKind::KeyValueCleared { key: key.clone() },
         Action::ClearKeyValues => EventKind::KeyValuesCleared,
@@ -1883,9 +1892,11 @@ fn action_matches_event_kind(action: &Action, event_kind: &EventKind) -> bool {
         // UpdateCustomStatus matches CustomStatusUpdated by kind only (value may differ across code versions)
         (Action::UpdateCustomStatus { .. }, EventKind::CustomStatusUpdated { .. }) => true,
 
-        // KV actions match KV events by kind only (like custom status)
-        (Action::SetKeyValue { .. }, EventKind::KeyValueSet { .. }) => true,
-        (Action::ClearKeyValue { .. }, EventKind::KeyValueCleared { .. }) => true,
+        // KV: validate key and value match, but skip timestamp (non-deterministic wall clock)
+        (Action::SetKeyValue { key, value, .. }, EventKind::KeyValueSet { key: ek, value: ev, .. }) => {
+            key == ek && value == ev
+        }
+        (Action::ClearKeyValue { key }, EventKind::KeyValueCleared { key: ek }) => key == ek,
         (Action::ClearKeyValues, EventKind::KeyValuesCleared) => true,
 
         _ => false,

@@ -777,6 +777,7 @@ fn kv_event_kinds_roundtrip() {
         EventKind::KeyValueSet {
             key: "my_key".to_string(),
             value: "my_value".to_string(),
+            last_updated_at_ms: 0,
         },
         EventKind::KeyValueCleared {
             key: "clear_me".to_string(),
@@ -789,7 +790,7 @@ fn kv_event_kinds_roundtrip() {
         let deser: EventKind = serde_json::from_str(&json).unwrap();
 
         match (kind, &deser) {
-            (EventKind::KeyValueSet { key: k1, value: v1 }, EventKind::KeyValueSet { key: k2, value: v2 }) => {
+            (EventKind::KeyValueSet { key: k1, value: v1, .. }, EventKind::KeyValueSet { key: k2, value: v2, .. }) => {
                 assert_eq!(k1, k2);
                 assert_eq!(v1, v2);
             }

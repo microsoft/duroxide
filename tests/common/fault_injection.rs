@@ -287,6 +287,13 @@ impl Provider for PoisonInjectingProvider {
     async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
         self.inner.get_kv_value(instance, key).await
     }
+
+    async fn get_kv_all_values(
+        &self,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
+        self.inner.get_kv_all_values(instance).await
+    }
 }
 
 /// A provider wrapper that bypasses the capability filter on fetch_orchestration_item.
@@ -439,6 +446,13 @@ impl Provider for FilterBypassProvider {
 
     async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
         self.inner.get_kv_value(instance, key).await
+    }
+
+    async fn get_kv_all_values(
+        &self,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
+        self.inner.get_kv_all_values(instance).await
     }
 }
 
@@ -684,5 +698,12 @@ impl Provider for FailingProvider {
 
     async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
         self.inner.get_kv_value(instance, key).await
+    }
+
+    async fn get_kv_all_values(
+        &self,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
+        self.inner.get_kv_all_values(instance).await
     }
 }
