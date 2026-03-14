@@ -413,10 +413,10 @@ pub mod runtime;
 pub use runtime::OrchestrationDescriptor;
 pub mod providers;
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod provider_validations;
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod provider_validation;
 
 #[cfg(feature = "provider-test")]

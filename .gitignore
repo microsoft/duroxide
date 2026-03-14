@@ -3,6 +3,7 @@ dtf-data/
 apps/*/dtf-data/
 # Build artifacts
 /target
+/sqlite-objs/target
 
 # Rust backup files
 **/*.rs.bk
@@ -36,3 +37,4 @@ perf.data
 perf.data.old
 *.local.*
 .claude/
+.env

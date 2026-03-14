@@ -3,60 +3,60 @@
 //! Comprehensive test suite for validating provider implementations.
 //! These tests are designed to work with any provider through the `ProviderFactory` trait.
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod atomicity;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod bulk_deletion;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod cancellation;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod capability_filtering;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod custom_status;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod deletion;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod error_handling;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod instance_creation;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod instance_locking;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod kv_store;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod lock_expiration;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod long_polling;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod management;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod multi_execution;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod poison_message;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod prune;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod queue_semantics;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod sessions;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod tag_filtering;
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 use crate::INITIAL_EXECUTION_ID;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 use crate::providers::WorkItem;
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 use std::time::Duration;
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::providers::ExecutionMetadata;
 /// Re-export common types for use in test modules
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::{Event, EventKind};
 
 /// Helper function to create a start item for an instance
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub(crate) fn start_item(instance: &str) -> WorkItem {
     WorkItem::StartOrchestration {
         instance: instance.to_string(),
@@ -70,7 +70,7 @@ pub(crate) fn start_item(instance: &str) -> WorkItem {
 }
 
 /// Helper function to create an instance by enqueueing, fetching, and acking with metadata
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub(crate) async fn create_instance(provider: &dyn crate::providers::Provider, instance: &str) -> Result<(), String> {
     provider
         .enqueue_for_orchestrator(start_item(instance), None)
@@ -122,7 +122,7 @@ pub(crate) async fn create_instance(provider: &dyn crate::providers::Provider, i
 ///
 /// Note: This is a low-level helper that only enqueues the instance (doesn't complete it).
 /// The `create_child_instance` helper in deletion.rs wraps this and also completes the instance.
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub(crate) async fn create_instance_with_parent(
     provider: &dyn crate::providers::Provider,
     instance: &str,
@@ -149,7 +149,7 @@ pub(crate) async fn create_instance_with_parent(
 
 /// Trait to create fresh provider instances for tests.
 /// Essential for multi-threaded/concurrent tests.
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 #[async_trait::async_trait]
 pub trait ProviderFactory: Sync + Send {
     /// Create a new, isolated provider instance connected to the same backend.

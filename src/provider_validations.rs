@@ -27,7 +27,7 @@
 //! ```
 
 // Re-export ProviderFactory from the internal module
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::ProviderFactory;
 
 /// ## Individual Test Functions
@@ -127,25 +127,25 @@ pub use crate::provider_validation::ProviderFactory;
 /// - `abandon_orchestration_item_ignore_attempt_decrements` - Verify ignore_attempt decrements count
 /// - `ignore_attempt_never_goes_negative` - Verify attempt_count never goes below 0
 /// - `max_attempt_count_across_message_batch` - Verify MAX attempt_count returned for batched messages
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::instance_creation::{
     test_instance_creation_via_metadata, test_no_instance_creation_on_enqueue, test_null_version_handling,
     test_sub_orchestration_instance_creation,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::atomicity::{
     test_atomicity_failure_rollback, test_concurrent_ack_prevention, test_lock_released_only_on_successful_ack,
     test_multi_operation_atomic_ack,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::error_handling::{
     test_corrupted_serialization_data, test_duplicate_event_id_rejection, test_invalid_lock_token_on_ack,
     test_lock_expiration_during_ack, test_missing_instance_metadata,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::instance_locking::{
     test_ack_only_affects_locked_messages, test_completions_arriving_during_lock_blocked,
     test_concurrent_instance_fetching, test_cross_instance_lock_isolation, test_exclusive_instance_lock,
@@ -154,7 +154,7 @@ pub use crate::provider_validation::instance_locking::{
     test_multi_threaded_no_duplicate_processing,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::lock_expiration::{
     test_abandon_releases_lock_immediately, test_abandon_work_item_releases_lock, test_abandon_work_item_with_delay,
     test_concurrent_lock_attempts_respect_expiration, test_lock_expires_after_timeout, test_lock_renewal_on_ack,
@@ -163,26 +163,26 @@ pub use crate::provider_validation::lock_expiration::{
     test_worker_lock_renewal_extends_timeout, test_worker_lock_renewal_invalid_token, test_worker_lock_renewal_success,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::multi_execution::{
     test_continue_as_new_creates_new_execution, test_execution_history_persistence, test_execution_id_sequencing,
     test_execution_isolation, test_latest_execution_detection,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::queue_semantics::{
     test_lost_lock_token_handling, test_orphan_queue_messages_dropped, test_timer_delayed_visibility,
     test_worker_ack_atomicity, test_worker_delayed_visibility_skips_future_items,
     test_worker_item_immediate_visibility, test_worker_peek_lock_semantics, test_worker_queue_fifo_ordering,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::management::{
     test_get_execution_info, test_get_instance_info, test_get_queue_depths, test_get_system_metrics,
     test_list_executions, test_list_instances, test_list_instances_by_status,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod long_polling {
     pub use crate::provider_validation::long_polling::{
         test_fetch_respects_timeout_upper_bound, test_long_poll_waits_for_timeout,
@@ -191,7 +191,7 @@ pub mod long_polling {
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod poison_message {
     pub use crate::provider_validation::poison_message::{
         abandon_orchestration_item_ignore_attempt_decrements, abandon_work_item_ignore_attempt_decrements,
@@ -201,7 +201,7 @@ pub mod poison_message {
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub use crate::provider_validation::cancellation::{
     test_ack_work_item_fails_when_entry_deleted, test_ack_work_item_none_deletes_without_enqueue,
     test_batch_cancellation_deletes_multiple_activities, test_cancelled_activities_deleted_from_worker_queue,
@@ -215,7 +215,7 @@ pub use crate::provider_validation::cancellation::{
     test_same_activity_in_worker_items_and_cancelled_is_noop,
 };
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod deletion {
     pub use crate::provider_validation::deletion::{
         test_cascade_delete_hierarchy, test_delete_cleans_queues_and_locks, test_delete_get_instance_tree,
@@ -226,14 +226,14 @@ pub mod deletion {
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod prune {
     pub use crate::provider_validation::prune::{
         test_prune_bulk, test_prune_bulk_includes_running_instances, test_prune_options_combinations, test_prune_safety,
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod bulk_deletion {
     pub use crate::provider_validation::bulk_deletion::{
         test_delete_instance_bulk_cascades_to_children, test_delete_instance_bulk_completed_before_filter,
@@ -241,7 +241,7 @@ pub mod bulk_deletion {
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod capability_filtering {
     pub use crate::provider_validation::capability_filtering::{
         test_ack_appends_event_to_corrupted_history, test_ack_stores_pinned_version_via_metadata_update,
@@ -259,7 +259,7 @@ pub mod capability_filtering {
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod sessions {
     pub use crate::provider_validation::sessions::{
         test_abandoned_session_item_ignore_attempt, test_abandoned_session_item_retryable,
@@ -282,7 +282,7 @@ pub mod sessions {
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod custom_status {
     pub use crate::provider_validation::custom_status::{
         test_custom_status_clear, test_custom_status_default_on_new_instance, test_custom_status_none_preserves,
@@ -291,7 +291,7 @@ pub mod custom_status {
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod tag_filtering {
     pub use crate::provider_validation::tag_filtering::{
         test_any_filter_fetches_everything, test_default_and_fetches_untagged_and_matching,
@@ -301,7 +301,7 @@ pub mod tag_filtering {
     };
 }
 
-#[cfg(feature = "provider-test")]
+#[cfg(any(feature = "provider-test", feature = "provider-test-core"))]
 pub mod kv_store {
     pub use crate::provider_validation::kv_store::{
         test_kv_clear_all, test_kv_clear_isolation, test_kv_clear_nonexistent_key, test_kv_clear_single,

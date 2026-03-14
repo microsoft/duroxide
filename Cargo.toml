@@ -15,6 +15,7 @@ categories = ["asynchronous", "concurrency"]
 default = []
 sqlite = ["sqlx", "libsqlite3-sys"]  # SQLite provider (bundled, no system deps)
 provider-test = ["sqlite"]  # Enable all provider testing infrastructure (requires sqlite)
+provider-test-core = []  # Provider validation tests without sqlite (for external providers)
 test = ["provider-test", "test-hooks"]  # Auto-enable provider-test and test-hooks for tests
 test-hooks = []  # Enable test hooks for fault injection in integration tests
 replay-version-test = ["test"]  # Zero-cost: only gates test code for replay engine extensibility verification
@@ -50,6 +51,9 @@ duroxide = { path = ".", features = ["sqlite", "test-hooks"] }
 members = [
     ".",
     "sqlite-stress",
+]
+exclude = [
+    "sqlite-objs",  # Excluded: uses libsqlite3-sys 0.36 (via rusqlite) which conflicts with sqlx's 0.28
 ]
 
 # Clippy lints for better code quality

@@ -1,0 +1,27 @@
+[package]
+name = "duroxide-sqlite-objs"
+version = "0.1.0"
+edition = "2024"
+description = "SQLite-objs provider for duroxide - Azure Storage backed SQLite VFS"
+license = "MIT"
+
+[dependencies]
+duroxide = { path = "..", default-features = false, features = ["provider-test-core"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+sqlite-objs = "0.1.1-alpha"
+urlencoding = "2"
+tokio = { version = "1", features = ["rt", "macros"] }
+serde_json = "1"
+tracing = "0.1"
+async-trait = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tempfile = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "perf-test"
+path = "src/bin/perf_test.rs"
+
+[workspace]  # Standalone workspace — excluded from parent due to libsqlite3-sys links conflict
