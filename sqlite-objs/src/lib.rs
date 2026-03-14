@@ -74,8 +74,9 @@ impl SqliteObjsProvider {
     /// Returns an error if VFS registration, database connection, or schema initialization fails.
     pub async fn new(options: SqliteObjsOptions) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, Box<dyn std::error::Error + Send + Sync>> {
-            // Register the sqlite-objs VFS (idempotent - ok if already registered)
-            SqliteObjsVfs::register_uri(false).ok();
+            // Register the sqlite-objs VFS once (global SQLite state, not thread-safe)
+            static VFS_INIT: std::sync::Once = std::sync::Once::new();
+            VFS_INIT.call_once(|| { SqliteObjsVfs::register_uri(false).ok(); });
 
             let uri = format!(
                 "file:{}?azure_account={}&azure_container={}&azure_sas={}",
@@ -96,7 +97,6 @@ impl SqliteObjsProvider {
                  PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
                  PRAGMA busy_timeout = 60000;
-                 PRAGMA foreign_keys = ON;
                  PRAGMA cache_size = -64000;",
             )?;
 
@@ -146,8 +146,16 @@ impl SqliteObjsProvider {
 
         let db_name = db_name.to_string();
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, Box<dyn std::error::Error + Send + Sync>> {
-            SqliteObjsVfs::register_with_config(&config, false)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            // Register the sqlite-objs VFS once (global SQLite state, not thread-safe)
+            use std::sync::OnceLock;
+            static VFS_CONFIG_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+            let init_result = VFS_CONFIG_INIT.get_or_init(|| {
+                SqliteObjsVfs::register_with_config(&config, false)
+                    .map_err(|e| e.to_string())
+            });
+            if let Err(e) = init_result {
+                return Err(e.clone().into());
+            }
 
             let conn = Connection::open_with_flags_and_vfs(
                 &db_name,
@@ -161,7 +169,6 @@ impl SqliteObjsProvider {
                  PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
                  PRAGMA busy_timeout = 60000;
-                 PRAGMA foreign_keys = ON;
                  PRAGMA cache_size = -64000;",
             )?;
 
@@ -190,7 +197,6 @@ impl SqliteObjsProvider {
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = WAL;
                  PRAGMA busy_timeout = 60000;
-                 PRAGMA foreign_keys = ON;
                  PRAGMA cache_size = -64000;
                  PRAGMA wal_autocheckpoint = 10000;",
             )?;
@@ -217,8 +223,7 @@ impl SqliteObjsProvider {
             conn.execute_batch(
                 "PRAGMA journal_mode = MEMORY;
                  PRAGMA synchronous = OFF;
-                 PRAGMA busy_timeout = 60000;
-                 PRAGMA foreign_keys = ON;",
+                 PRAGMA busy_timeout = 60000;",
             )?;
             Ok(conn)
         })
@@ -259,7 +264,7 @@ impl SqliteObjsProvider {
                     custom_status_version INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    parent_instance_id TEXT REFERENCES instances(instance_id)
+                    parent_instance_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_instances_parent ON instances(parent_instance_id);
 
@@ -339,6 +344,7 @@ impl SqliteObjsProvider {
                     key TEXT NOT NULL,
                     value TEXT NOT NULL,
                     execution_id INTEGER NOT NULL,
+                    last_updated_at_ms INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (instance_id, key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_kv_store_execution ON kv_store(instance_id, execution_id);
@@ -535,13 +541,8 @@ impl Provider for SqliteObjsProvider {
 
             let instance_id = match instance_id {
                 Some(id) => id,
-                None => {
-                    eprintln!("[fetch_orch] Step 1: no candidate found");
-                    return Ok(None);
-                }
+                None => return Ok(None),
             };
-
-            eprintln!("[fetch_orch] Step 1: candidate={instance_id}, now_ms={now_ms}");
 
             // Step 2: Acquire instance lock
             let lock_token = Self::generate_lock_token();
@@ -560,20 +561,16 @@ impl Provider for SqliteObjsProvider {
                 )
                 .map_err(|e| Self::rusqlite_to_provider_error("fetch_orchestration_item", e))?;
 
-            eprintln!("[fetch_orch] Step 2: lock_rows={lock_rows}");
-
             if lock_rows == 0 {
                 return Ok(None);
             }
 
             // Step 3: Mark messages with our lock_token
-            let mark_rows = conn.execute(
+            conn.execute(
                 "UPDATE orchestrator_queue SET lock_token = ?1, attempt_count = attempt_count + 1 WHERE instance_id = ?2 AND visible_at <= ?3",
                 params![&lock_token, &instance_id, now_ms],
             )
             .map_err(|e| Self::rusqlite_to_provider_error("fetch_orchestration_item", e))?;
-
-            eprintln!("[fetch_orch] Step 3: marked {mark_rows} messages");
 
             // Step 4: Fetch marked messages
             let mut stmt = conn
@@ -599,12 +596,9 @@ impl Provider for SqliteObjsProvider {
                 .collect();
 
             if work_items.is_empty() {
-                eprintln!("[fetch_orch] Step 4: work_items empty! Releasing lock");
                 conn.execute("DELETE FROM instance_locks WHERE instance_id = ?", params![&instance_id]).ok();
                 return Ok(None);
             }
-
-            eprintln!("[fetch_orch] Step 4: got {} work items", work_items.len());
 
             // Step 5: Get instance metadata
             let instance_info: Option<(String, Option<String>, i64)> = conn
@@ -658,56 +652,81 @@ impl Provider for SqliteObjsProvider {
                                     history: vec![],
                                     messages: work_items,
                                     history_error: Some(error_msg),
-                                    kv_snapshot: std::collections::HashMap::new(),
+                                    kv_snapshot: std::collections::HashMap::<String, duroxide::providers::KvEntry>::new(),
                                 },
                                 lock_token,
                                 max_attempt_count,
                             )));
                         }
                     }
-                } else if let Some(start_item) = work_items.iter().find(|item| {
-                    matches!(item, WorkItem::StartOrchestration { .. } | WorkItem::ContinueAsNew { .. })
-                }) {
-                    let (orchestration, version) = match start_item {
-                        WorkItem::StartOrchestration { orchestration, version, .. }
-                        | WorkItem::ContinueAsNew { orchestration, version, .. } => {
-                            (orchestration.clone(), version.clone())
-                        }
-                        _ => unreachable!(),
-                    };
-                    (
-                        orchestration,
-                        version.unwrap_or_else(|| "unknown".to_string()),
-                        1u64,
-                        Vec::new(),
-                    )
                 } else {
-                    // No instance info and no start message
-                    let all_queue_messages = work_items.iter().all(|item| matches!(item, WorkItem::QueueMessage { .. }));
-                    if all_queue_messages {
-                        conn.execute("DELETE FROM orchestrator_queue WHERE lock_token = ?1", params![&lock_token]).ok();
+                    // No instances row — fallback: try to derive from history
+                    // (e.g., ActivityCompleted arriving before metadata was set via ack)
+                    let mut hist_stmt = conn
+                        .prepare("SELECT event_data FROM history WHERE instance_id = ?1 ORDER BY execution_id, event_id")
+                        .map_err(|e| Self::rusqlite_to_provider_error("fetch_orchestration_item", e))?;
+                    let hist: Vec<Event> = hist_stmt
+                        .query_map(params![&instance_id], |row| {
+                            let data: String = row.get(0)?;
+                            Ok(data)
+                        })
+                        .map_err(|e| Self::rusqlite_to_provider_error("fetch_orchestration_item", e))?
+                        .filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok()))
+                        .collect();
+
+                    if let Some((name, version)) = hist.iter().find_map(|e| {
+                        if let EventKind::OrchestrationStarted { name, version, .. } = &e.kind {
+                            Some((name.clone(), version.clone()))
+                        } else {
+                            None
+                        }
+                    }) {
+                        (name, version, 1u64, hist)
+                    } else if let Some(start_item) = work_items.iter().find(|item| {
+                        matches!(item, WorkItem::StartOrchestration { .. } | WorkItem::ContinueAsNew { .. })
+                    }) {
+                        let (orchestration, version) = match start_item {
+                            WorkItem::StartOrchestration { orchestration, version, .. }
+                            | WorkItem::ContinueAsNew { orchestration, version, .. } => {
+                                (orchestration.clone(), version.clone())
+                            }
+                            _ => unreachable!(),
+                        };
+                        (
+                            orchestration,
+                            version.unwrap_or_else(|| "unknown".to_string()),
+                            1u64,
+                            Vec::new(),
+                        )
+                    } else {
+                        // No instance info, no history, and no start message
+                        let all_queue_messages = work_items.iter().all(|item| matches!(item, WorkItem::QueueMessage { .. }));
+                        if all_queue_messages {
+                            conn.execute("DELETE FROM orchestrator_queue WHERE lock_token = ?1", params![&lock_token]).ok();
+                            conn.execute("DELETE FROM instance_locks WHERE lock_token = ?1", params![&lock_token]).ok();
+                            return Ok(None);
+                        }
+                        // Release locks for retry
+                        conn.execute(
+                            "UPDATE orchestrator_queue SET lock_token = NULL WHERE lock_token = ?1",
+                            params![&lock_token],
+                        ).ok();
                         conn.execute("DELETE FROM instance_locks WHERE lock_token = ?1", params![&lock_token]).ok();
                         return Ok(None);
                     }
-                    // Release locks for retry
-                    conn.execute(
-                        "UPDATE orchestrator_queue SET lock_token = NULL WHERE lock_token = ?1",
-                        params![&lock_token],
-                    ).ok();
-                    conn.execute("DELETE FROM instance_locks WHERE lock_token = ?1", params![&lock_token]).ok();
-                    return Ok(None);
                 };
 
             // Load KV snapshot
             let mut kv_stmt = conn
-                .prepare("SELECT key, value FROM kv_store WHERE instance_id = ?")
+                .prepare("SELECT key, value, last_updated_at_ms FROM kv_store WHERE instance_id = ?")
                 .map_err(|e| Self::rusqlite_to_provider_error("fetch_orchestration_item", e))?;
-            let kv_snapshot: std::collections::HashMap<String, String> = kv_stmt
+            let kv_snapshot: std::collections::HashMap<String, duroxide::providers::KvEntry> = kv_stmt
                 .query_map(params![&instance_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
                 })
                 .map_err(|e| Self::rusqlite_to_provider_error("fetch_orchestration_item", e))?
                 .filter_map(|r| r.ok())
+                .map(|(k, v, ts)| (k, duroxide::providers::KvEntry { value: v, last_updated_at_ms: ts as u64 }))
                 .collect();
 
             debug!(
@@ -855,10 +874,10 @@ impl Provider for SqliteObjsProvider {
             // Materialize KV mutations
             for event in &history_delta {
                 match &event.kind {
-                    EventKind::KeyValueSet { key, value } => {
+                    EventKind::KeyValueSet { key, value, last_updated_at_ms } => {
                         conn.execute(
-                            "INSERT INTO kv_store (instance_id, key, value, execution_id) VALUES (?, ?, ?, ?) ON CONFLICT(instance_id, key) DO UPDATE SET value = excluded.value, execution_id = excluded.execution_id",
-                            params![&instance_id, key, value, execution_id as i64],
+                            "INSERT INTO kv_store (instance_id, key, value, execution_id, last_updated_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(instance_id, key) DO UPDATE SET value = excluded.value, execution_id = excluded.execution_id, last_updated_at_ms = excluded.last_updated_at_ms",
+                            params![&instance_id, key, value, execution_id as i64, *last_updated_at_ms as i64],
                         ).map_err(|e| Self::rusqlite_to_provider_error("ack_orchestration_item", e))?;
                     }
                     EventKind::KeyValueCleared { key } => {
@@ -1564,6 +1583,34 @@ impl Provider for SqliteObjsProvider {
         .await
         .map_err(|e| ProviderError::permanent("get_kv_value", format!("Task join error: {e}")))?
     }
+
+    async fn get_kv_all_values(
+        &self,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
+        let conn = self.conn.clone();
+        let instance = instance.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().expect("mutex poisoned");
+
+            let mut stmt = conn
+                .prepare("SELECT key, value FROM kv_store WHERE instance_id = ?")
+                .map_err(|e| Self::rusqlite_to_provider_error("get_kv_all_values", e))?;
+
+            let map: std::collections::HashMap<String, String> = stmt
+                .query_map(params![&instance], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| Self::rusqlite_to_provider_error("get_kv_all_values", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(map)
+        })
+        .await
+        .map_err(|e| ProviderError::permanent("get_kv_all_values", format!("Task join error: {e}")))?
+    }
 }
 
 #[async_trait::async_trait]
@@ -1881,6 +1928,29 @@ impl ProviderAdmin for SqliteObjsProvider {
                 }
             }
 
+            // Orphan check: ensure no children outside the delete set would be orphaned
+            let orphan_sql = format!(
+                "SELECT instance_id, parent_instance_id FROM instances WHERE parent_instance_id IN ({placeholders}) AND instance_id NOT IN ({placeholders}) LIMIT 1"
+            );
+            let mut stmt = conn.prepare(&orphan_sql)
+                .map_err(|e| Self::rusqlite_to_provider_error("delete_instances_atomic", e))?;
+            // Bind ids twice: once for parent_instance_id IN, once for instance_id NOT IN
+            let mut double_params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(ids.len() * 2);
+            for id in &ids { double_params.push(id as &dyn rusqlite::types::ToSql); }
+            for id in &ids { double_params.push(id as &dyn rusqlite::types::ToSql); }
+            let orphan_row: Option<(String, String)> = stmt.query_row(double_params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }).ok();
+            if let Some((orphan_id, parent_id)) = orphan_row {
+                return Err(ProviderError::permanent(
+                    "delete_instances_atomic",
+                    format!(
+                        "Cannot delete: instance {parent_id} has child {orphan_id} that was created after tree traversal. \
+                         Re-fetch the tree and retry."
+                    ),
+                ));
+            }
+
             let mut result = DeleteInstanceResult::default();
 
             // Count before delete
@@ -1893,6 +1963,19 @@ impl ProviderAdmin for SqliteObjsProvider {
             let mut stmt = conn.prepare(&count_sql).map_err(|e| Self::rusqlite_to_provider_error("delete_instances_atomic", e))?;
             let params_ref: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
             result.executions_deleted = stmt.query_row(params_ref.as_slice(), |row| row.get::<_, i64>(0)).unwrap_or(0) as u64;
+
+            // Count queue messages
+            let count_oq_sql = format!("SELECT COUNT(*) FROM orchestrator_queue WHERE instance_id IN ({placeholders})");
+            let mut stmt = conn.prepare(&count_oq_sql).map_err(|e| Self::rusqlite_to_provider_error("delete_instances_atomic", e))?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let oq_count = stmt.query_row(params_ref.as_slice(), |row| row.get::<_, i64>(0)).unwrap_or(0);
+
+            let count_wq_sql = format!("SELECT COUNT(*) FROM worker_queue WHERE instance_id IN ({placeholders})");
+            let mut stmt = conn.prepare(&count_wq_sql).map_err(|e| Self::rusqlite_to_provider_error("delete_instances_atomic", e))?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let wq_count = stmt.query_row(params_ref.as_slice(), |row| row.get::<_, i64>(0)).unwrap_or(0);
+
+            result.queue_messages_deleted = (oq_count + wq_count) as u64;
 
             // Delete from all tables
             for table in &["history", "executions", "orchestrator_queue", "worker_queue", "instance_locks", "kv_store", "instances"] {
@@ -2045,39 +2128,70 @@ impl ProviderAdmin for SqliteObjsProvider {
                 .map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?;
             let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|v| v.as_ref()).collect();
 
-            let instance_ids: Vec<String> = stmt
+            let root_ids: Vec<String> = stmt
                 .query_map(params_ref.as_slice(), |row| row.get(0))
                 .map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?
                 .filter_map(|r| r.ok())
                 .collect();
 
-            if instance_ids.is_empty() {
+            if root_ids.is_empty() {
                 return Ok(DeleteInstanceResult::default());
             }
 
             drop(stmt);
 
+            // Expand roots to include all descendants (BFS)
+            let mut all_ids: Vec<String> = Vec::new();
+            for root_id in &root_ids {
+                let mut to_process = vec![root_id.clone()];
+                while let Some(parent_id) = to_process.pop() {
+                    all_ids.push(parent_id.clone());
+                    let mut child_stmt = conn
+                        .prepare("SELECT instance_id FROM instances WHERE parent_instance_id = ?")
+                        .map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?;
+                    let children: Vec<String> = child_stmt
+                        .query_map(params![&parent_id], |row| row.get(0))
+                        .map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    to_process.extend(children);
+                }
+            }
+
             let mut result = DeleteInstanceResult::default();
-            let placeholders: String = instance_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let placeholders: String = all_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
             let count_sql = format!("SELECT COUNT(*) FROM history WHERE instance_id IN ({placeholders})");
             let mut stmt = conn.prepare(&count_sql).map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?;
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> = instance_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = all_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
             result.events_deleted = stmt.query_row(params_ref.as_slice(), |row| row.get::<_, i64>(0)).unwrap_or(0) as u64;
 
             let count_sql = format!("SELECT COUNT(*) FROM executions WHERE instance_id IN ({placeholders})");
             let mut stmt = conn.prepare(&count_sql).map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?;
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> = instance_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = all_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
             result.executions_deleted = stmt.query_row(params_ref.as_slice(), |row| row.get::<_, i64>(0)).unwrap_or(0) as u64;
+
+            // Count queue messages
+            let count_oq_sql = format!("SELECT COUNT(*) FROM orchestrator_queue WHERE instance_id IN ({placeholders})");
+            let mut stmt = conn.prepare(&count_oq_sql).map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = all_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let oq_count = stmt.query_row(params_ref.as_slice(), |row| row.get::<_, i64>(0)).unwrap_or(0);
+
+            let count_wq_sql = format!("SELECT COUNT(*) FROM worker_queue WHERE instance_id IN ({placeholders})");
+            let mut stmt = conn.prepare(&count_wq_sql).map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = all_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let wq_count = stmt.query_row(params_ref.as_slice(), |row| row.get::<_, i64>(0)).unwrap_or(0);
+
+            result.queue_messages_deleted = (oq_count + wq_count) as u64;
 
             for table in &["history", "executions", "orchestrator_queue", "worker_queue", "instance_locks", "kv_store", "instances"] {
                 let del_sql = format!("DELETE FROM {} WHERE instance_id IN ({})", table, placeholders);
                 let mut stmt = conn.prepare(&del_sql).map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?;
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> = instance_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> = all_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
                 stmt.execute(params_ref.as_slice()).map_err(|e| Self::rusqlite_to_provider_error("delete_instance_bulk", e))?;
             }
 
-            result.instances_deleted = instance_ids.len() as u64;
+            result.instances_deleted = all_ids.len() as u64;
             Ok(result)
         })
         .await

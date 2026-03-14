@@ -16,9 +16,12 @@ tracing = "0.1"
 async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tempfile = "3"
+dotenvy = "0.15"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
 
 [[bin]]
 name = "perf-test"

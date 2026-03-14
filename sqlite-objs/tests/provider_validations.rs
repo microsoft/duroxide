@@ -163,8 +163,13 @@ use duroxide::provider_validations::{
 };
 
 
-/// Standard test factory — each `create_provider()` call gets a fresh in-memory DB.
-/// Used by the vast majority of tests that don't need direct DB manipulation.
+/// Standard test factory — each `create_provider()` call gets a fresh DB.
+///
+/// Controlled by `SQLITE_MODE` env var:
+///   LOCAL_INMEM  — in-memory rusqlite (default)
+///   LOCAL_FILE   — local file via rusqlite (temp dir per provider)
+///   OBJS_AZURE   — Azure Storage via sqlite-objs VFS
+///                   Requires: AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_CONTAINER
 
 use duroxide::providers::Provider;
 use duroxide_sqlite_objs::SqliteObjsProvider;
@@ -173,12 +178,50 @@ use std::time::Duration;
 
 const TEST_LOCK_TIMEOUT: Duration = Duration::from_millis(1000);
 
+fn load_dotenv() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // Load .env from the crate root (where Cargo.toml lives), not cwd
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let env_path = std::path::Path::new(manifest_dir).join(".env");
+        dotenvy::from_path(&env_path).ok();
+    });
+}
+
+async fn create_provider_from_env() -> SqliteObjsProvider {
+    load_dotenv();
+    let mode = std::env::var("SQLITE_MODE").unwrap_or_else(|_| "LOCAL_INMEM".to_string());
+    match mode.as_str() {
+        "LOCAL_INMEM" => SqliteObjsProvider::new_in_memory().await.unwrap(),
+        "LOCAL_FILE" => {
+            let dir = tempfile::tempdir().expect("failed to create temp dir");
+            let path = dir.path().join(format!("test-{}.db", uuid::Uuid::new_v4()));
+            // Leak the tempdir so it lives for the duration of the test
+            let path_str = path.to_str().unwrap().to_string();
+            std::mem::forget(dir);
+            SqliteObjsProvider::new_local(&path_str).await.unwrap()
+        }
+        "OBJS_AZURE" => {
+            let conn_str = std::env::var("AZURE_STORAGE_CONNECTION_STRING")
+                .expect("OBJS_AZURE mode requires AZURE_STORAGE_CONNECTION_STRING");
+            let container = std::env::var("AZURE_STORAGE_CONTAINER")
+                .expect("OBJS_AZURE mode requires AZURE_STORAGE_CONTAINER");
+            let db_name = format!("test-{}.db", uuid::Uuid::new_v4());
+            SqliteObjsProvider::new_from_connection_string(&conn_str, &container, &db_name)
+                .await
+                .unwrap()
+        }
+        other => panic!("Unknown SQLITE_MODE={other}. Valid: LOCAL_INMEM, LOCAL_FILE, OBJS_AZURE"),
+    }
+}
+
 struct SqliteObjsTestFactory;
 
 #[async_trait::async_trait]
 impl ProviderFactory for SqliteObjsTestFactory {
     async fn create_provider(&self) -> Arc<dyn Provider> {
-        Arc::new(SqliteObjsProvider::new_in_memory().await.unwrap())
+        Arc::new(create_provider_from_env().await)
     }
 
     fn lock_timeout(&self) -> Duration {
@@ -193,7 +236,7 @@ struct SharedSqliteObjsTestFactory {
 impl SharedSqliteObjsTestFactory {
     async fn new() -> Self {
         Self {
-            provider: Arc::new(SqliteObjsProvider::new_in_memory().await.unwrap()),
+            provider: Arc::new(create_provider_from_env().await),
         }
     }
 }
@@ -1165,7 +1208,7 @@ use duroxide::provider_validations::kv_store::{
     test_kv_delete_instance_with_children, test_kv_empty_value, test_kv_execution_id_tracking,
     test_kv_get_nonexistent, test_kv_get_unknown_instance, test_kv_instance_isolation, test_kv_large_value,
     test_kv_overwrite, test_kv_prune_current_execution_protected, test_kv_prune_preserves_overwritten,
-    test_kv_prune_removes_orphan_keys, test_kv_set_after_clear, test_kv_set_and_get,
+    test_kv_prune_preserves_all_keys, test_kv_set_after_clear, test_kv_set_and_get,
     test_kv_snapshot_after_clear_all, test_kv_snapshot_after_clear_single, test_kv_snapshot_cross_execution,
     test_kv_snapshot_empty, test_kv_snapshot_in_fetch, test_kv_special_chars_in_key,
 };
@@ -1231,8 +1274,8 @@ async fn test_sqlite_objs_kv_prune_preserves_overwritten() {
 }
 
 #[tokio::test]
-async fn test_sqlite_objs_kv_prune_removes_orphan_keys() {
-    test_kv_prune_removes_orphan_keys(&SqliteObjsTestFactory).await;
+async fn test_sqlite_objs_kv_prune_preserves_all_keys() {
+    test_kv_prune_preserves_all_keys(&SqliteObjsTestFactory).await;
 }
 
 #[tokio::test]
@@ -1298,90 +1341,4 @@ async fn test_sqlite_objs_kv_delete_instance_with_children() {
 #[tokio::test]
 async fn test_sqlite_objs_kv_clear_isolation() {
     test_kv_clear_isolation(&SqliteObjsTestFactory).await;
-}
-
-#[tokio::test]
-async fn debug_ack_orchestrator_items() {
-    use duroxide::{Event, EventKind};
-    use duroxide::providers::{ExecutionMetadata, WorkItem, TagFilter};
-
-    let provider = SqliteObjsProvider::new_in_memory().await.unwrap();
-
-    // Create instance
-    provider.enqueue_for_orchestrator(WorkItem::StartOrchestration {
-        instance: "inst-1".to_string(),
-        orchestration: "Orch".to_string(),
-        input: "{}".to_string(),
-        version: Some("1.0".to_string()),
-        parent_instance: None,
-        parent_id: None,
-        execution_id: 1,
-    }, None).await.unwrap();
-
-    let (_, lock_token, _) = provider.fetch_orchestration_item(
-        Duration::from_secs(30), Duration::ZERO, None
-    ).await.unwrap().unwrap();
-
-    // Ack with worker + orchestrator items
-    provider.ack_orchestration_item(
-        &lock_token,
-        1,
-        vec![Event::with_event_id(1, "inst-1".to_string(), 1, None,
-            EventKind::OrchestrationStarted {
-                name: "Orch".to_string(), version: "1.0".to_string(), input: "{}".to_string(),
-                parent_instance: None, parent_id: None, carry_forward_events: None, initial_custom_status: None,
-            })],
-        vec![WorkItem::ActivityExecute {
-            instance: "inst-1".to_string(), execution_id: 1, id: 1,
-            name: "Act".to_string(), input: "in".to_string(), session_id: None, tag: None,
-        }],
-        vec![WorkItem::TimerFired {
-            instance: "inst-1".to_string(), execution_id: 1, id: 1, fire_at_ms: 1234567890,
-        }],
-        ExecutionMetadata::default(),
-        vec![],
-    ).await.unwrap();
-
-    // Debug: check the queues
-    {
-        let conn = provider.get_conn().lock().unwrap();
-        let oq_count: i64 = conn.query_row("SELECT COUNT(*) FROM orchestrator_queue", [], |r| r.get(0)).unwrap();
-        let wq_count: i64 = conn.query_row("SELECT COUNT(*) FROM worker_queue", [], |r| r.get(0)).unwrap();
-        let lock_count: i64 = conn.query_row("SELECT COUNT(*) FROM instance_locks", [], |r| r.get(0)).unwrap();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
-        eprintln!("After ack: orchestrator_queue={oq_count}, worker_queue={wq_count}, instance_locks={lock_count}, now_ms={now_ms}");
-
-        let mut stmt = conn.prepare("SELECT id, instance_id, visible_at, lock_token FROM orchestrator_queue").unwrap();
-        let rows: Vec<(i64, String, i64, Option<String>)> = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
-        for (id, inst, vis, lt) in &rows {
-            let visible = *vis <= now_ms;
-            eprintln!("  OQ: id={id} instance={inst} visible_at={vis} lock_token={lt:?} is_visible={visible}");
-        }
-
-        // Simulate the fetch query
-        let candidate: Result<String, _> = conn.query_row(
-            "SELECT q.instance_id FROM orchestrator_queue q LEFT JOIN instance_locks il ON q.instance_id = il.instance_id WHERE q.visible_at <= ?1 AND (il.instance_id IS NULL OR il.locked_until <= ?1) ORDER BY q.id LIMIT 1",
-            rusqlite::params![now_ms],
-            |row| row.get(0),
-        );
-        eprintln!("  Simulated fetch candidate: {candidate:?}");
-    }
-
-    // Fetch worker item
-    let (_, w_token, _) = provider.fetch_work_item(
-        Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default()
-    ).await.unwrap().expect("Should get worker item");
-    provider.ack_work_item(&w_token, None).await.unwrap();
-
-    // Try fetch orchestration item
-    let result = provider.fetch_orchestration_item(
-        Duration::from_secs(30), Duration::ZERO, None
-    ).await.unwrap();
-    assert!(result.is_some(), "Should get orchestration item with timer");
-    let (item, _, _) = result.unwrap();
-    assert_eq!(item.messages.len(), 1);
-    assert!(matches!(&item.messages[0], WorkItem::TimerFired { .. }));
 }
