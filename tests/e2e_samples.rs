@@ -2264,12 +2264,12 @@ async fn sample_dual_runtime_tag_cooperation() {
 /// KV Store: Client ↔ Orchestration request/response via KV + external events.
 ///
 /// Pattern: A long-running "server" orchestration receives requests via external
-/// events and writes responses to its KV store. Clients poll `client.get_value()`
+/// events and writes responses to its KV store. Clients poll `client.get_kv_value()`
 /// to read responses. This eliminates the need for a separate response channel.
 ///
 /// Highlights:
-/// - `ctx.set_value()` / `ctx.get_value()` for in-orchestration state
-/// - `client.get_value()` for external reads of orchestration KV
+/// - `ctx.set_kv_value()` / `ctx.get_kv_value()` for in-orchestration state
+/// - `client.get_kv_value()` for external reads of orchestration KV
 /// - `ctx.schedule_wait()` to receive requests as external events
 /// - Request/response correlation via KV keys like `"response:{op_id}"`
 /// - KV survives replay — safe across restarts
@@ -2288,7 +2288,7 @@ async fn sample_kv_request_response() {
         .register(
             "RequestServer",
             |ctx: OrchestrationContext, _input: String| async move {
-                ctx.set_value("status", "ready");
+                ctx.set_kv_value("status", "ready");
 
                 // Process up to 3 requests then shut down
                 for _ in 0..3 {
@@ -2298,7 +2298,7 @@ async fn sample_kv_request_response() {
                     let op_id = request["op_id"].as_str().unwrap().to_string();
                     let command = request["command"].as_str().unwrap().to_string();
 
-                    ctx.set_value("status", "processing");
+                    ctx.set_kv_value("status", "processing");
 
                     // Process the command via an activity
                     let result = ctx
@@ -2307,11 +2307,11 @@ async fn sample_kv_request_response() {
                         .unwrap_or_else(|e| format!("error: {e}"));
 
                     // Write response to KV keyed by op_id
-                    ctx.set_value(format!("response:{op_id}"), &result);
-                    ctx.set_value("status", "ready");
+                    ctx.set_kv_value(format!("response:{op_id}"), &result);
+                    ctx.set_kv_value("status", "ready");
                 }
 
-                ctx.set_value("status", "shutdown");
+                ctx.set_kv_value("status", "shutdown");
                 Ok("served 3 requests".to_string())
             },
         )
@@ -2329,7 +2329,7 @@ async fn sample_kv_request_response() {
 
     // Wait for the server to be ready
     let status = client
-        .wait_for_value("req-resp-server", "status", Duration::from_secs(5))
+        .wait_for_kv_value("req-resp-server", "status", Duration::from_secs(5))
         .await
         .expect("Server never became ready");
     assert_eq!(status, "ready");
@@ -2347,7 +2347,7 @@ async fn sample_kv_request_response() {
         // Wait for response
         let response_key = format!("response:{op_id}");
         let response = client
-            .wait_for_value("req-resp-server", &response_key, Duration::from_secs(5))
+            .wait_for_kv_value("req-resp-server", &response_key, Duration::from_secs(5))
             .await
             .unwrap_or_else(|_| panic!("Timed out waiting for response to {op_id}"));
 
@@ -2372,19 +2372,19 @@ async fn sample_kv_request_response() {
 
     // All KV values still accessible after completion
     assert_eq!(
-        client.get_value("req-resp-server", "status").await.unwrap(),
+        client.get_kv_value("req-resp-server", "status").await.unwrap(),
         Some("shutdown".to_string())
     );
     assert_eq!(
-        client.get_value("req-resp-server", "response:op-1").await.unwrap(),
+        client.get_kv_value("req-resp-server", "response:op-1").await.unwrap(),
         Some("olleh".to_string())
     );
     assert_eq!(
-        client.get_value("req-resp-server", "response:op-2").await.unwrap(),
+        client.get_kv_value("req-resp-server", "response:op-2").await.unwrap(),
         Some("dlrow".to_string())
     );
     assert_eq!(
-        client.get_value("req-resp-server", "response:op-3").await.unwrap(),
+        client.get_kv_value("req-resp-server", "response:op-3").await.unwrap(),
         Some("tsur".to_string())
     );
 
@@ -2398,10 +2398,10 @@ async fn sample_kv_request_response() {
 /// between independent orchestrations without shared state or external systems.
 ///
 /// Highlights:
-/// - `ctx.get_value_from_instance()` reads another orchestration's KV via a system activity
+/// - `ctx.get_kv_value_from_instance()` reads another orchestration's KV via a system activity
 /// - Cross-instance reads are replay-safe (recorded as `ActivityCompleted`)
 /// - Values set by one orchestration are immediately visible to others (after ack)
-/// - `client.wait_for_value()` for efficient polling
+/// - `client.wait_for_kv_value()` for efficient polling
 #[tokio::test]
 async fn sample_kv_cross_orchestration_read() {
     let (store, _temp_dir) = common::create_sqlite_store_disk().await;
@@ -2417,11 +2417,11 @@ async fn sample_kv_cross_orchestration_read() {
         // Producer: computes values and stores them in KV
         .register("Producer", |ctx: OrchestrationContext, input: String| async move {
             let n: i64 = input.parse().unwrap();
-            ctx.set_value("status", "computing");
+            ctx.set_kv_value("status", "computing");
 
             let squared = ctx.schedule_activity("ComputeResult", n.to_string()).await?;
-            ctx.set_value("result", &squared);
-            ctx.set_value("status", "done");
+            ctx.set_kv_value("result", &squared);
+            ctx.set_kv_value("status", "done");
 
             // Wait for consumer to acknowledge before completing
             ctx.schedule_wait("ack").await;
@@ -2435,7 +2435,7 @@ async fn sample_kv_cross_orchestration_read() {
                 let mut attempts = 0;
                 loop {
                     let status = ctx
-                        .get_value_from_instance(&producer_id, "status")
+                        .get_kv_value_from_instance(&producer_id, "status")
                         .await
                         .map_err(|e| format!("read status: {e}"))?;
                     if status.as_deref() == Some("done") {
@@ -2450,7 +2450,7 @@ async fn sample_kv_cross_orchestration_read() {
 
                 // Read the computed result from producer's KV
                 let result = ctx
-                    .get_value_from_instance(&producer_id, "result")
+                    .get_kv_value_from_instance(&producer_id, "result")
                     .await
                     .map_err(|e| format!("read result: {e}"))?;
 
@@ -2470,7 +2470,7 @@ async fn sample_kv_cross_orchestration_read() {
 
     // Wait for producer to have a result via client polling
     let result = client
-        .wait_for_value("producer-1", "result", Duration::from_secs(5))
+        .wait_for_kv_value("producer-1", "result", Duration::from_secs(5))
         .await
         .expect("Producer never set result");
     assert_eq!(result, "49"); // 7*7
@@ -2509,11 +2509,11 @@ async fn sample_kv_cross_orchestration_read() {
 
     // Cross-instance reads also work via client after both are terminal
     assert_eq!(
-        client.get_value("producer-1", "result").await.unwrap(),
+        client.get_kv_value("producer-1", "result").await.unwrap(),
         Some("49".to_string())
     );
     assert_eq!(
-        client.get_value("producer-1", "status").await.unwrap(),
+        client.get_kv_value("producer-1", "status").await.unwrap(),
         Some("done".to_string())
     );
 

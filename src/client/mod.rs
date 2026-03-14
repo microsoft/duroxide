@@ -880,7 +880,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns `ClientError` if the provider fails to read.
-    pub async fn get_value(&self, instance: &str, key: &str) -> Result<Option<String>, ClientError> {
+    pub async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ClientError> {
         self.store.get_kv_value(instance, key).await.map_err(ClientError::from)
     }
 
@@ -892,12 +892,12 @@ impl Client {
     /// # Errors
     ///
     /// Returns `ClientError` if the provider fails or deserialization fails.
-    pub async fn get_value_typed<T: serde::de::DeserializeOwned>(
+    pub async fn get_kv_value_typed<T: serde::de::DeserializeOwned>(
         &self,
         instance: &str,
         key: &str,
     ) -> Result<Option<T>, ClientError> {
-        match self.get_value(instance, key).await? {
+        match self.get_kv_value(instance, key).await? {
             None => Ok(None),
             Some(s) => serde_json::from_str(&s)
                 .map(Some)
@@ -907,6 +907,21 @@ impl Client {
         }
     }
 
+    /// Read all KV entries for a given instance.
+    ///
+    /// Returns a map of key→value pairs. Returns an empty map if no keys exist.
+    /// Reads directly from the provider's materialized `kv_store` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError` if the provider fails to read.
+    pub async fn get_kv_all_values(
+        &self,
+        instance: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ClientError> {
+        self.store.get_kv_all_values(instance).await.map_err(ClientError::from)
+    }
+
     /// Poll a KV key until it becomes `Some`, or timeout.
     ///
     /// Uses exponential backoff (same as [`wait_for_orchestration`](Self::wait_for_orchestration)).
@@ -914,7 +929,7 @@ impl Client {
     /// # Example
     ///
     /// ```ignore
-    /// let value = client.wait_for_value(
+    /// let value = client.wait_for_kv_value(
     ///     "my-instance", "response:op-1",
     ///     Duration::from_secs(5),
     /// ).await?;
@@ -925,7 +940,7 @@ impl Client {
     ///
     /// Returns `ClientError::Timeout` if the key is still `None` after `timeout`.
     /// Returns `ClientError` if a provider read fails.
-    pub async fn wait_for_value(
+    pub async fn wait_for_kv_value(
         &self,
         instance: &str,
         key: &str,
@@ -933,13 +948,13 @@ impl Client {
     ) -> Result<String, ClientError> {
         let deadline = std::time::Instant::now() + timeout;
         // quick path
-        if let Some(val) = self.get_value(instance, key).await? {
+        if let Some(val) = self.get_kv_value(instance, key).await? {
             return Ok(val);
         }
         // poll with backoff
         let mut delay_ms: u64 = INITIAL_POLL_DELAY_MS;
         while std::time::Instant::now() < deadline {
-            if let Some(val) = self.get_value(instance, key).await? {
+            if let Some(val) = self.get_kv_value(instance, key).await? {
                 return Ok(val);
             }
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -950,20 +965,20 @@ impl Client {
 
     /// Poll a typed KV key until it becomes `Some`, or timeout.
     ///
-    /// Same as [`wait_for_value`](Self::wait_for_value) but deserializes
+    /// Same as [`wait_for_kv_value`](Self::wait_for_kv_value) but deserializes
     /// the JSON value into `T`.
     ///
     /// # Errors
     ///
     /// Returns `ClientError::Timeout` if the key is still `None` after `timeout`.
     /// Returns `ClientError` if a provider read or deserialization fails.
-    pub async fn wait_for_value_typed<T: serde::de::DeserializeOwned>(
+    pub async fn wait_for_kv_value_typed<T: serde::de::DeserializeOwned>(
         &self,
         instance: &str,
         key: &str,
         timeout: std::time::Duration,
     ) -> Result<T, ClientError> {
-        let raw = self.wait_for_value(instance, key, timeout).await?;
+        let raw = self.wait_for_kv_value(instance, key, timeout).await?;
         serde_json::from_str(&raw).map_err(|e| ClientError::InvalidInput {
             message: format!("KV deserialization error: {e}"),
         })

@@ -39,7 +39,7 @@ fn validate_limits(
     orchestrator_items: &mut Vec<WorkItem>,
     instance: &str,
     execution_id: u64,
-    kv_snapshot: &std::collections::HashMap<String, String>,
+    kv_snapshot: &std::collections::HashMap<String, crate::providers::KvEntry>,
 ) -> bool {
     // --- Custom status size ---
     let last_custom_status = history_delta.iter().rev().find_map(|e| {
@@ -124,7 +124,7 @@ fn validate_limits(
 
     // --- KV value size ---
     let oversized_kv = history_delta.iter().find_map(|e| {
-        if let EventKind::KeyValueSet { ref key, ref value } = e.kind {
+        if let EventKind::KeyValueSet { ref key, ref value, .. } = e.kind {
             if value.len() > crate::runtime::limits::MAX_KV_VALUE_BYTES {
                 Some((key.clone(), value.len()))
             } else {
@@ -1022,7 +1022,7 @@ impl Runtime {
         workitem_reader: &WorkItemReader,
         execution_id: u64,
         worker_id: &str,
-        kv_snapshot: std::collections::HashMap<String, String>,
+        kv_snapshot: std::collections::HashMap<String, crate::providers::KvEntry>,
     ) -> Result<(Vec<WorkItem>, Vec<WorkItem>, Vec<ScheduledActivityIdentifier>), OrchestrationProcessingError> {
         let mut worker_items = Vec::new();
         let mut orchestrator_items = Vec::new();

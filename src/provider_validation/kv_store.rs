@@ -74,6 +74,7 @@ pub async fn test_kv_set_and_get<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "counter".to_string(),
                 value: "42".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -106,6 +107,7 @@ pub async fn test_kv_overwrite<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "status".to_string(),
                 value: "old".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -128,6 +130,7 @@ pub async fn test_kv_overwrite<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "status".to_string(),
                 value: "new".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -160,6 +163,7 @@ pub async fn test_kv_clear_single<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "remove_me".to_string(),
                 value: "x".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -214,6 +218,7 @@ pub async fn test_kv_clear_all<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "a".to_string(),
                     value: "1".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
             Event::with_event_id(
@@ -224,6 +229,7 @@ pub async fn test_kv_clear_all<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "b".to_string(),
                     value: "2".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
         ],
@@ -299,6 +305,7 @@ pub async fn test_kv_snapshot_in_fetch<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "x".to_string(),
                     value: "10".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
             Event::with_event_id(
@@ -309,6 +316,7 @@ pub async fn test_kv_snapshot_in_fetch<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "y".to_string(),
                     value: "20".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
         ],
@@ -328,8 +336,8 @@ pub async fn test_kv_snapshot_in_fetch<F: ProviderFactory>(factory: &F) {
         .expect("expected orchestration item");
 
     assert_eq!(item.kv_snapshot.len(), 2);
-    assert_eq!(item.kv_snapshot.get("x"), Some(&"10".to_string()));
-    assert_eq!(item.kv_snapshot.get("y"), Some(&"20".to_string()));
+    assert_eq!(item.kv_snapshot.get("x").map(|e| &*e.value), Some("10"));
+    assert_eq!(item.kv_snapshot.get("y").map(|e| &*e.value), Some("20"));
 
     // Clean up: ack without changes
     provider
@@ -370,6 +378,7 @@ pub async fn test_kv_snapshot_after_clear_single<F: ProviderFactory>(factory: &F
                 EventKind::KeyValueSet {
                     key: "keep".to_string(),
                     value: "yes".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
             Event::with_event_id(
@@ -380,6 +389,7 @@ pub async fn test_kv_snapshot_after_clear_single<F: ProviderFactory>(factory: &F
                 EventKind::KeyValueSet {
                     key: "remove".to_string(),
                     value: "bye".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
         ],
@@ -416,7 +426,7 @@ pub async fn test_kv_snapshot_after_clear_single<F: ProviderFactory>(factory: &F
         .expect("expected orchestration item");
 
     assert_eq!(item.kv_snapshot.len(), 1);
-    assert_eq!(item.kv_snapshot.get("keep"), Some(&"yes".to_string()));
+    assert_eq!(item.kv_snapshot.get("keep").map(|e| &*e.value), Some("yes"));
     assert_eq!(item.kv_snapshot.get("remove"), None);
 
     provider
@@ -457,6 +467,7 @@ pub async fn test_kv_snapshot_after_clear_all<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "a".to_string(),
                     value: "1".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
             Event::with_event_id(
@@ -467,6 +478,7 @@ pub async fn test_kv_snapshot_after_clear_all<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "b".to_string(),
                     value: "2".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
         ],
@@ -548,6 +560,7 @@ pub async fn test_kv_execution_id_tracking<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "shared".to_string(),
                 value: "from_exec_1".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -570,6 +583,7 @@ pub async fn test_kv_execution_id_tracking<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "shared".to_string(),
                 value: "from_exec_2".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -620,6 +634,7 @@ pub async fn test_kv_cross_execution_overwrite<F: ProviderFactory>(factory: &F) 
             EventKind::KeyValueSet {
                 key: "k".to_string(),
                 value: "v1".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -642,6 +657,7 @@ pub async fn test_kv_cross_execution_overwrite<F: ProviderFactory>(factory: &F) 
             EventKind::KeyValueSet {
                 key: "k".to_string(),
                 value: "v2".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -674,6 +690,7 @@ pub async fn test_kv_cross_execution_remove_readd<F: ProviderFactory>(factory: &
             EventKind::KeyValueSet {
                 key: "cycle".to_string(),
                 value: "exec1".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -720,6 +737,7 @@ pub async fn test_kv_cross_execution_remove_readd<F: ProviderFactory>(factory: &
             EventKind::KeyValueSet {
                 key: "cycle".to_string(),
                 value: "exec3".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -758,6 +776,7 @@ pub async fn test_kv_prune_preserves_overwritten<F: ProviderFactory>(factory: &F
             EventKind::KeyValueSet {
                 key: "survive".to_string(),
                 value: "v1".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -777,6 +796,7 @@ pub async fn test_kv_prune_preserves_overwritten<F: ProviderFactory>(factory: &F
             EventKind::KeyValueSet {
                 key: "survive".to_string(),
                 value: "v2".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -803,11 +823,12 @@ pub async fn test_kv_prune_preserves_overwritten<F: ProviderFactory>(factory: &F
 }
 
 // =============================================================================
-// Pruning: prune removes orphan keys owned only by the pruned execution
+// Pruning: KV entries survive execution pruning (instance-scoped lifetime)
 // =============================================================================
 
-/// Key set only in exec 1 (orphan). After pruning exec 1, the key should be gone.
-pub async fn test_kv_prune_removes_orphan_keys<F: ProviderFactory>(factory: &F) {
+/// Key set only in exec 1 (orphan). After pruning exec 1, the key should SURVIVE
+/// because KV lifetime is tied to the instance, not to individual executions.
+pub async fn test_kv_prune_preserves_all_keys<F: ProviderFactory>(factory: &F) {
     let provider = factory.create_provider().await;
     let mgmt = provider
         .as_management_capability()
@@ -815,7 +836,7 @@ pub async fn test_kv_prune_removes_orphan_keys<F: ProviderFactory>(factory: &F) 
 
     create_instance(&*provider, "kv-prn2").await.unwrap();
 
-    // Exec 1: set an orphan key
+    // Exec 1: set a key
     ack_with_delta(
         &*provider,
         "kv-prn2",
@@ -827,7 +848,8 @@ pub async fn test_kv_prune_removes_orphan_keys<F: ProviderFactory>(factory: &F) 
             None,
             EventKind::KeyValueSet {
                 key: "orphan".to_string(),
-                value: "will_die".to_string(),
+                value: "survives".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -847,6 +869,7 @@ pub async fn test_kv_prune_removes_orphan_keys<F: ProviderFactory>(factory: &F) 
             EventKind::KeyValueSet {
                 key: "keeper".to_string(),
                 value: "alive".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -855,7 +878,7 @@ pub async fn test_kv_prune_removes_orphan_keys<F: ProviderFactory>(factory: &F) 
     // Verify both exist before prune
     assert_eq!(
         provider.get_kv_value("kv-prn2", "orphan").await.unwrap(),
-        Some("will_die".to_string()),
+        Some("survives".to_string()),
     );
     assert_eq!(
         provider.get_kv_value("kv-prn2", "keeper").await.unwrap(),
@@ -873,11 +896,11 @@ pub async fn test_kv_prune_removes_orphan_keys<F: ProviderFactory>(factory: &F) 
     .await
     .unwrap();
 
-    // Orphan key from exec 1 should be gone, exec 2 key should remain
+    // Both keys survive — KV is instance-scoped, not execution-scoped
     assert_eq!(
         provider.get_kv_value("kv-prn2", "orphan").await.unwrap(),
-        None,
-        "orphan key should be deleted when its execution is pruned",
+        Some("survives".to_string()),
+        "KV entries must survive execution pruning (instance-scoped lifetime)",
     );
     assert_eq!(
         provider.get_kv_value("kv-prn2", "keeper").await.unwrap(),
@@ -909,6 +932,7 @@ pub async fn test_kv_instance_isolation<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "shared_name".to_string(),
                 value: "from_a".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -926,6 +950,7 @@ pub async fn test_kv_instance_isolation<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "shared_name".to_string(),
                 value: "from_b".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -966,6 +991,7 @@ pub async fn test_kv_delete_instance_cascades<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "doomed".to_string(),
                 value: "bye".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1056,6 +1082,7 @@ pub async fn test_kv_set_after_clear<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "old_a".to_string(),
                     value: "1".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
             Event::with_event_id(
@@ -1066,6 +1093,7 @@ pub async fn test_kv_set_after_clear<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "old_b".to_string(),
                     value: "2".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
         ],
@@ -1087,6 +1115,7 @@ pub async fn test_kv_set_after_clear<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: "new_x".to_string(),
                     value: "fresh".to_string(),
+                    last_updated_at_ms: 0,
                 },
             ),
         ],
@@ -1123,6 +1152,7 @@ pub async fn test_kv_empty_value<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "blank".to_string(),
                 value: "".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1155,6 +1185,7 @@ pub async fn test_kv_large_value<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "payload".to_string(),
                 value: big_val.clone(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1194,6 +1225,7 @@ pub async fn test_kv_special_chars_in_key<F: ProviderFactory>(factory: &F) {
                 EventKind::KeyValueSet {
                     key: k.to_string(),
                     value: v.to_string(),
+                    last_updated_at_ms: 0,
                 },
             )
         })
@@ -1271,6 +1303,7 @@ pub async fn test_kv_snapshot_cross_execution<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "A".to_string(),
                 value: "from_exec1".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1290,6 +1323,7 @@ pub async fn test_kv_snapshot_cross_execution<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "B".to_string(),
                 value: "from_exec2".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1308,8 +1342,8 @@ pub async fn test_kv_snapshot_cross_execution<F: ProviderFactory>(factory: &F) {
         .expect("expected orchestration item");
 
     assert_eq!(item.kv_snapshot.len(), 2);
-    assert_eq!(item.kv_snapshot.get("A"), Some(&"from_exec1".to_string()));
-    assert_eq!(item.kv_snapshot.get("B"), Some(&"from_exec2".to_string()));
+    assert_eq!(item.kv_snapshot.get("A").map(|e| &*e.value), Some("from_exec1"));
+    assert_eq!(item.kv_snapshot.get("B").map(|e| &*e.value), Some("from_exec2"));
 
     provider
         .ack_orchestration_item(
@@ -1350,6 +1384,7 @@ pub async fn test_kv_prune_current_execution_protected<F: ProviderFactory>(facto
             EventKind::KeyValueSet {
                 key: "alive".to_string(),
                 value: "yes".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1401,6 +1436,7 @@ pub async fn test_kv_delete_instance_with_children<F: ProviderFactory>(factory: 
             EventKind::KeyValueSet {
                 key: "parent_key".to_string(),
                 value: "parent_val".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1469,6 +1505,7 @@ pub async fn test_kv_delete_instance_with_children<F: ProviderFactory>(factory: 
             EventKind::KeyValueSet {
                 key: "child_key".to_string(),
                 value: "child_val".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1517,6 +1554,7 @@ pub async fn test_kv_clear_isolation<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "shared".to_string(),
                 value: "from_a".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )
@@ -1534,6 +1572,7 @@ pub async fn test_kv_clear_isolation<F: ProviderFactory>(factory: &F) {
             EventKind::KeyValueSet {
                 key: "shared".to_string(),
                 value: "from_b".to_string(),
+                last_updated_at_ms: 0,
             },
         )],
     )

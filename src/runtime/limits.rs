@@ -37,7 +37,7 @@ pub const MAX_TAG_NAME_BYTES: usize = 256;
 ///
 /// Enforced in `validate_limits()` after the orchestration turn completes.
 /// If exceeded, the orchestration is failed with a non-retryable application error.
-pub const MAX_KV_KEYS: usize = 10;
+pub const MAX_KV_KEYS: usize = 100;
 
 /// Maximum size of a single KV value in bytes (16 KiB).
 ///

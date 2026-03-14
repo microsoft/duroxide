@@ -8,6 +8,7 @@
 
 use super::helpers::*;
 use async_trait::async_trait;
+use duroxide::providers::KvEntry;
 use duroxide::{Event, EventKind, OrchestrationContext, OrchestrationHandler};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,7 +35,7 @@ impl SetKeyValueHandler {
 #[async_trait]
 impl OrchestrationHandler for SetKeyValueHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.set_value(&self.key, &self.value);
+        ctx.set_kv_value(&self.key, &self.value);
         Ok("done".to_string())
     }
 }
@@ -57,8 +58,8 @@ impl SetThenGetHandler {
 #[async_trait]
 impl OrchestrationHandler for SetThenGetHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.set_value(&self.key, &self.value);
-        let got = ctx.get_value(&self.key).unwrap_or_default();
+        ctx.set_kv_value(&self.key, &self.value);
+        let got = ctx.get_kv_value(&self.key).unwrap_or_default();
         Ok(got)
     }
 }
@@ -69,7 +70,7 @@ struct ClearAllValuesHandler;
 #[async_trait]
 impl OrchestrationHandler for ClearAllValuesHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.clear_all_values();
+        ctx.clear_all_kv_values();
         Ok("cleared".to_string())
     }
 }
@@ -88,7 +89,7 @@ impl ClearValueHandler {
 #[async_trait]
 impl OrchestrationHandler for ClearValueHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.clear_value(&self.key);
+        ctx.clear_kv_value(&self.key);
         Ok("cleared".to_string())
     }
 }
@@ -99,11 +100,11 @@ struct SetClearSetHandler;
 #[async_trait]
 impl OrchestrationHandler for SetClearSetHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.set_value("A", "1");
-        ctx.clear_all_values();
-        ctx.set_value("B", "2");
-        let a = ctx.get_value("A").unwrap_or("none".to_string());
-        let b = ctx.get_value("B").unwrap_or("none".to_string());
+        ctx.set_kv_value("A", "1");
+        ctx.clear_all_kv_values();
+        ctx.set_kv_value("B", "2");
+        let a = ctx.get_kv_value("A").unwrap_or("none".to_string());
+        let b = ctx.get_kv_value("B").unwrap_or("none".to_string());
         Ok(format!("A={a},B={b}"))
     }
 }
@@ -114,11 +115,11 @@ struct SetThenClearSingleHandler;
 #[async_trait]
 impl OrchestrationHandler for SetThenClearSingleHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.set_value("A", "1");
-        ctx.set_value("B", "2");
-        ctx.clear_value("A");
-        let a = ctx.get_value("A").unwrap_or("none".to_string());
-        let b = ctx.get_value("B").unwrap_or("none".to_string());
+        ctx.set_kv_value("A", "1");
+        ctx.set_kv_value("B", "2");
+        ctx.clear_kv_value("A");
+        let a = ctx.get_kv_value("A").unwrap_or("none".to_string());
+        let b = ctx.get_kv_value("B").unwrap_or("none".to_string());
         Ok(format!("A={a},B={b}"))
     }
 }
@@ -145,7 +146,7 @@ impl SetKvThenActivityHandler {
 #[async_trait]
 impl OrchestrationHandler for SetKvThenActivityHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.set_value(&self.key, &self.value);
+        ctx.set_kv_value(&self.key, &self.value);
         let result = ctx.schedule_activity(&self.activity_name, &self.activity_input).await?;
         Ok(result)
     }
@@ -157,11 +158,11 @@ struct AllKvOpsHandler;
 #[async_trait]
 impl OrchestrationHandler for AllKvOpsHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.set_value("X", "Y");
-        ctx.clear_value("Z");
-        ctx.clear_all_values();
-        ctx.set_value("A", "1");
-        let val = ctx.get_value("A").unwrap_or_default();
+        ctx.set_kv_value("X", "Y");
+        ctx.clear_kv_value("Z");
+        ctx.clear_all_kv_values();
+        ctx.set_kv_value("A", "1");
+        let val = ctx.get_kv_value("A").unwrap_or_default();
         Ok(val)
     }
 }
@@ -180,7 +181,7 @@ impl ReadSnapshotHandler {
 #[async_trait]
 impl OrchestrationHandler for ReadSnapshotHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        let val = ctx.get_value(&self.key).unwrap_or("missing".to_string());
+        let val = ctx.get_kv_value(&self.key).unwrap_or("missing".to_string());
         Ok(val)
     }
 }
@@ -203,8 +204,8 @@ impl ReadThenOverwriteSnapshotHandler {
 #[async_trait]
 impl OrchestrationHandler for ReadThenOverwriteSnapshotHandler {
     async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-        ctx.set_value(&self.key, &self.new_value);
-        let val = ctx.get_value(&self.key).unwrap_or("missing".to_string());
+        ctx.set_kv_value(&self.key, &self.new_value);
+        let val = ctx.get_kv_value(&self.key).unwrap_or("missing".to_string());
         Ok(val)
     }
 }
@@ -245,10 +246,10 @@ fn action_to_event_kv_variants() {
     }
 
     // Check specific types
-    assert!(matches!(&kv_events[0].kind, EventKind::KeyValueSet { key, value } if key == "X" && value == "Y"));
+    assert!(matches!(&kv_events[0].kind, EventKind::KeyValueSet { key, value, .. } if key == "X" && value == "Y"));
     assert!(matches!(&kv_events[1].kind, EventKind::KeyValueCleared { key } if key == "Z"));
     assert!(matches!(&kv_events[2].kind, EventKind::KeyValuesCleared));
-    assert!(matches!(&kv_events[3].kind, EventKind::KeyValueSet { key, value } if key == "A" && value == "1"));
+    assert!(matches!(&kv_events[3].kind, EventKind::KeyValueSet { key, value, .. } if key == "A" && value == "1"));
 }
 
 // ============================================================================
@@ -268,6 +269,7 @@ fn replay_set_value_reconstructs_state() {
             EventKind::KeyValueSet {
                 key: "A".to_string(),
                 value: "1".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
     ];
@@ -291,6 +293,7 @@ fn replay_multiple_sets_last_wins() {
             EventKind::KeyValueSet {
                 key: "A".to_string(),
                 value: "1".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
         Event::with_event_id(
@@ -301,6 +304,7 @@ fn replay_multiple_sets_last_wins() {
             EventKind::KeyValueSet {
                 key: "A".to_string(),
                 value: "2".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
     ];
@@ -311,9 +315,9 @@ fn replay_multiple_sets_last_wins() {
     #[async_trait]
     impl OrchestrationHandler for SetTwiceHandler {
         async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
-            ctx.set_value("A", "1");
-            ctx.set_value("A", "2");
-            Ok(ctx.get_value("A").unwrap_or_default())
+            ctx.set_kv_value("A", "1");
+            ctx.set_kv_value("A", "2");
+            Ok(ctx.get_kv_value("A").unwrap_or_default())
         }
     }
 
@@ -334,6 +338,7 @@ fn replay_clear_then_set() {
             EventKind::KeyValueSet {
                 key: "A".to_string(),
                 value: "1".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
         Event::with_event_id(3, TEST_INSTANCE, TEST_EXECUTION_ID, None, EventKind::KeyValuesCleared),
@@ -345,6 +350,7 @@ fn replay_clear_then_set() {
             EventKind::KeyValueSet {
                 key: "B".to_string(),
                 value: "2".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
     ];
@@ -367,6 +373,7 @@ fn replay_clear_single_key() {
             EventKind::KeyValueSet {
                 key: "A".to_string(),
                 value: "1".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
         Event::with_event_id(
@@ -377,6 +384,7 @@ fn replay_clear_single_key() {
             EventKind::KeyValueSet {
                 key: "B".to_string(),
                 value: "2".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
         Event::with_event_id(
@@ -406,6 +414,7 @@ fn replay_set_value_matches_action() {
             EventKind::KeyValueSet {
                 key: "A".to_string(),
                 value: "1".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
     ];
@@ -431,6 +440,7 @@ fn replay_set_value_mismatch_nondeterminism() {
             EventKind::KeyValueSet {
                 key: "A".to_string(),
                 value: "1".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
         activity_scheduled(3, "Task", "input"),
@@ -512,6 +522,7 @@ fn replay_kv_interleaved_with_activities() {
             EventKind::KeyValueSet {
                 key: "progress".to_string(),
                 value: "started".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
         activity_scheduled(3, "DoWork", "work-input"),
@@ -540,6 +551,7 @@ fn replay_kv_no_token_binding() {
             EventKind::KeyValueSet {
                 key: "k".to_string(),
                 value: "v".to_string(),
+                last_updated_at_ms: 0,
             },
         ),
     ];
@@ -589,7 +601,13 @@ fn new_kv_events_after_replay() {
 fn kv_state_seeded_from_snapshot() {
     let history = vec![started_event(1)];
     let mut snapshot = HashMap::new();
-    snapshot.insert("X".to_string(), "from_prev_exec".to_string());
+    snapshot.insert(
+        "X".to_string(),
+        KvEntry {
+            value: "from_prev_exec".to_string(),
+            last_updated_at_ms: 100,
+        },
+    );
 
     let mut engine = create_engine(history).with_kv_snapshot(snapshot);
 
@@ -602,10 +620,227 @@ fn kv_state_seeded_from_snapshot() {
 fn kv_state_snapshot_overridden_by_code() {
     let history = vec![started_event(1)];
     let mut snapshot = HashMap::new();
-    snapshot.insert("X".to_string(), "old".to_string());
+    snapshot.insert(
+        "X".to_string(),
+        KvEntry {
+            value: "old".to_string(),
+            last_updated_at_ms: 100,
+        },
+    );
 
     let mut engine = create_engine(history).with_kv_snapshot(snapshot);
 
     let result = execute(&mut engine, ReadThenOverwriteSnapshotHandler::new("X", "new"));
     assert_completed(&result, "new");
+}
+
+// ============================================================================
+// Section 2.4: In-turn, cross-turn, cross-execution get_kv_value
+// ============================================================================
+
+/// RE-KV-13: get_kv_value returns a value set earlier in the same turn.
+#[test]
+fn kv_get_value_same_turn() {
+    let history = vec![started_event(1)];
+    let mut engine = create_engine(history);
+
+    let result = execute(&mut engine, SetThenGetHandler::new("mykey", "myval"));
+    assert_completed(&result, "myval");
+}
+
+/// RE-KV-14: get_kv_value returns a value set in a previous turn (via replay).
+///
+/// History contains KeyValueSet from a prior turn. In this turn, the handler
+/// re-emits the same set (replayed) and then reads it back.
+#[test]
+fn kv_get_value_previous_turn() {
+    let history = vec![
+        started_event(1),
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "progress".to_string(),
+                value: "step_1".to_string(),
+                last_updated_at_ms: 100,
+            },
+        ),
+        activity_scheduled(3, "Work", "input"),
+        activity_completed(4, 3, "result"),
+    ];
+    let mut engine = create_engine(history);
+
+    struct PreviousTurnReadHandler;
+    #[async_trait]
+    impl OrchestrationHandler for PreviousTurnReadHandler {
+        async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+            // Re-emit the same set from the previous turn (replayed)
+            ctx.set_kv_value("progress", "step_1");
+            // This activity was completed in history — replayed
+            let _ = ctx.schedule_activity("Work", "input").await?;
+            // Now read the value — should still be "step_1"
+            let val = ctx.get_kv_value("progress").unwrap_or("missing".to_string());
+            Ok(val)
+        }
+    }
+
+    let result = execute(&mut engine, Arc::new(PreviousTurnReadHandler));
+    assert_completed(&result, "step_1");
+}
+
+/// RE-KV-15: get_kv_value returns a value set in a previous execution (via snapshot).
+#[test]
+fn kv_get_value_previous_execution() {
+    let history = vec![started_event(1)];
+    let mut snapshot = HashMap::new();
+    snapshot.insert(
+        "status".to_string(),
+        KvEntry {
+            value: "from_exec_1".to_string(),
+            last_updated_at_ms: 500,
+        },
+    );
+    snapshot.insert(
+        "config".to_string(),
+        KvEntry {
+            value: "old_config".to_string(),
+            last_updated_at_ms: 400,
+        },
+    );
+
+    let mut engine = create_engine(history).with_kv_snapshot(snapshot);
+
+    struct ReadMultipleSnapshotHandler;
+    #[async_trait]
+    impl OrchestrationHandler for ReadMultipleSnapshotHandler {
+        async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+            let status = ctx.get_kv_value("status").unwrap_or("missing".to_string());
+            let config = ctx.get_kv_value("config").unwrap_or("missing".to_string());
+            let absent = ctx.get_kv_value("nonexistent").unwrap_or("missing".to_string());
+            Ok(format!("status={status},config={config},absent={absent}"))
+        }
+    }
+
+    let result = execute(&mut engine, Arc::new(ReadMultipleSnapshotHandler));
+    assert_completed(&result, "status=from_exec_1,config=old_config,absent=missing");
+}
+
+// ============================================================================
+// Section 2.5: Nondeterminism — key/value mismatch
+// ============================================================================
+
+/// RE-KV-16: Nondeterminism when handler sets key "A" but history has key "B".
+///
+/// The handler must suspend (via an activity) so the replay loop processes
+/// the KV history event and validates it against the emitted action.
+#[test]
+fn kv_set_key_mismatch_nondeterminism() {
+    let history = vec![
+        started_event(1),
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "B".to_string(),
+                value: "1".to_string(),
+                last_updated_at_ms: 0,
+            },
+        ),
+        activity_scheduled(3, "Task", "input"),
+        activity_completed(4, 3, "result"),
+    ];
+    let mut engine = create_engine(history);
+
+    // Handler sets "A" but history expects "B" → nondeterminism
+    let result = execute(&mut engine, SetKvThenActivityHandler::new("A", "1", "Task", "input"));
+    assert_nondeterminism(&result);
+}
+
+/// RE-KV-17: Nondeterminism when handler sets value "new" but history has value "old".
+#[test]
+fn kv_set_value_mismatch_nondeterminism() {
+    let history = vec![
+        started_event(1),
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "A".to_string(),
+                value: "old".to_string(),
+                last_updated_at_ms: 0,
+            },
+        ),
+        activity_scheduled(3, "Task", "input"),
+        activity_completed(4, 3, "result"),
+    ];
+    let mut engine = create_engine(history);
+
+    // Handler sets value "new" but history has "old" → nondeterminism
+    let result = execute(&mut engine, SetKvThenActivityHandler::new("A", "new", "Task", "input"));
+    assert_nondeterminism(&result);
+}
+
+/// RE-KV-18: Nondeterminism when handler clears key "A" but history has key "B".
+#[test]
+fn kv_clear_key_mismatch_nondeterminism() {
+    let history = vec![
+        started_event(1),
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueCleared { key: "B".to_string() },
+        ),
+        activity_scheduled(3, "Task", "input"),
+        activity_completed(4, 3, "result"),
+    ];
+    let mut engine = create_engine(history);
+
+    // Handler clears "A" then schedules activity, but history expects clear "B"
+    struct ClearThenActivityHandler;
+    #[async_trait]
+    impl OrchestrationHandler for ClearThenActivityHandler {
+        async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+            ctx.clear_kv_value("A");
+            let result = ctx.schedule_activity("Task", "input").await?;
+            Ok(result)
+        }
+    }
+
+    let result = execute(&mut engine, Arc::new(ClearThenActivityHandler));
+    assert_nondeterminism(&result);
+}
+
+/// RE-KV-19: Timestamp mismatch does NOT cause nondeterminism.
+/// History has timestamp 999 but handler will produce a different timestamp —
+/// should still match since we skip timestamp comparison.
+#[test]
+fn kv_set_timestamp_mismatch_ok() {
+    let history = vec![
+        started_event(1),
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "A".to_string(),
+                value: "1".to_string(),
+                last_updated_at_ms: 999, // different from what handler will produce
+            },
+        ),
+    ];
+    let mut engine = create_engine(history);
+
+    // Handler sets same key/value — timestamp will be different (now_ms())
+    // but should still pass determinism check
+    let result = execute(&mut engine, SetKeyValueHandler::new("A", "1"));
+    assert_completed(&result, "done");
 }

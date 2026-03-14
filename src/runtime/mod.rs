@@ -52,7 +52,7 @@ fn inject_builtin_activities(user_registry: registry::ActivityRegistry) -> regis
                     .ok_or_else(|| "get_kv_value: missing key".to_string())?;
                 let client = ctx.get_client();
                 let value = client
-                    .get_value(instance_id, key)
+                    .get_kv_value(instance_id, key)
                     .await
                     .map_err(|e| format!("get_kv_value client error: {e}"))?;
                 serde_json::to_string(&value).map_err(|e| format!("get_kv_value serialization error: {e}"))

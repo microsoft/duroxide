@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.25] - 2026-03-14
+
+**Release:** <https://crates.io/crates/duroxide/0.1.25>
+
+### Breaking Changes
+
+- **KV API renamed** — All KV methods now use `kv_` prefix for namespace clarity:
+  - `ctx.set_value()` → `ctx.set_kv_value()`, `ctx.get_value()` → `ctx.get_kv_value()`,
+    `ctx.clear_value()` → `ctx.clear_kv_value()`, `ctx.clear_all_values()` → `ctx.clear_all_kv_values()`
+  - `client.get_value()` → `client.get_kv_value()`, `client.wait_for_value()` → `client.wait_for_kv_value()`
+  - All typed variants similarly renamed
+- **`KeyValueSet` event** now carries `last_updated_at_ms: u64` (defaults to 0 via `#[serde(default)]`)
+- **`OrchestrationItem.kv_snapshot`** type changed from `HashMap<String, String>` to
+  `HashMap<String, KvEntry>` where `KvEntry { value: String, last_updated_at_ms: u64 }`
+- **Provider trait**: new required method `get_kv_all_values(instance)` for bulk KV reads
+- **KV pruning semantics**: KV entries are now instance-scoped — execution pruning no longer
+  deletes KV entries (previously, orphan keys were deleted when their execution was pruned)
+- **`MAX_KV_KEYS`** raised from 10 → 100
+
+### Added
+
+- **KV timestamps** — Every `set_kv_value()` call stamps `last_updated_at_ms` from the runtime
+  wall clock. Persisted in the `kv_store` table and carried in `KeyValueSet` events.
+  - New migration: `20240111000000_add_kv_last_updated.sql`
+  - New struct: `KvEntry { value, last_updated_at_ms }` in `providers` module
+- **Bulk KV reads** — `ctx.get_kv_all_values()`, `ctx.get_kv_all_keys()`, `ctx.get_kv_length()`
+  for reading all KV state from within an orchestration
+- **KV pruning by age** — `ctx.prune_kv_values_updated_before(cutoff_ms)` removes keys whose
+  `last_updated_at_ms` is older than the cutoff. Keys written in the current turn are protected.
+- **Client bulk read** — `client.get_kv_all_values(instance)` returns all KV pairs for an instance
+- **Provider validation test** renamed: `test_kv_prune_removes_orphan_keys` →
+  `test_kv_prune_preserves_all_keys` to reflect new instance-scoped KV lifetime
+
 ## [0.1.24] - 2026-03-12
 
 **Release:** <https://crates.io/crates/duroxide/0.1.24>
