@@ -27,4 +27,8 @@ uuid = { version = "1", features = ["v4"] }
 name = "perf-test"
 path = "src/bin/perf_test.rs"
 
+[[bin]]
+name = "azure_vfs_repro"
+path = "repro/azure_vfs_repro.rs"
+
 [workspace]  # Standalone workspace — excluded from parent due to libsqlite3-sys links conflict
