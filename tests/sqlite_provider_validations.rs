@@ -175,6 +175,28 @@ mod tests {
 
     const TEST_LOCK_TIMEOUT: Duration = Duration::from_millis(1000);
 
+    async fn create_sqlite_provider_from_env() -> SqliteProvider {
+        let mode = std::env::var("SQLITE_PROVIDER_MODE").unwrap_or_else(|_| "INMEM".to_string());
+        match mode.as_str() {
+            "INMEM" => SqliteProvider::new_in_memory().await.unwrap(),
+            "FILE" => {
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock before epoch")
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!(
+                    "sqlite-provider-test-{}-{}.db",
+                    std::process::id(),
+                    unique
+                ));
+                std::fs::File::create(&path).expect("failed to create sqlite temp file");
+                let url = format!("sqlite://{}?mode=rwc", path.to_str().unwrap());
+                SqliteProvider::new(&url, None).await.unwrap()
+            }
+            other => panic!("Unknown SQLITE_PROVIDER_MODE={other}. Valid: INMEM, FILE"),
+        }
+    }
+
     /// Standard test factory — each `create_provider()` call gets a fresh in-memory DB.
     /// Used by the vast majority of tests that don't need direct DB manipulation.
     struct SqliteTestFactory;
@@ -182,7 +204,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ProviderFactory for SqliteTestFactory {
         async fn create_provider(&self) -> Arc<dyn Provider> {
-            Arc::new(SqliteProvider::new_in_memory().await.unwrap())
+            Arc::new(create_sqlite_provider_from_env().await)
         }
 
         fn lock_timeout(&self) -> Duration {
@@ -200,7 +222,7 @@ mod tests {
     impl SharedSqliteTestFactory {
         async fn new() -> Self {
             Self {
-                provider: Arc::new(SqliteProvider::new_in_memory().await.unwrap()),
+                provider: Arc::new(create_sqlite_provider_from_env().await),
             }
         }
     }
