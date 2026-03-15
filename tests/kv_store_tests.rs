@@ -2874,7 +2874,10 @@ async fn kv_read_modify_write_across_turns() {
             assert_eq!(output, "2", "Should have incremented counter from 1 to 2");
         }
         OrchestrationStatus::Failed { details, .. } => {
-            panic!("Orchestration failed (possible nondeterminism): {}", details.display_message());
+            panic!(
+                "Orchestration failed (possible nondeterminism): {}",
+                details.display_message()
+            );
         }
         other => panic!("Expected Completed, got: {other:?}"),
     }
@@ -2910,19 +2913,16 @@ async fn kv_read_modify_write_every_turn() {
         })
         .build();
     let orchestrations = OrchestrationRegistry::builder()
-        .register(
-            "RMWEveryTurn",
-            |ctx: OrchestrationContext, _input: String| async move {
-                // 5 iterations: counter goes 0→1→2→3→4→5
-                for _ in 0..5 {
-                    let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
-                    let n: u32 = val.parse().expect("counter should be a valid u32");
-                    ctx.set_kv_value("counter", (n + 1).to_string());
-                    ctx.schedule_activity("Noop", "").await?;
-                }
-                Ok(ctx.get_kv_value("counter").unwrap_or("0".to_string()))
-            },
-        )
+        .register("RMWEveryTurn", |ctx: OrchestrationContext, _input: String| async move {
+            // 5 iterations: counter goes 0→1→2→3→4→5
+            for _ in 0..5 {
+                let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
+                let n: u32 = val.parse().expect("counter should be a valid u32");
+                ctx.set_kv_value("counter", (n + 1).to_string());
+                ctx.schedule_activity("Noop", "").await?;
+            }
+            Ok(ctx.get_kv_value("counter").unwrap_or("0".to_string()))
+        })
         .build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
@@ -2981,43 +2981,40 @@ async fn kv_clear_all_then_set_across_turns() {
         .build();
     let iter_clone = iteration.clone();
     let orchestrations = OrchestrationRegistry::builder()
-        .register(
-            "ClearAllRMW",
-            move |ctx: OrchestrationContext, _input: String| {
-                let iter = iter_clone.clone();
-                async move {
-                    let i = iter.fetch_add(1, Ordering::SeqCst);
-                    if i == 0 {
-                        // Execution 1: set some keys, then CAN
-                        ctx.set_kv_value("old_key", "old_val");
-                        ctx.set_kv_value("shared", "from_exec_1");
-                        let _ = ctx.continue_as_new("next").await;
-                        Ok("continued".to_string())
-                    } else {
-                        // Execution 2: clear all, set new values across turns
-                        ctx.clear_all_kv_values();
-                        ctx.set_kv_value("new_key", "new_val");
-                        ctx.schedule_activity("Noop", "").await?;
+        .register("ClearAllRMW", move |ctx: OrchestrationContext, _input: String| {
+            let iter = iter_clone.clone();
+            async move {
+                let i = iter.fetch_add(1, Ordering::SeqCst);
+                if i == 0 {
+                    // Execution 1: set some keys, then CAN
+                    ctx.set_kv_value("old_key", "old_val");
+                    ctx.set_kv_value("shared", "from_exec_1");
+                    let _ = ctx.continue_as_new("next").await;
+                    Ok("continued".to_string())
+                } else {
+                    // Execution 2: clear all, set new values across turns
+                    ctx.clear_all_kv_values();
+                    ctx.set_kv_value("new_key", "new_val");
+                    ctx.schedule_activity("Noop", "").await?;
 
-                        // After turn boundary: old keys should be gone, new key visible
-                        let old = ctx.get_kv_value("old_key");
-                        let shared = ctx.get_kv_value("shared");
-                        let new = ctx.get_kv_value("new_key");
-                        assert_eq!(old, None, "old_key should be cleared");
-                        assert_eq!(shared, None, "shared should be cleared");
-                        assert_eq!(new, Some("new_val".to_string()));
+                    // After turn boundary: old keys should be gone, new key visible
+                    let old = ctx.get_kv_value("old_key");
+                    let shared = ctx.get_kv_value("shared");
+                    let new = ctx.get_kv_value("new_key");
+                    assert_eq!(old, None, "old_key should be cleared");
+                    assert_eq!(shared, None, "shared should be cleared");
+                    assert_eq!(new, Some("new_val".to_string()));
 
-                        ctx.set_kv_value("final", "done");
-                        Ok(format!(
-                            "old={},shared={},new={}",
-                            old.unwrap_or("none".to_string()),
-                            shared.unwrap_or("none".to_string()),
-                            new.unwrap_or("none".to_string()),
-                        ))
-                    }
+                    ctx.set_kv_value("final", "done");
+                    Ok(format!(
+                        "old={},shared={},new={}",
+                        old.unwrap_or("none".to_string()),
+                        shared.unwrap_or("none".to_string()),
+                        new.unwrap_or("none".to_string()),
+                    ))
                 }
-            },
-        )
+            }
+        })
         .build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
@@ -3041,10 +3038,7 @@ async fn kv_clear_all_then_set_across_turns() {
     }
 
     // Client reads should reflect final state
-    assert_eq!(
-        client.get_kv_value("kv-ca-rmw", "old_key").await.unwrap(),
-        None
-    );
+    assert_eq!(client.get_kv_value("kv-ca-rmw", "old_key").await.unwrap(), None);
     assert_eq!(
         client.get_kv_value("kv-ca-rmw", "final").await.unwrap(),
         Some("done".to_string())
@@ -3081,33 +3075,30 @@ async fn kv_clear_single_with_prior_execution_value() {
         .build();
     let iter_clone = iteration.clone();
     let orchestrations = OrchestrationRegistry::builder()
-        .register(
-            "ClearSinglePrior",
-            move |ctx: OrchestrationContext, _input: String| {
-                let iter = iter_clone.clone();
-                async move {
-                    let i = iter.fetch_add(1, Ordering::SeqCst);
-                    if i == 0 {
-                        ctx.set_kv_value("session_token", "abc123");
-                        ctx.set_kv_value("keep_me", "alive");
-                        let _ = ctx.continue_as_new("next").await;
-                        Ok("continued".to_string())
-                    } else {
-                        // Clear only the session token, keep the other
-                        ctx.clear_kv_value("session_token");
-                        ctx.schedule_activity("Noop", "").await?;
+        .register("ClearSinglePrior", move |ctx: OrchestrationContext, _input: String| {
+            let iter = iter_clone.clone();
+            async move {
+                let i = iter.fetch_add(1, Ordering::SeqCst);
+                if i == 0 {
+                    ctx.set_kv_value("session_token", "abc123");
+                    ctx.set_kv_value("keep_me", "alive");
+                    let _ = ctx.continue_as_new("next").await;
+                    Ok("continued".to_string())
+                } else {
+                    // Clear only the session token, keep the other
+                    ctx.clear_kv_value("session_token");
+                    ctx.schedule_activity("Noop", "").await?;
 
-                        let token = ctx.get_kv_value("session_token");
-                        let kept = ctx.get_kv_value("keep_me");
-                        Ok(format!(
-                            "token={},kept={}",
-                            token.unwrap_or("none".to_string()),
-                            kept.unwrap_or("none".to_string()),
-                        ))
-                    }
+                    let token = ctx.get_kv_value("session_token");
+                    let kept = ctx.get_kv_value("keep_me");
+                    Ok(format!(
+                        "token={},kept={}",
+                        token.unwrap_or("none".to_string()),
+                        kept.unwrap_or("none".to_string()),
+                    ))
                 }
-            },
-        )
+            }
+        })
         .build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
@@ -3157,38 +3148,32 @@ async fn kv_rmw_across_can_boundary() {
         .build();
     let iter_clone = iteration.clone();
     let orchestrations = OrchestrationRegistry::builder()
-        .register(
-            "RmwCan",
-            move |ctx: OrchestrationContext, _input: String| {
-                let iter = iter_clone.clone();
-                async move {
-                    let i = iter.fetch_add(1, Ordering::SeqCst);
-                    if i == 0 {
-                        // Execution 1: initial set
-                        ctx.set_kv_value("counter", "5");
-                        let _ = ctx.continue_as_new("next").await;
-                        Ok("continued".to_string())
-                    } else {
-                        // Execution 2: RMW across 3 turns
-                        for _ in 0..3 {
-                            let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
-                            let n: u32 = val.parse().unwrap();
-                            ctx.set_kv_value("counter", (n + 1).to_string());
-                            ctx.schedule_activity("Noop", "").await?;
-                        }
-                        Ok(ctx.get_kv_value("counter").unwrap_or("0".to_string()))
+        .register("RmwCan", move |ctx: OrchestrationContext, _input: String| {
+            let iter = iter_clone.clone();
+            async move {
+                let i = iter.fetch_add(1, Ordering::SeqCst);
+                if i == 0 {
+                    // Execution 1: initial set
+                    ctx.set_kv_value("counter", "5");
+                    let _ = ctx.continue_as_new("next").await;
+                    Ok("continued".to_string())
+                } else {
+                    // Execution 2: RMW across 3 turns
+                    for _ in 0..3 {
+                        let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
+                        let n: u32 = val.parse().unwrap();
+                        ctx.set_kv_value("counter", (n + 1).to_string());
+                        ctx.schedule_activity("Noop", "").await?;
                     }
+                    Ok(ctx.get_kv_value("counter").unwrap_or("0".to_string()))
                 }
-            },
-        )
+            }
+        })
         .build();
 
     let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
     let client = duroxide::Client::new(store.clone());
-    client
-        .start_orchestration("kv-rmw-can", "RmwCan", "")
-        .await
-        .unwrap();
+    client.start_orchestration("kv-rmw-can", "RmwCan", "").await.unwrap();
     let status = client
         .wait_for_orchestration("kv-rmw-can", Duration::from_secs(10))
         .await

@@ -1410,14 +1410,12 @@ impl Provider for SqliteProvider {
                 EventKind::KeyValuesCleared => {
                     let clear_ts = Self::now_millis();
                     // Tombstone all existing delta rows
-                    sqlx::query(
-                        "UPDATE kv_delta SET value = NULL, last_updated_at_ms = ? WHERE instance_id = ?",
-                    )
-                    .bind(clear_ts)
-                    .bind(&instance_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+                    sqlx::query("UPDATE kv_delta SET value = NULL, last_updated_at_ms = ? WHERE instance_id = ?")
+                        .bind(clear_ts)
+                        .bind(&instance_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
                     // Tombstone kv_store keys not already represented in delta
                     sqlx::query(
                         r#"
@@ -2447,8 +2445,12 @@ impl Provider for SqliteProvider {
                 .try_get("value")
                 .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
             match v {
-                Some(value) => { map.insert(k, value); }
-                None => { map.remove(&k); } // tombstone
+                Some(value) => {
+                    map.insert(k, value);
+                }
+                None => {
+                    map.remove(&k);
+                } // tombstone
             }
         }
         Ok(map)

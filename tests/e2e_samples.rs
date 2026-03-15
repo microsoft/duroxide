@@ -2545,12 +2545,9 @@ async fn sample_kv_read_modify_write_counter() {
             .unwrap(),
     );
     let activities = ActivityRegistry::builder()
-        .register(
-            "ProcessBatch",
-            |_ctx: ActivityContext, batch: String| async move {
-                Ok(format!("processed:{batch}"))
-            },
-        )
+        .register("ProcessBatch", |_ctx: ActivityContext, batch: String| async move {
+            Ok(format!("processed:{batch}"))
+        })
         .build();
     let orchestrations = OrchestrationRegistry::builder()
         .register(
@@ -2560,24 +2557,18 @@ async fn sample_kv_read_modify_write_counter() {
 
                 for batch_name in &batches {
                     // Read current progress
-                    let processed = ctx
-                        .get_kv_value("batches_processed")
-                        .unwrap_or("0".to_string());
+                    let processed = ctx.get_kv_value("batches_processed").unwrap_or("0".to_string());
                     let count: u32 = processed.parse().unwrap();
 
                     // Process the batch (activity = turn boundary)
-                    let result = ctx
-                        .schedule_activity("ProcessBatch", batch_name.to_string())
-                        .await?;
+                    let result = ctx.schedule_activity("ProcessBatch", batch_name.to_string()).await?;
 
                     // Update progress counter
                     ctx.set_kv_value("batches_processed", (count + 1).to_string());
                     ctx.set_kv_value("last_result", &result);
                 }
 
-                Ok(ctx
-                    .get_kv_value("batches_processed")
-                    .unwrap_or("0".to_string()))
+                Ok(ctx.get_kv_value("batches_processed").unwrap_or("0".to_string()))
             },
         )
         .build();
@@ -2607,17 +2598,11 @@ async fn sample_kv_read_modify_write_counter() {
     }
 
     assert_eq!(
-        client
-            .get_kv_value("batch-proc", "batches_processed")
-            .await
-            .unwrap(),
+        client.get_kv_value("batch-proc", "batches_processed").await.unwrap(),
         Some("3".to_string()),
     );
     assert_eq!(
-        client
-            .get_kv_value("batch-proc", "last_result")
-            .await
-            .unwrap(),
+        client.get_kv_value("batch-proc", "last_result").await.unwrap(),
         Some("processed:gamma".to_string()),
     );
 

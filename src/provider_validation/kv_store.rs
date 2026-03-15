@@ -1350,10 +1350,18 @@ pub async fn test_kv_snapshot_cross_execution<F: ProviderFactory>(factory: &F) {
         .unwrap()
         .expect("expected orchestration item");
 
-    assert_eq!(item.kv_snapshot.len(), 1, "snapshot should only contain prior-execution state");
+    assert_eq!(
+        item.kv_snapshot.len(),
+        1,
+        "snapshot should only contain prior-execution state"
+    );
     assert_eq!(item.kv_snapshot.get("A").map(|e| &*e.value), Some("from_exec1"));
     // B is in kv_delta, not in snapshot — it will be rebuilt during replay
-    assert_eq!(item.kv_snapshot.get("B"), None, "current-execution key should not be in snapshot");
+    assert_eq!(
+        item.kv_snapshot.get("B"),
+        None,
+        "current-execution key should not be in snapshot"
+    );
 
     provider
         .ack_orchestration_item(
