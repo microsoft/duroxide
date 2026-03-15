@@ -8,7 +8,7 @@
 
 A lightweight and embeddable durable execution runtime for Rust. Inspired by the [Durable Task Framework](https://github.com/Azure/durabletask) and [Temporal](https://temporal.io/).
 
-> **[Latest Release: v0.1.25](https://crates.io/crates/duroxide/0.1.25)** — KV store timestamps, API rename, bulk-read and pruning.
+> **[Latest Release: v0.1.26](https://crates.io/crates/duroxide/0.1.26)** — KV delta table fix for read-modify-write replay poisoning.
 > See [CHANGELOG.md](CHANGELOG.md#0125---2026-03-14) for release notes.
 
 ### What you can build with this

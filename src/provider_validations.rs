@@ -312,5 +312,11 @@ pub mod kv_store {
         test_kv_prune_preserves_overwritten, test_kv_set_after_clear, test_kv_set_and_get,
         test_kv_snapshot_after_clear_all, test_kv_snapshot_after_clear_single, test_kv_snapshot_cross_execution,
         test_kv_snapshot_empty, test_kv_snapshot_in_fetch, test_kv_special_chars_in_key,
+        // KV delta tests (spec for kv_delta change)
+        test_kv_delta_clear_all_tombstones_store, test_kv_delta_client_reads_merged,
+        test_kv_delta_delete_instance_cascades, test_kv_delta_merged_on_can,
+        test_kv_delta_merged_on_completion, test_kv_delta_prune_untouched_key_survives,
+        test_kv_delta_snapshot_excludes_current_execution,
+        test_kv_delta_snapshot_includes_completed_execution, test_kv_delta_tombstone_overrides_store,
     };
 }

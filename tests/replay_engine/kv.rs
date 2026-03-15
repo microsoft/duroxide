@@ -844,3 +844,334 @@ fn kv_set_timestamp_mismatch_ok() {
     let result = execute(&mut engine, SetKeyValueHandler::new("A", "1"));
     assert_completed(&result, "done");
 }
+
+/// RE-KV-20: Read-modify-write across turns. Simulates turn 3 of:
+///   Turn 1: set("counter", "1") → activity
+///   Turn 2: get("counter") → activity
+///   Turn 3: get("counter") → parse → set("counter", gotten+1)
+///
+/// History includes the KV set and both activity round-trips from prior turns.
+/// The handler re-executes from the start: replays the set, replays activity 1,
+/// reads the value (pure), replays activity 2, then does set(parsed+1) as new.
+/// This must NOT produce a nondeterminism error.
+#[test]
+fn kv_read_modify_write_across_turns_replay() {
+    let history = vec![
+        started_event(1),
+        // Turn 1: set counter to "1", then schedule activity
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "counter".to_string(),
+                value: "1".to_string(),
+                last_updated_at_ms: 100,
+            },
+        ),
+        activity_scheduled(3, "Noop", ""),
+        // Turn 2: activity completed, get (no event), schedule second activity
+        activity_completed(4, 3, "ok"),
+        activity_scheduled(5, "Noop", ""),
+        // Turn 3: second activity completed — handler now runs new code
+        activity_completed(6, 5, "ok"),
+    ];
+    // Provider snapshot: counter was "1" at end of last persisted turn
+    let mut snapshot = HashMap::new();
+    snapshot.insert(
+        "counter".to_string(),
+        KvEntry {
+            value: "1".to_string(),
+            last_updated_at_ms: 100,
+        },
+    );
+    let mut engine = create_engine(history).with_kv_snapshot(snapshot);
+
+    struct ReadModifyWriteHandler;
+    #[async_trait]
+    impl OrchestrationHandler for ReadModifyWriteHandler {
+        async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+            // Turn 1 (replayed): set initial value
+            ctx.set_kv_value("counter", "1");
+            ctx.schedule_activity("Noop", "").await?;
+
+            // Turn 2 (replayed): pure read, no event
+            let val = ctx.get_kv_value("counter").unwrap_or("missing".to_string());
+            assert_eq!(val, "1");
+            ctx.schedule_activity("Noop", "").await?;
+
+            // Turn 3 (new): read → parse → increment → write
+            let val = ctx.get_kv_value("counter").unwrap_or("missing".to_string());
+            let n: u32 = val.parse().unwrap();
+            ctx.set_kv_value("counter", (n + 1).to_string());
+
+            Ok(format!("{}", n + 1))
+        }
+    }
+
+    let result = execute(&mut engine, Arc::new(ReadModifyWriteHandler));
+    assert_completed(&result, "2");
+}
+
+/// RE-KV-21: Read-modify-write on EVERY turn — with correct (empty) snapshot.
+///
+/// Pattern: every turn does `get → parse → increment → set → activity`.
+/// History has 3 completed RMW turns (counter went 0→1→2→3).
+///
+/// With the kv_delta fix, the provider snapshot is empty (current-execution
+/// mutations are in kv_delta, not kv_store). The replay engine must rebuild
+/// kv_state from the KeyValueSet events in history during replay.
+#[test]
+fn kv_read_modify_write_every_turn_snapshot_poisons_replay() {
+    let history = vec![
+        started_event(1),
+        // Turn 1: read None→"0", set counter="1"
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "counter".to_string(),
+                value: "1".to_string(),
+                last_updated_at_ms: 100,
+            },
+        ),
+        activity_scheduled(3, "Noop", ""),
+        activity_completed(4, 3, "ok"),
+        // Turn 2: read "1", set counter="2"
+        Event::with_event_id(
+            5,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "counter".to_string(),
+                value: "2".to_string(),
+                last_updated_at_ms: 200,
+            },
+        ),
+        activity_scheduled(6, "Noop", ""),
+        activity_completed(7, 6, "ok"),
+        // Turn 3: read "2", set counter="3"
+        Event::with_event_id(
+            8,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "counter".to_string(),
+                value: "3".to_string(),
+                last_updated_at_ms: 300,
+            },
+        ),
+        activity_scheduled(9, "Noop", ""),
+        activity_completed(10, 9, "ok"),
+        // Turn 4 is new code
+    ];
+    // Snapshot is EMPTY — current-execution values are in kv_delta (not kv_store).
+    // The replay engine rebuilds kv_state from KeyValueSet events during replay.
+    let mut engine = create_engine(history);
+
+    struct RMWEveryTurnHandler;
+    #[async_trait]
+    impl OrchestrationHandler for RMWEveryTurnHandler {
+        async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+            // Same code runs every turn: read → increment → write → activity
+            for _ in 0..4 {
+                let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
+                let n: u32 = val.parse().unwrap();
+                ctx.set_kv_value("counter", (n + 1).to_string());
+                ctx.schedule_activity("Noop", "").await?;
+            }
+            Ok(ctx.get_kv_value("counter").unwrap_or("0".to_string()))
+        }
+    }
+
+    let result = execute(&mut engine, Arc::new(RMWEveryTurnHandler));
+    // With empty snapshot, replay correctly starts from scratch: 0→1→2→3
+    // Turn 4 is new and schedules an activity that hasn't completed → Continue
+    assert_continue(&result);
+}
+
+/// RE-KV-22: RMW with CAN carry-over snapshot.
+///
+/// Snapshot has counter="5" (from a prior execution via CAN). Current execution
+/// history has one RMW turn (read 5, set 6) + activity. Turn 2 is new: reads 6,
+/// sets 7. The snapshot value "5" must seed kv_state at the start since it's
+/// from a PRIOR execution (no KeyValueSet event for it in current history).
+#[test]
+fn kv_read_modify_write_with_can_snapshot() {
+    let history = vec![
+        started_event(1),
+        // Turn 1: read snapshot "5", set counter="6"
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "counter".to_string(),
+                value: "6".to_string(),
+                last_updated_at_ms: 100,
+            },
+        ),
+        activity_scheduled(3, "Noop", ""),
+        activity_completed(4, 3, "ok"),
+        // Turn 2 is new code
+    ];
+    // Snapshot from prior execution (via CAN) — must be seeded
+    let mut snapshot = HashMap::new();
+    snapshot.insert(
+        "counter".to_string(),
+        KvEntry {
+            value: "5".to_string(),
+            last_updated_at_ms: 50,
+        },
+    );
+    let mut engine = create_engine(history).with_kv_snapshot(snapshot);
+
+    struct RmwCanHandler;
+    #[async_trait]
+    impl OrchestrationHandler for RmwCanHandler {
+        async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+            // Turn 1 (replay): read 5 (from snapshot), write 6
+            let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
+            let n: u32 = val.parse().unwrap();
+            ctx.set_kv_value("counter", (n + 1).to_string());
+            ctx.schedule_activity("Noop", "").await?;
+            // Turn 2 (new): read 6, write 7
+            let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
+            let n: u32 = val.parse().unwrap();
+            ctx.set_kv_value("counter", (n + 1).to_string());
+            Ok(format!("{}", n + 1))
+        }
+    }
+
+    let result = execute(&mut engine, Arc::new(RmwCanHandler));
+    assert_completed(&result, "7");
+}
+
+/// RE-KV-23: clear_all then set then activity, replayed.
+///
+/// Turn 1: clear_all + set("x", "new") + activity. Turn 2 is new.
+/// Snapshot has an old key "old" from prior execution. After replay of turn 1,
+/// "old" should be gone and "x" should be "new".
+#[test]
+fn kv_clear_all_then_set_replay() {
+    let history = vec![
+        started_event(1),
+        // Turn 1: clear all, set x=new
+        Event::with_event_id(1, TEST_INSTANCE, TEST_EXECUTION_ID, None, EventKind::KeyValuesCleared),
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "x".to_string(),
+                value: "new".to_string(),
+                last_updated_at_ms: 100,
+            },
+        ),
+        activity_scheduled(3, "Noop", ""),
+        activity_completed(4, 3, "ok"),
+        // Turn 2 is new
+    ];
+    let mut snapshot = HashMap::new();
+    snapshot.insert(
+        "old".to_string(),
+        KvEntry {
+            value: "stale".to_string(),
+            last_updated_at_ms: 10,
+        },
+    );
+    let mut engine = create_engine(history).with_kv_snapshot(snapshot);
+
+    struct ClearAllSetHandler;
+    #[async_trait]
+    impl OrchestrationHandler for ClearAllSetHandler {
+        async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+            ctx.clear_all_kv_values();
+            ctx.set_kv_value("x", "new");
+            ctx.schedule_activity("Noop", "").await?;
+            // Should see x=new, old=gone
+            let x = ctx.get_kv_value("x").unwrap_or("missing".to_string());
+            let old = ctx.get_kv_value("old").unwrap_or("gone".to_string());
+            Ok(format!("x={x},old={old}"))
+        }
+    }
+
+    let result = execute(&mut engine, Arc::new(ClearAllSetHandler));
+    assert_completed(&result, "x=new,old=gone");
+}
+
+/// RE-KV-24: clear single key from snapshot, then RMW on a different key.
+///
+/// Snapshot has "session"="abc" and "counter"="3". Turn 1 clears "session" and
+/// does RMW on counter (read 3, write 4). Turn 2 is new — reads both.
+#[test]
+fn kv_clear_single_snapshot_key_then_rmw() {
+    let history = vec![
+        started_event(1),
+        // Turn 1: clear session, set counter=4
+        Event::with_event_id(
+            2,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueCleared {
+                key: "session".to_string(),
+            },
+        ),
+        Event::with_event_id(
+            3,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: "counter".to_string(),
+                value: "4".to_string(),
+                last_updated_at_ms: 100,
+            },
+        ),
+        activity_scheduled(4, "Noop", ""),
+        activity_completed(5, 4, "ok"),
+    ];
+    let mut snapshot = HashMap::new();
+    snapshot.insert(
+        "session".to_string(),
+        KvEntry {
+            value: "abc".to_string(),
+            last_updated_at_ms: 10,
+        },
+    );
+    snapshot.insert(
+        "counter".to_string(),
+        KvEntry {
+            value: "3".to_string(),
+            last_updated_at_ms: 20,
+        },
+    );
+    let mut engine = create_engine(history).with_kv_snapshot(snapshot);
+
+    struct ClearSingleRmwHandler;
+    #[async_trait]
+    impl OrchestrationHandler for ClearSingleRmwHandler {
+        async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+            ctx.clear_kv_value("session");
+            let counter = ctx.get_kv_value("counter").unwrap_or("0".to_string());
+            let n: u32 = counter.parse().unwrap();
+            ctx.set_kv_value("counter", (n + 1).to_string());
+            ctx.schedule_activity("Noop", "").await?;
+            // Turn 2 (new): verify state
+            let session = ctx.get_kv_value("session").unwrap_or("gone".to_string());
+            let counter = ctx.get_kv_value("counter").unwrap_or("missing".to_string());
+            Ok(format!("session={session},counter={counter}"))
+        }
+    }
+
+    let result = execute(&mut engine, Arc::new(ClearSingleRmwHandler));
+    assert_completed(&result, "session=gone,counter=4");
+}

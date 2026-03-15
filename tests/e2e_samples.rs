@@ -2519,3 +2519,107 @@ async fn sample_kv_cross_orchestration_read() {
 
     rt.shutdown(None).await;
 }
+
+// =============================================================================
+// Sample: KV Read-Modify-Write Counter
+// =============================================================================
+
+/// Demonstrates a counter pattern where KV is used to track progress across
+/// turns. Each loop iteration reads the counter, increments it, and writes it
+/// back, with an activity in between (forcing a turn boundary and replay).
+///
+/// This pattern requires the kv_delta fix: without it, the provider snapshot
+/// poisons replay by seeding kv_state with the latest accumulated value,
+/// causing set_kv_value to emit a mismatched action during replay.
+///
+/// Highlights:
+/// - `ctx.get_kv_value("counter")` reads in-memory state (no event emitted)
+/// - `ctx.set_kv_value("counter", ...)` emits a `KeyValueSet` history event
+/// - Activities between iterations force turn boundaries → replay on next turn
+/// - `client.get_kv_value(...)` reads the final counter value after completion
+#[tokio::test]
+async fn sample_kv_read_modify_write_counter() {
+    let store = Arc::new(
+        duroxide::providers::sqlite::SqliteProvider::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    let activities = ActivityRegistry::builder()
+        .register(
+            "ProcessBatch",
+            |_ctx: ActivityContext, batch: String| async move {
+                Ok(format!("processed:{batch}"))
+            },
+        )
+        .build();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register(
+            "BatchProcessor",
+            |ctx: OrchestrationContext, _input: String| async move {
+                let batches = vec!["alpha", "beta", "gamma"];
+
+                for batch_name in &batches {
+                    // Read current progress
+                    let processed = ctx
+                        .get_kv_value("batches_processed")
+                        .unwrap_or("0".to_string());
+                    let count: u32 = processed.parse().unwrap();
+
+                    // Process the batch (activity = turn boundary)
+                    let result = ctx
+                        .schedule_activity("ProcessBatch", batch_name.to_string())
+                        .await?;
+
+                    // Update progress counter
+                    ctx.set_kv_value("batches_processed", (count + 1).to_string());
+                    ctx.set_kv_value("last_result", &result);
+                }
+
+                Ok(ctx
+                    .get_kv_value("batches_processed")
+                    .unwrap_or("0".to_string()))
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = Client::new(store.clone());
+    client
+        .start_orchestration("batch-proc", "BatchProcessor", "")
+        .await
+        .unwrap();
+
+    let status = client
+        .wait_for_orchestration("batch-proc", Duration::from_secs(10))
+        .await
+        .unwrap();
+    match status {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "3", "Should have processed 3 batches");
+        }
+        runtime::OrchestrationStatus::Failed { details, .. } => {
+            panic!(
+                "Batch processor failed (possible RMW nondeterminism): {}",
+                details.display_message()
+            );
+        }
+        other => panic!("Expected Completed, got: {other:?}"),
+    }
+
+    assert_eq!(
+        client
+            .get_kv_value("batch-proc", "batches_processed")
+            .await
+            .unwrap(),
+        Some("3".to_string()),
+    );
+    assert_eq!(
+        client
+            .get_kv_value("batch-proc", "last_result")
+            .await
+            .unwrap(),
+        Some("processed:gamma".to_string()),
+    );
+
+    rt.shutdown(None).await;
+}

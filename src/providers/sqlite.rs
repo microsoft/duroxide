@@ -453,14 +453,14 @@ impl SqliteProvider {
         .execute(pool)
         .await?;
 
-        // KV store: instance-scoped key-value pairs, materialized from history events.
+        // KV store: instance-scoped key-value pairs, written at execution completion.
+        // Contains the merged state from all prior completed executions.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS kv_store (
                 instance_id TEXT NOT NULL,
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
-                execution_id INTEGER NOT NULL,
                 last_updated_at_ms INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (instance_id, key)
             )
@@ -469,9 +469,22 @@ impl SqliteProvider {
         .execute(pool)
         .await?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_kv_store_execution ON kv_store(instance_id, execution_id)")
-            .execute(pool)
-            .await?;
+        // KV delta: mutations from the current execution only.
+        // Written every turn (ack). Merged into kv_store on execution completion.
+        // NULL value = tombstone (key was explicitly cleared).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kv_delta (
+                instance_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT,
+                last_updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (instance_id, key)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
 
         Ok(())
     }
@@ -1351,8 +1364,9 @@ impl Provider for SqliteProvider {
             }
         }
 
-        // Materialize KV mutations from history_delta into the kv_store table.
-        // Pattern: scan delta for KV events, apply UPSERT/DELETE to the materialized table.
+        // Materialize KV mutations from history_delta into the kv_delta table.
+        // kv_delta captures current-execution mutations only. On execution completion,
+        // kv_delta is merged into kv_store and cleared.
         for event in &history_delta {
             match &event.kind {
                 EventKind::KeyValueSet {
@@ -1362,38 +1376,108 @@ impl Provider for SqliteProvider {
                 } => {
                     sqlx::query(
                         r#"
-                        INSERT INTO kv_store (instance_id, key, value, execution_id, last_updated_at_ms)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO kv_delta (instance_id, key, value, last_updated_at_ms)
+                        VALUES (?, ?, ?, ?)
                         ON CONFLICT(instance_id, key)
-                        DO UPDATE SET value = excluded.value, execution_id = excluded.execution_id, last_updated_at_ms = excluded.last_updated_at_ms
+                        DO UPDATE SET value = excluded.value, last_updated_at_ms = excluded.last_updated_at_ms
                         "#,
                     )
                     .bind(&instance_id)
                     .bind(key)
                     .bind(value)
-                    .bind(execution_id as i64)
                     .bind(*last_updated_at_ms as i64)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
                 }
                 EventKind::KeyValueCleared { key } => {
-                    sqlx::query("DELETE FROM kv_store WHERE instance_id = ? AND key = ?")
-                        .bind(&instance_id)
-                        .bind(key)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+                    // Upsert tombstone (value = NULL)
+                    sqlx::query(
+                        r#"
+                        INSERT INTO kv_delta (instance_id, key, value, last_updated_at_ms)
+                        VALUES (?, ?, NULL, ?)
+                        ON CONFLICT(instance_id, key)
+                        DO UPDATE SET value = NULL, last_updated_at_ms = excluded.last_updated_at_ms
+                        "#,
+                    )
+                    .bind(&instance_id)
+                    .bind(key)
+                    .bind(Self::now_millis())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
                 }
                 EventKind::KeyValuesCleared => {
-                    sqlx::query("DELETE FROM kv_store WHERE instance_id = ?")
-                        .bind(&instance_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+                    let clear_ts = Self::now_millis();
+                    // Tombstone all existing delta rows
+                    sqlx::query(
+                        "UPDATE kv_delta SET value = NULL, last_updated_at_ms = ? WHERE instance_id = ?",
+                    )
+                    .bind(clear_ts)
+                    .bind(&instance_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+                    // Tombstone kv_store keys not already represented in delta
+                    sqlx::query(
+                        r#"
+                        INSERT OR IGNORE INTO kv_delta (instance_id, key, value, last_updated_at_ms)
+                        SELECT instance_id, key, NULL, ? FROM kv_store WHERE instance_id = ?
+                        "#,
+                    )
+                    .bind(clear_ts)
+                    .bind(&instance_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
                 }
                 _ => {}
             }
+        }
+
+        // On execution completion (terminal turn), merge kv_delta into kv_store
+        // and clear kv_delta for this instance.
+        let is_terminal = metadata
+            .status
+            .as_deref()
+            .is_some_and(|s| s == "Completed" || s == "ContinuedAsNew" || s == "Failed");
+        if is_terminal {
+            // Apply non-tombstone values from delta → store
+            sqlx::query(
+                r#"
+                INSERT INTO kv_store (instance_id, key, value, last_updated_at_ms)
+                SELECT instance_id, key, value, last_updated_at_ms
+                FROM kv_delta
+                WHERE instance_id = ? AND value IS NOT NULL
+                ON CONFLICT(instance_id, key)
+                DO UPDATE SET value = excluded.value, last_updated_at_ms = excluded.last_updated_at_ms
+                "#,
+            )
+            .bind(&instance_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+
+            // Apply tombstones: delete from kv_store where delta has NULL value
+            sqlx::query(
+                r#"
+                DELETE FROM kv_store
+                WHERE instance_id = ?
+                AND key IN (SELECT key FROM kv_delta WHERE instance_id = ? AND value IS NULL)
+                "#,
+            )
+            .bind(&instance_id)
+            .bind(&instance_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
+
+            // Clear kv_delta for this instance
+            sqlx::query("DELETE FROM kv_delta WHERE instance_id = ?")
+                .bind(&instance_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::sqlx_to_provider_error("ack_orchestration_item", e))?;
         }
 
         // Enqueue worker items with identity columns for cancellation support
@@ -2293,6 +2377,23 @@ impl Provider for SqliteProvider {
     }
 
     async fn get_kv_value(&self, instance: &str, key: &str) -> Result<Option<String>, ProviderError> {
+        // Check kv_delta first (current execution mutations)
+        let delta_row = sqlx::query("SELECT value FROM kv_delta WHERE instance_id = ? AND key = ?")
+            .bind(instance)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("get_kv_value", e))?;
+
+        if let Some(r) = delta_row {
+            // Row exists in delta: value IS NOT NULL = live value, NULL = tombstone
+            let value: Option<String> = r
+                .try_get("value")
+                .map_err(|e| Self::sqlx_to_provider_error("get_kv_value", e))?;
+            return Ok(value);
+        }
+
+        // No delta row — fall through to kv_store (prior-execution state)
         let row = sqlx::query("SELECT value FROM kv_store WHERE instance_id = ? AND key = ?")
             .bind(instance)
             .bind(key)
@@ -2313,14 +2414,15 @@ impl Provider for SqliteProvider {
         &self,
         instance: &str,
     ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
-        let rows = sqlx::query("SELECT key, value FROM kv_store WHERE instance_id = ?")
+        // Start with kv_store (prior-execution state)
+        let store_rows = sqlx::query("SELECT key, value FROM kv_store WHERE instance_id = ?")
             .bind(instance)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
 
         let mut map = std::collections::HashMap::new();
-        for row in rows {
+        for row in store_rows {
             let k: String = row
                 .try_get("key")
                 .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
@@ -2328,6 +2430,26 @@ impl Provider for SqliteProvider {
                 .try_get("value")
                 .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
             map.insert(k, v);
+        }
+
+        // Overlay kv_delta (current execution mutations)
+        let delta_rows = sqlx::query("SELECT key, value FROM kv_delta WHERE instance_id = ?")
+            .bind(instance)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
+
+        for row in delta_rows {
+            let k: String = row
+                .try_get("key")
+                .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
+            let v: Option<String> = row
+                .try_get("value")
+                .map_err(|e| Self::sqlx_to_provider_error("get_kv_all_values", e))?;
+            match v {
+                Some(value) => { map.insert(k, value); }
+                None => { map.remove(&k); } // tombstone
+            }
         }
         Ok(map)
     }
@@ -2880,6 +3002,17 @@ impl ProviderAdmin for SqliteProvider {
         // Delete KV store entries
         let del_kv_sql = format!("DELETE FROM kv_store WHERE instance_id IN ({placeholders})");
         let mut del_query = sqlx::query(&del_kv_sql);
+        for id in ids {
+            del_query = del_query.bind(id);
+        }
+        del_query
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
+
+        // Delete KV delta entries
+        let del_kv_delta_sql = format!("DELETE FROM kv_delta WHERE instance_id IN ({placeholders})");
+        let mut del_query = sqlx::query(&del_kv_delta_sql);
         for id in ids {
             del_query = del_query.bind(id);
         }

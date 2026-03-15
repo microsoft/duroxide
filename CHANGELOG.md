@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.26] - 2026-03-15
+
+**Release:** <https://crates.io/crates/duroxide/0.1.26>
+
+**Proposal:** [KV Delta Table](https://github.com/microsoft/duroxide/blob/main/docs/proposals/kv-delta-table.md)
+
+### Fixed
+
+- **KV read-modify-write replay poisoning** — Orchestrations using read-modify-write patterns
+  on KV state (e.g., `get_kv_value → compute → set_kv_value` in a loop with activities) would
+  hit nondeterminism errors on replay. The provider snapshot was seeding `kv_state` with the
+  latest accumulated value instead of the prior-execution state.
+
+### Changed
+
+- **Two-table KV model** — KV mutations during the current execution now go to a `kv_delta` table.
+  The existing `kv_store` table is only written at execution completion boundaries (Completed,
+  ContinueAsNew, Failed). Replay seeding reads from `kv_store` only (prior-execution state).
+  Client reads merge `kv_store + kv_delta` for a live view.
+- **`execution_id` column dropped from `kv_store`** (SQLite reference provider) — No longer needed
+  since execution pruning no longer touches KV entries.
+
+### Added
+
+- **9 new provider validation tests** for KV delta behavior:
+  `test_kv_delta_snapshot_excludes_current_execution`, `test_kv_delta_snapshot_includes_completed_execution`,
+  `test_kv_delta_client_reads_merged`, `test_kv_delta_tombstone_overrides_store`,
+  `test_kv_delta_clear_all_tombstones_store`, `test_kv_delta_merged_on_completion`,
+  `test_kv_delta_merged_on_can`, `test_kv_delta_delete_instance_cascades`,
+  `test_kv_delta_prune_untouched_key_survives`
+- **New E2E test** `sample_kv_read_modify_write_counter` — Demonstrates the RMW counter pattern
+  that previously triggered nondeterminism errors
+- **New migration** `20240112000000_add_kv_delta.sql` — Creates `kv_delta` table, drops
+  `execution_id` from `kv_store`
+
 ## [0.1.25] - 2026-03-14
 
 **Release:** <https://crates.io/crates/duroxide/0.1.25>

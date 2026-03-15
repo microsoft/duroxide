@@ -291,7 +291,7 @@ pub async fn test_kv_snapshot_in_fetch<F: ProviderFactory>(factory: &F) {
 
     create_instance(&*provider, "kv-fetch").await.unwrap();
 
-    // Set multiple values
+    // Set multiple values in execution 1
     ack_with_delta(
         &*provider,
         "kv-fetch",
@@ -323,7 +323,10 @@ pub async fn test_kv_snapshot_in_fetch<F: ProviderFactory>(factory: &F) {
     )
     .await;
 
-    // Enqueue another poke to trigger fetch
+    // Complete execution 1 so values merge into kv_store
+    complete_instance(&*provider, "kv-fetch", 1).await;
+
+    // Enqueue another poke to trigger fetch for a new turn
     provider
         .enqueue_for_orchestrator(poke_item("kv-fetch"), None)
         .await
@@ -335,6 +338,7 @@ pub async fn test_kv_snapshot_in_fetch<F: ProviderFactory>(factory: &F) {
         .unwrap()
         .expect("expected orchestration item");
 
+    // Snapshot contains values from the completed execution (now in kv_store)
     assert_eq!(item.kv_snapshot.len(), 2);
     assert_eq!(item.kv_snapshot.get("x").map(|e| &*e.value), Some("10"));
     assert_eq!(item.kv_snapshot.get("y").map(|e| &*e.value), Some("20"));
@@ -358,7 +362,7 @@ pub async fn test_kv_snapshot_in_fetch<F: ProviderFactory>(factory: &F) {
 // KV snapshot reflects cleared single key
 // =============================================================================
 
-/// After clearing a single key, fetch_orchestration_item snapshot omits it.
+/// After clearing a single key and completing execution, fetch snapshot omits it.
 pub async fn test_kv_snapshot_after_clear_single<F: ProviderFactory>(factory: &F) {
     let provider = factory.create_provider().await;
 
@@ -412,6 +416,9 @@ pub async fn test_kv_snapshot_after_clear_single<F: ProviderFactory>(factory: &F
         )],
     )
     .await;
+
+    // Complete execution so delta merges into kv_store
+    complete_instance(&*provider, "kv-fclr1", 1).await;
 
     // Fetch and verify snapshot
     provider
@@ -1309,7 +1316,7 @@ pub async fn test_kv_snapshot_cross_execution<F: ProviderFactory>(factory: &F) {
     )
     .await;
 
-    // ContinueAsNew → exec 2: set "B"
+    // ContinueAsNew → exec 2 (merges exec 1 delta into kv_store): set "B"
     continue_as_new(&*provider, "kv-scross", 2).await;
     ack_with_delta(
         &*provider,
@@ -1329,7 +1336,9 @@ pub async fn test_kv_snapshot_cross_execution<F: ProviderFactory>(factory: &F) {
     )
     .await;
 
-    // Fetch and check snapshot contains both
+    // Fetch and check snapshot:
+    // "A" is in kv_store (merged at CAN boundary) → in snapshot
+    // "B" is in kv_delta (current execution) → NOT in snapshot
     provider
         .enqueue_for_orchestrator(poke_item("kv-scross"), None)
         .await
@@ -1341,9 +1350,10 @@ pub async fn test_kv_snapshot_cross_execution<F: ProviderFactory>(factory: &F) {
         .unwrap()
         .expect("expected orchestration item");
 
-    assert_eq!(item.kv_snapshot.len(), 2);
+    assert_eq!(item.kv_snapshot.len(), 1, "snapshot should only contain prior-execution state");
     assert_eq!(item.kv_snapshot.get("A").map(|e| &*e.value), Some("from_exec1"));
-    assert_eq!(item.kv_snapshot.get("B").map(|e| &*e.value), Some("from_exec2"));
+    // B is in kv_delta, not in snapshot — it will be rebuilt during replay
+    assert_eq!(item.kv_snapshot.get("B"), None, "current-execution key should not be in snapshot");
 
     provider
         .ack_orchestration_item(
@@ -1601,6 +1611,719 @@ pub async fn test_kv_clear_isolation<F: ProviderFactory>(factory: &F) {
         Some("from_b".to_string()),
         "clearing instance A must not affect instance B",
     );
+}
+
+// =============================================================================
+// KV Delta: Snapshot only contains prior-execution state
+// =============================================================================
+
+/// After multiple acks within the same execution, the snapshot returned by
+/// fetch_orchestration_item must only contain values from PRIOR executions
+/// (i.e., values that were merged into kv_store at execution completion).
+/// Values set during the current (not-yet-completed) execution must NOT
+/// appear in the snapshot — they'll be rebuilt by replay.
+///
+/// NOTE: This test describes the desired behavior after the kv_delta fix.
+/// Under the current implementation it will FAIL because kv_store is written
+/// every turn. This test is a specification for the kv_delta change.
+pub async fn test_kv_delta_snapshot_excludes_current_execution<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+
+    create_instance(&*provider, "kv-ds1").await.unwrap();
+
+    // Turn 1: set counter=1 in execution 1 (not completed yet)
+    ack_with_delta(
+        &*provider,
+        "kv-ds1",
+        1,
+        vec![Event::with_event_id(
+            100,
+            "kv-ds1",
+            1,
+            None,
+            EventKind::KeyValueSet {
+                key: "counter".to_string(),
+                value: "1".to_string(),
+                last_updated_at_ms: 100,
+            },
+        )],
+    )
+    .await;
+
+    // Client read should see "1" (live state = kv_store + kv_delta)
+    assert_eq!(
+        provider.get_kv_value("kv-ds1", "counter").await.unwrap(),
+        Some("1".to_string()),
+        "client read should see current-execution value",
+    );
+
+    // Fetch snapshot — should NOT contain current-execution value
+    provider
+        .enqueue_for_orchestrator(poke_item("kv-ds1"), None)
+        .await
+        .unwrap();
+    let (item, lock_token, _) = provider
+        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("expected orchestration item");
+
+    assert!(
+        item.kv_snapshot.is_empty(),
+        "snapshot must be empty — counter was set in current execution (not completed), \
+         should not be in snapshot. Got: {:?}",
+        item.kv_snapshot,
+    );
+
+    // Clean up
+    provider
+        .ack_orchestration_item(
+            &lock_token,
+            1,
+            vec![],
+            vec![],
+            vec![],
+            ExecutionMetadata::default(),
+            vec![],
+        )
+        .await
+        .unwrap();
+}
+
+// =============================================================================
+// KV Delta: Snapshot contains prior-execution values after CAN
+// =============================================================================
+
+/// After an execution completes (via CAN), its KV values are merged into
+/// kv_store. The next execution's snapshot should see those values.
+pub async fn test_kv_delta_snapshot_includes_completed_execution<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+
+    create_instance(&*provider, "kv-ds2").await.unwrap();
+
+    // Execution 1: set counter=5
+    ack_with_delta(
+        &*provider,
+        "kv-ds2",
+        1,
+        vec![Event::with_event_id(
+            100,
+            "kv-ds2",
+            1,
+            None,
+            EventKind::KeyValueSet {
+                key: "counter".to_string(),
+                value: "5".to_string(),
+                last_updated_at_ms: 100,
+            },
+        )],
+    )
+    .await;
+
+    // CAN → execution 2
+    continue_as_new(&*provider, "kv-ds2", 2).await;
+
+    // Fetch snapshot for execution 2 — should see counter=5 from exec 1
+    provider
+        .enqueue_for_orchestrator(poke_item("kv-ds2"), None)
+        .await
+        .unwrap();
+    let (item, lock_token, _) = provider
+        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("expected orchestration item");
+
+    assert_eq!(
+        item.kv_snapshot.get("counter").map(|e| &*e.value),
+        Some("5"),
+        "snapshot must contain prior-execution value after CAN",
+    );
+
+    provider
+        .ack_orchestration_item(
+            &lock_token,
+            2,
+            vec![],
+            vec![],
+            vec![],
+            ExecutionMetadata::default(),
+            vec![],
+        )
+        .await
+        .unwrap();
+}
+
+// =============================================================================
+// KV Delta: Client reads merge kv_store + kv_delta
+// =============================================================================
+
+/// Client reads must see the merged view: kv_store (prior execution) +
+/// kv_delta (current execution mutations). Delta overrides store.
+pub async fn test_kv_delta_client_reads_merged<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+
+    create_instance(&*provider, "kv-dm").await.unwrap();
+
+    // Execution 1: set color=red, size=large
+    ack_with_delta(
+        &*provider,
+        "kv-dm",
+        1,
+        vec![
+            Event::with_event_id(
+                100,
+                "kv-dm",
+                1,
+                None,
+                EventKind::KeyValueSet {
+                    key: "color".to_string(),
+                    value: "red".to_string(),
+                    last_updated_at_ms: 100,
+                },
+            ),
+            Event::with_event_id(
+                101,
+                "kv-dm",
+                1,
+                None,
+                EventKind::KeyValueSet {
+                    key: "size".to_string(),
+                    value: "large".to_string(),
+                    last_updated_at_ms: 101,
+                },
+            ),
+        ],
+    )
+    .await;
+
+    // Complete execution 1 → values merge into kv_store
+    complete_instance(&*provider, "kv-dm", 1).await;
+
+    // Start execution 2 (simulate re-start, not CAN for simplicity)
+    // Execution 2: overwrite color=blue, set new key shape=circle
+    ack_with_delta(
+        &*provider,
+        "kv-dm",
+        2,
+        vec![
+            Event::with_event_id(
+                200,
+                "kv-dm",
+                2,
+                None,
+                EventKind::KeyValueSet {
+                    key: "color".to_string(),
+                    value: "blue".to_string(),
+                    last_updated_at_ms: 200,
+                },
+            ),
+            Event::with_event_id(
+                201,
+                "kv-dm",
+                2,
+                None,
+                EventKind::KeyValueSet {
+                    key: "shape".to_string(),
+                    value: "circle".to_string(),
+                    last_updated_at_ms: 201,
+                },
+            ),
+        ],
+    )
+    .await;
+
+    // Client reads:
+    // color = "blue" (delta overrides store)
+    assert_eq!(
+        provider.get_kv_value("kv-dm", "color").await.unwrap(),
+        Some("blue".to_string()),
+        "delta should override kv_store value",
+    );
+    // size = "large" (from kv_store, no delta for this key)
+    assert_eq!(
+        provider.get_kv_value("kv-dm", "size").await.unwrap(),
+        Some("large".to_string()),
+        "kv_store value should be visible when no delta exists",
+    );
+    // shape = "circle" (only in delta)
+    assert_eq!(
+        provider.get_kv_value("kv-dm", "shape").await.unwrap(),
+        Some("circle".to_string()),
+        "delta-only key should be visible",
+    );
+}
+
+// =============================================================================
+// KV Delta: Tombstone overrides kv_store value
+// =============================================================================
+
+/// When a key exists in kv_store from a prior execution and the current
+/// execution clears it, client reads must return None (tombstone wins).
+pub async fn test_kv_delta_tombstone_overrides_store<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+
+    create_instance(&*provider, "kv-dt").await.unwrap();
+
+    // Execution 1: set key
+    ack_with_delta(
+        &*provider,
+        "kv-dt",
+        1,
+        vec![Event::with_event_id(
+            100,
+            "kv-dt",
+            1,
+            None,
+            EventKind::KeyValueSet {
+                key: "temp".to_string(),
+                value: "exists".to_string(),
+                last_updated_at_ms: 100,
+            },
+        )],
+    )
+    .await;
+
+    // Complete execution 1 → merges to kv_store
+    complete_instance(&*provider, "kv-dt", 1).await;
+
+    // Execution 2: clear the key
+    ack_with_delta(
+        &*provider,
+        "kv-dt",
+        2,
+        vec![Event::with_event_id(
+            200,
+            "kv-dt",
+            2,
+            None,
+            EventKind::KeyValueCleared {
+                key: "temp".to_string(),
+            },
+        )],
+    )
+    .await;
+
+    // Client read: should return None (tombstone overrides kv_store)
+    assert_eq!(
+        provider.get_kv_value("kv-dt", "temp").await.unwrap(),
+        None,
+        "tombstone in delta must override kv_store value",
+    );
+}
+
+// =============================================================================
+// KV Delta: clear_all tombstones all kv_store keys
+// =============================================================================
+
+/// clear_all_values in the current execution must hide all keys from kv_store.
+pub async fn test_kv_delta_clear_all_tombstones_store<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+
+    create_instance(&*provider, "kv-dca").await.unwrap();
+
+    // Execution 1: set multiple keys
+    ack_with_delta(
+        &*provider,
+        "kv-dca",
+        1,
+        vec![
+            Event::with_event_id(
+                100,
+                "kv-dca",
+                1,
+                None,
+                EventKind::KeyValueSet {
+                    key: "a".to_string(),
+                    value: "1".to_string(),
+                    last_updated_at_ms: 100,
+                },
+            ),
+            Event::with_event_id(
+                101,
+                "kv-dca",
+                1,
+                None,
+                EventKind::KeyValueSet {
+                    key: "b".to_string(),
+                    value: "2".to_string(),
+                    last_updated_at_ms: 101,
+                },
+            ),
+        ],
+    )
+    .await;
+
+    // Complete execution 1
+    complete_instance(&*provider, "kv-dca", 1).await;
+
+    // Execution 2: clear all, then set one new key
+    ack_with_delta(
+        &*provider,
+        "kv-dca",
+        2,
+        vec![
+            Event::with_event_id(200, "kv-dca", 2, None, EventKind::KeyValuesCleared),
+            Event::with_event_id(
+                201,
+                "kv-dca",
+                2,
+                None,
+                EventKind::KeyValueSet {
+                    key: "c".to_string(),
+                    value: "3".to_string(),
+                    last_updated_at_ms: 201,
+                },
+            ),
+        ],
+    )
+    .await;
+
+    // a and b should be gone (tombstoned by clear_all)
+    assert_eq!(
+        provider.get_kv_value("kv-dca", "a").await.unwrap(),
+        None,
+        "clear_all must tombstone kv_store key 'a'",
+    );
+    assert_eq!(
+        provider.get_kv_value("kv-dca", "b").await.unwrap(),
+        None,
+        "clear_all must tombstone kv_store key 'b'",
+    );
+    // c should exist (set after clear_all, in delta)
+    assert_eq!(
+        provider.get_kv_value("kv-dca", "c").await.unwrap(),
+        Some("3".to_string()),
+        "key set after clear_all should be visible",
+    );
+}
+
+// =============================================================================
+// KV Delta: Merged on completion
+// =============================================================================
+
+/// When an execution completes, kv_delta is merged into kv_store and then
+/// cleared. Subsequent snapshot reads should see the merged state.
+pub async fn test_kv_delta_merged_on_completion<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+
+    create_instance(&*provider, "kv-dmc").await.unwrap();
+
+    // Execution 1: set key
+    ack_with_delta(
+        &*provider,
+        "kv-dmc",
+        1,
+        vec![Event::with_event_id(
+            100,
+            "kv-dmc",
+            1,
+            None,
+            EventKind::KeyValueSet {
+                key: "result".to_string(),
+                value: "42".to_string(),
+                last_updated_at_ms: 100,
+            },
+        )],
+    )
+    .await;
+
+    // Complete execution 1 → delta merged into kv_store
+    complete_instance(&*provider, "kv-dmc", 1).await;
+
+    // Client read should still see the value (now in kv_store)
+    assert_eq!(
+        provider.get_kv_value("kv-dmc", "result").await.unwrap(),
+        Some("42".to_string()),
+        "value should be in kv_store after completion merge",
+    );
+}
+
+// =============================================================================
+// KV Delta: Merged on CAN, new execution sees it in snapshot
+// =============================================================================
+
+/// After CAN, the delta from execution 1 is merged into kv_store, and
+/// execution 2's fetch snapshot reflects the merged state.
+pub async fn test_kv_delta_merged_on_can<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+
+    create_instance(&*provider, "kv-dmc2").await.unwrap();
+
+    // Execution 1: set two keys, overwrite one
+    ack_with_delta(
+        &*provider,
+        "kv-dmc2",
+        1,
+        vec![
+            Event::with_event_id(
+                100,
+                "kv-dmc2",
+                1,
+                None,
+                EventKind::KeyValueSet {
+                    key: "version".to_string(),
+                    value: "1".to_string(),
+                    last_updated_at_ms: 100,
+                },
+            ),
+            Event::with_event_id(
+                101,
+                "kv-dmc2",
+                1,
+                None,
+                EventKind::KeyValueSet {
+                    key: "progress".to_string(),
+                    value: "50%".to_string(),
+                    last_updated_at_ms: 101,
+                },
+            ),
+        ],
+    )
+    .await;
+
+    // Update progress in a second turn (still execution 1)
+    ack_with_delta(
+        &*provider,
+        "kv-dmc2",
+        1,
+        vec![Event::with_event_id(
+            102,
+            "kv-dmc2",
+            1,
+            None,
+            EventKind::KeyValueSet {
+                key: "progress".to_string(),
+                value: "100%".to_string(),
+                last_updated_at_ms: 102,
+            },
+        )],
+    )
+    .await;
+
+    // CAN → execution 2
+    continue_as_new(&*provider, "kv-dmc2", 2).await;
+
+    // Fetch snapshot for new execution
+    provider
+        .enqueue_for_orchestrator(poke_item("kv-dmc2"), None)
+        .await
+        .unwrap();
+    let (item, lock_token, _) = provider
+        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("expected orchestration item");
+
+    assert_eq!(
+        item.kv_snapshot.get("version").map(|e| &*e.value),
+        Some("1"),
+        "version should carry over via kv_store after CAN merge",
+    );
+    assert_eq!(
+        item.kv_snapshot.get("progress").map(|e| &*e.value),
+        Some("100%"),
+        "latest progress value should carry over",
+    );
+
+    provider
+        .ack_orchestration_item(
+            &lock_token,
+            2,
+            vec![],
+            vec![],
+            vec![],
+            ExecutionMetadata::default(),
+            vec![],
+        )
+        .await
+        .unwrap();
+}
+
+// =============================================================================
+// KV Delta: Delete instance cascades to delta table
+// =============================================================================
+
+/// Deleting an instance must clean up kv_delta rows in addition to kv_store.
+pub async fn test_kv_delta_delete_instance_cascades<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+    let mgmt = provider
+        .as_management_capability()
+        .expect("Provider should implement ProviderAdmin");
+
+    create_instance(&*provider, "kv-ddel").await.unwrap();
+
+    // Set a value in current execution (goes to delta)
+    ack_with_delta(
+        &*provider,
+        "kv-ddel",
+        1,
+        vec![Event::with_event_id(
+            100,
+            "kv-ddel",
+            1,
+            None,
+            EventKind::KeyValueSet {
+                key: "data".to_string(),
+                value: "important".to_string(),
+                last_updated_at_ms: 100,
+            },
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        provider.get_kv_value("kv-ddel", "data").await.unwrap(),
+        Some("important".to_string()),
+    );
+
+    // Delete instance
+    mgmt.delete_instance("kv-ddel", true).await.unwrap();
+
+    // Value should be gone
+    assert_eq!(
+        provider.get_kv_value("kv-ddel", "data").await.unwrap(),
+        None,
+        "KV delta must be cleaned up on instance deletion",
+    );
+}
+
+// =============================================================================
+// KV Delta: Prune does not affect untouched KV from pruned executions
+// =============================================================================
+
+/// A key set in execution 1 and never referenced in any subsequent execution
+/// must survive pruning of execution 1. The key lives in kv_store (merged at
+/// the CAN boundary) and prune only deletes history/execution rows.
+///
+/// Flow:
+///   Exec 1: set "stale_config" → kv_delta
+///   CAN → exec 2: delta merged to kv_store. Exec 2 sets unrelated key.
+///   CAN → exec 3: delta merged to kv_store. Exec 3 is running, never touches "stale_config".
+///   Prune execs 1+2 (keep_last=1).
+///   Assert "stale_config" still readable via client AND via snapshot.
+pub async fn test_kv_delta_prune_untouched_key_survives<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+    let mgmt = provider
+        .as_management_capability()
+        .expect("Provider should implement ProviderAdmin");
+
+    create_instance(&*provider, "kv-dprn").await.unwrap();
+
+    // Exec 1: set "stale_config" — only execution that ever touches this key
+    ack_with_delta(
+        &*provider,
+        "kv-dprn",
+        1,
+        vec![Event::with_event_id(
+            100,
+            "kv-dprn",
+            1,
+            None,
+            EventKind::KeyValueSet {
+                key: "stale_config".to_string(),
+                value: "from_exec_1".to_string(),
+                last_updated_at_ms: 100,
+            },
+        )],
+    )
+    .await;
+
+    // CAN → exec 2 (merges exec 1 delta into kv_store)
+    continue_as_new(&*provider, "kv-dprn", 2).await;
+
+    // Exec 2: set a completely unrelated key
+    ack_with_delta(
+        &*provider,
+        "kv-dprn",
+        2,
+        vec![Event::with_event_id(
+            200,
+            "kv-dprn",
+            2,
+            None,
+            EventKind::KeyValueSet {
+                key: "other".to_string(),
+                value: "unrelated".to_string(),
+                last_updated_at_ms: 200,
+            },
+        )],
+    )
+    .await;
+
+    // CAN → exec 3 (merges exec 2 delta into kv_store)
+    continue_as_new(&*provider, "kv-dprn", 3).await;
+
+    // Exec 3: running — never touches "stale_config" or "other"
+    // (no ack_with_delta for exec 3, just the OrchestrationStarted from CAN)
+
+    // Verify both keys exist before prune
+    assert_eq!(
+        provider.get_kv_value("kv-dprn", "stale_config").await.unwrap(),
+        Some("from_exec_1".to_string()),
+    );
+    assert_eq!(
+        provider.get_kv_value("kv-dprn", "other").await.unwrap(),
+        Some("unrelated".to_string()),
+    );
+
+    // Prune execs 1 + 2 (keep only exec 3)
+    mgmt.prune_executions(
+        "kv-dprn",
+        PruneOptions {
+            keep_last: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // "stale_config" must survive — it's in kv_store, prune doesn't touch kv_store
+    assert_eq!(
+        provider.get_kv_value("kv-dprn", "stale_config").await.unwrap(),
+        Some("from_exec_1".to_string()),
+        "KV key from pruned execution must survive — KV lifetime is instance-scoped",
+    );
+    assert_eq!(
+        provider.get_kv_value("kv-dprn", "other").await.unwrap(),
+        Some("unrelated".to_string()),
+        "KV key from pruned execution 2 must also survive",
+    );
+
+    // Snapshot for exec 3 should also contain both (they're in kv_store)
+    provider
+        .enqueue_for_orchestrator(poke_item("kv-dprn"), None)
+        .await
+        .unwrap();
+    let (item, lock_token, _) = provider
+        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("expected orchestration item");
+
+    assert_eq!(
+        item.kv_snapshot.get("stale_config").map(|e| &*e.value),
+        Some("from_exec_1"),
+        "snapshot must include untouched key from pruned execution",
+    );
+    assert_eq!(
+        item.kv_snapshot.get("other").map(|e| &*e.value),
+        Some("unrelated"),
+        "snapshot must include key from pruned execution 2",
+    );
+
+    provider
+        .ack_orchestration_item(
+            &lock_token,
+            3,
+            vec![],
+            vec![],
+            vec![],
+            ExecutionMetadata::default(),
+            vec![],
+        )
+        .await
+        .unwrap();
 }
 
 // =============================================================================

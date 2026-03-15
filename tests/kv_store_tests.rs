@@ -2819,3 +2819,398 @@ async fn kv_prune_selective_by_age() {
 
     rt.shutdown(None).await;
 }
+
+// =============================================================================
+// E2E-KV: Read-modify-write across turns (replay exercised)
+// =============================================================================
+
+#[tokio::test]
+async fn kv_read_modify_write_across_turns() {
+    let store = Arc::new(
+        duroxide::providers::sqlite::SqliteProvider::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    let activities = ActivityRegistry::builder()
+        .register("Noop", |_ctx: ActivityContext, _input: String| async move {
+            Ok("ok".to_string())
+        })
+        .build();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register(
+            "ReadModifyWrite",
+            |ctx: OrchestrationContext, _input: String| async move {
+                // Turn 1: set initial value, then force turn via activity
+                ctx.set_kv_value("counter", "1");
+                ctx.schedule_activity("Noop", "").await?;
+
+                // Turn 2 (replay reconstructs kv_state): read value back, force turn
+                let val = ctx.get_kv_value("counter").unwrap_or("missing".to_string());
+                assert_eq!(val, "1", "Turn 2 should see value from turn 1");
+                ctx.schedule_activity("Noop", "").await?;
+
+                // Turn 3 (replay reconstructs again): read → parse → increment → write
+                let val = ctx.get_kv_value("counter").unwrap_or("missing".to_string());
+                let n: u32 = val.parse().expect("counter should be a valid u32");
+                ctx.set_kv_value("counter", (n + 1).to_string());
+
+                Ok(format!("{}", n + 1))
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = duroxide::Client::new(store.clone());
+    client
+        .start_orchestration("kv-rmw", "ReadModifyWrite", "")
+        .await
+        .unwrap();
+    let status = client
+        .wait_for_orchestration("kv-rmw", Duration::from_secs(5))
+        .await
+        .unwrap();
+    match status {
+        OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "2", "Should have incremented counter from 1 to 2");
+        }
+        OrchestrationStatus::Failed { details, .. } => {
+            panic!("Orchestration failed (possible nondeterminism): {}", details.display_message());
+        }
+        other => panic!("Expected Completed, got: {other:?}"),
+    }
+
+    // Verify the final KV state via client
+    assert_eq!(
+        client.get_kv_value("kv-rmw", "counter").await.unwrap(),
+        Some("2".to_string())
+    );
+
+    rt.shutdown(None).await;
+}
+
+// =============================================================================
+// E2E-KV: Read-modify-write on EVERY turn — snapshot-poisons-replay scenario
+//
+// Each turn does: get(counter) → parse → increment → set(counter) → activity.
+// On turn 2+, replay re-runs all prior turns. If the KV snapshot (which carries
+// the latest accumulated value) is visible during replay of turn 1, the handler
+// reads the wrong value and emits a set that doesn't match history.
+// =============================================================================
+
+#[tokio::test]
+async fn kv_read_modify_write_every_turn() {
+    let store = Arc::new(
+        duroxide::providers::sqlite::SqliteProvider::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    let activities = ActivityRegistry::builder()
+        .register("Noop", |_ctx: ActivityContext, _input: String| async move {
+            Ok("ok".to_string())
+        })
+        .build();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register(
+            "RMWEveryTurn",
+            |ctx: OrchestrationContext, _input: String| async move {
+                // 5 iterations: counter goes 0→1→2→3→4→5
+                for _ in 0..5 {
+                    let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
+                    let n: u32 = val.parse().expect("counter should be a valid u32");
+                    ctx.set_kv_value("counter", (n + 1).to_string());
+                    ctx.schedule_activity("Noop", "").await?;
+                }
+                Ok(ctx.get_kv_value("counter").unwrap_or("0".to_string()))
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = duroxide::Client::new(store.clone());
+    client
+        .start_orchestration("kv-rmw-every", "RMWEveryTurn", "")
+        .await
+        .unwrap();
+    let status = client
+        .wait_for_orchestration("kv-rmw-every", Duration::from_secs(10))
+        .await
+        .unwrap();
+    match status {
+        OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "5", "5 increments from 0 should yield 5");
+        }
+        OrchestrationStatus::Failed { details, .. } => {
+            panic!(
+                "Orchestration failed (likely snapshot-poisons-replay nondeterminism): {}",
+                details.display_message()
+            );
+        }
+        other => panic!("Expected Completed, got: {other:?}"),
+    }
+
+    assert_eq!(
+        client.get_kv_value("kv-rmw-every", "counter").await.unwrap(),
+        Some("5".to_string())
+    );
+
+    rt.shutdown(None).await;
+}
+
+// =============================================================================
+// E2E-KV-DELTA: clear_all then set across turns
+//
+// Execution 1 sets keys, CAN, execution 2 clears all then sets new keys
+// across multiple turns. Verifies clear_all tombstones prior-execution
+// values and new sets are visible.
+// =============================================================================
+
+#[tokio::test]
+async fn kv_clear_all_then_set_across_turns() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let iteration = Arc::new(AtomicU32::new(0));
+
+    let store = Arc::new(
+        duroxide::providers::sqlite::SqliteProvider::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    let activities = ActivityRegistry::builder()
+        .register("Noop", |_ctx: ActivityContext, _input: String| async move {
+            Ok("ok".to_string())
+        })
+        .build();
+    let iter_clone = iteration.clone();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register(
+            "ClearAllRMW",
+            move |ctx: OrchestrationContext, _input: String| {
+                let iter = iter_clone.clone();
+                async move {
+                    let i = iter.fetch_add(1, Ordering::SeqCst);
+                    if i == 0 {
+                        // Execution 1: set some keys, then CAN
+                        ctx.set_kv_value("old_key", "old_val");
+                        ctx.set_kv_value("shared", "from_exec_1");
+                        let _ = ctx.continue_as_new("next").await;
+                        Ok("continued".to_string())
+                    } else {
+                        // Execution 2: clear all, set new values across turns
+                        ctx.clear_all_kv_values();
+                        ctx.set_kv_value("new_key", "new_val");
+                        ctx.schedule_activity("Noop", "").await?;
+
+                        // After turn boundary: old keys should be gone, new key visible
+                        let old = ctx.get_kv_value("old_key");
+                        let shared = ctx.get_kv_value("shared");
+                        let new = ctx.get_kv_value("new_key");
+                        assert_eq!(old, None, "old_key should be cleared");
+                        assert_eq!(shared, None, "shared should be cleared");
+                        assert_eq!(new, Some("new_val".to_string()));
+
+                        ctx.set_kv_value("final", "done");
+                        Ok(format!(
+                            "old={},shared={},new={}",
+                            old.unwrap_or("none".to_string()),
+                            shared.unwrap_or("none".to_string()),
+                            new.unwrap_or("none".to_string()),
+                        ))
+                    }
+                }
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = duroxide::Client::new(store.clone());
+    client
+        .start_orchestration("kv-ca-rmw", "ClearAllRMW", "")
+        .await
+        .unwrap();
+    let status = client
+        .wait_for_orchestration("kv-ca-rmw", Duration::from_secs(10))
+        .await
+        .unwrap();
+    match status {
+        OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "old=none,shared=none,new=new_val");
+        }
+        OrchestrationStatus::Failed { details, .. } => {
+            panic!("Failed: {}", details.display_message());
+        }
+        other => panic!("Expected Completed, got: {other:?}"),
+    }
+
+    // Client reads should reflect final state
+    assert_eq!(
+        client.get_kv_value("kv-ca-rmw", "old_key").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        client.get_kv_value("kv-ca-rmw", "final").await.unwrap(),
+        Some("done".to_string())
+    );
+    assert_eq!(
+        client.get_kv_value("kv-ca-rmw", "new_key").await.unwrap(),
+        Some("new_val".to_string())
+    );
+
+    rt.shutdown(None).await;
+}
+
+// =============================================================================
+// E2E-KV-DELTA: Clear single key with prior-execution value
+//
+// Execution 1 sets a key via CAN. Execution 2 clears that specific key.
+// Verifies the tombstone hides the prior-execution value.
+// =============================================================================
+
+#[tokio::test]
+async fn kv_clear_single_with_prior_execution_value() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let iteration = Arc::new(AtomicU32::new(0));
+
+    let store = Arc::new(
+        duroxide::providers::sqlite::SqliteProvider::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    let activities = ActivityRegistry::builder()
+        .register("Noop", |_ctx: ActivityContext, _input: String| async move {
+            Ok("ok".to_string())
+        })
+        .build();
+    let iter_clone = iteration.clone();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register(
+            "ClearSinglePrior",
+            move |ctx: OrchestrationContext, _input: String| {
+                let iter = iter_clone.clone();
+                async move {
+                    let i = iter.fetch_add(1, Ordering::SeqCst);
+                    if i == 0 {
+                        ctx.set_kv_value("session_token", "abc123");
+                        ctx.set_kv_value("keep_me", "alive");
+                        let _ = ctx.continue_as_new("next").await;
+                        Ok("continued".to_string())
+                    } else {
+                        // Clear only the session token, keep the other
+                        ctx.clear_kv_value("session_token");
+                        ctx.schedule_activity("Noop", "").await?;
+
+                        let token = ctx.get_kv_value("session_token");
+                        let kept = ctx.get_kv_value("keep_me");
+                        Ok(format!(
+                            "token={},kept={}",
+                            token.unwrap_or("none".to_string()),
+                            kept.unwrap_or("none".to_string()),
+                        ))
+                    }
+                }
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = duroxide::Client::new(store.clone());
+    client
+        .start_orchestration("kv-csp", "ClearSinglePrior", "")
+        .await
+        .unwrap();
+    let status = client
+        .wait_for_orchestration("kv-csp", Duration::from_secs(10))
+        .await
+        .unwrap();
+    match status {
+        OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "token=none,kept=alive");
+        }
+        OrchestrationStatus::Failed { details, .. } => {
+            panic!("Failed: {}", details.display_message());
+        }
+        other => panic!("Expected Completed, got: {other:?}"),
+    }
+
+    rt.shutdown(None).await;
+}
+
+// =============================================================================
+// E2E-KV-DELTA: RMW across CAN boundary
+//
+// Execution 1 sets counter=5 via CAN. Execution 2 does RMW (read 5, write 6)
+// across multiple turns. This exercises CAN carry-over + RMW together.
+// =============================================================================
+
+#[tokio::test]
+async fn kv_rmw_across_can_boundary() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let iteration = Arc::new(AtomicU32::new(0));
+
+    let store = Arc::new(
+        duroxide::providers::sqlite::SqliteProvider::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    let activities = ActivityRegistry::builder()
+        .register("Noop", |_ctx: ActivityContext, _input: String| async move {
+            Ok("ok".to_string())
+        })
+        .build();
+    let iter_clone = iteration.clone();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register(
+            "RmwCan",
+            move |ctx: OrchestrationContext, _input: String| {
+                let iter = iter_clone.clone();
+                async move {
+                    let i = iter.fetch_add(1, Ordering::SeqCst);
+                    if i == 0 {
+                        // Execution 1: initial set
+                        ctx.set_kv_value("counter", "5");
+                        let _ = ctx.continue_as_new("next").await;
+                        Ok("continued".to_string())
+                    } else {
+                        // Execution 2: RMW across 3 turns
+                        for _ in 0..3 {
+                            let val = ctx.get_kv_value("counter").unwrap_or("0".to_string());
+                            let n: u32 = val.parse().unwrap();
+                            ctx.set_kv_value("counter", (n + 1).to_string());
+                            ctx.schedule_activity("Noop", "").await?;
+                        }
+                        Ok(ctx.get_kv_value("counter").unwrap_or("0".to_string()))
+                    }
+                }
+            },
+        )
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = duroxide::Client::new(store.clone());
+    client
+        .start_orchestration("kv-rmw-can", "RmwCan", "")
+        .await
+        .unwrap();
+    let status = client
+        .wait_for_orchestration("kv-rmw-can", Duration::from_secs(10))
+        .await
+        .unwrap();
+    match status {
+        OrchestrationStatus::Completed { output, .. } => {
+            // 5 + 3 increments = 8
+            assert_eq!(output, "8", "CAN carry-over 5 + 3 RMW increments = 8");
+        }
+        OrchestrationStatus::Failed { details, .. } => {
+            panic!(
+                "Failed (possible CAN+RMW nondeterminism): {}",
+                details.display_message()
+            );
+        }
+        other => panic!("Expected Completed, got: {other:?}"),
+    }
+
+    assert_eq!(
+        client.get_kv_value("kv-rmw-can", "counter").await.unwrap(),
+        Some("8".to_string())
+    );
+
+    rt.shutdown(None).await;
+}

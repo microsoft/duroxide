@@ -1299,4 +1299,58 @@ mod tests {
     async fn test_sqlite_kv_clear_isolation() {
         test_kv_clear_isolation(&SqliteTestFactory).await;
     }
+
+    // KV delta tests (spec for kv_delta change)
+    use duroxide::provider_validations::kv_store::{
+        test_kv_delta_clear_all_tombstones_store, test_kv_delta_client_reads_merged,
+        test_kv_delta_delete_instance_cascades, test_kv_delta_merged_on_can,
+        test_kv_delta_merged_on_completion, test_kv_delta_prune_untouched_key_survives,
+        test_kv_delta_snapshot_excludes_current_execution,
+        test_kv_delta_snapshot_includes_completed_execution, test_kv_delta_tombstone_overrides_store,
+    };
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_snapshot_excludes_current_execution() {
+        test_kv_delta_snapshot_excludes_current_execution(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_snapshot_includes_completed_execution() {
+        test_kv_delta_snapshot_includes_completed_execution(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_client_reads_merged() {
+        test_kv_delta_client_reads_merged(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_tombstone_overrides_store() {
+        test_kv_delta_tombstone_overrides_store(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_clear_all_tombstones_store() {
+        test_kv_delta_clear_all_tombstones_store(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_merged_on_completion() {
+        test_kv_delta_merged_on_completion(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_merged_on_can() {
+        test_kv_delta_merged_on_can(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_delete_instance_cascades() {
+        test_kv_delta_delete_instance_cascades(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_kv_delta_prune_untouched_key_survives() {
+        test_kv_delta_prune_untouched_key_survives(&SqliteTestFactory).await;
+    }
 }
