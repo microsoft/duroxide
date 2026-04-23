@@ -2,7 +2,7 @@
 
 ### Active TODOs
 
-- Size limits 
+- ~~Size limits~~ *(implemented 2026-05-06)*
 - RaiseEvent pub/sub
 - **Stale activity cleanup / Activity TTL**
   - Tagged activities that no matching worker picks up sit in the worker queue indefinitely
@@ -58,7 +58,7 @@
 - move stress tests to cargo standard "bench"
 - separate execution loops for orchestrations and activities, communicate through channels
 - Port samples from DurableTasks and Temporal to tests/scenarios/
-- Limits everywhere, orch/activity names, input/output event sizes, history sizes etc. 
+- ~~Limits everywhere, orch/activity names, input/output event sizes, history sizes etc.~~ *(implemented 2026-05-06)*
 - LLM-orchestration/provider
 - Revive batching from dispatcher-batching branch, currently the perf dropped drastically. Might've been a sqlite-only issue. 
 - Mgmt API feedback

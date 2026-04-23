@@ -43,3 +43,57 @@ pub const MAX_KV_KEYS: usize = 150;
 ///
 /// Enforced in `validate_limits()` by scanning `KeyValueSet` events in the history delta.
 pub const MAX_KV_VALUE_BYTES: usize = 64 * 1024;
+
+// =============================================================================
+// Size limits — see `docs/proposals/size-limits.md`
+//
+// These three constants cover every value-bearing call site not already
+// governed by an existing constant above. Enforcement and error shape are
+// gated by `RuntimeOptions::enforce_size_limits` and
+// `RuntimeOptions::emit_limit_exceeded_errors` respectively (defaults `false`
+// in the introducing release; defaults flip in a later release).
+// =============================================================================
+
+/// Maximum total serialized size of an execution's history, in bytes.
+///
+/// When `RuntimeOptions::enforce_size_limits` is true, the orchestration
+/// dispatcher checks before each ack whether appending the proposed
+/// `history_delta` would push `total_history_bytes` past this cap. If it
+/// would, the delta is **discarded in memory** and the orchestration is
+/// failed with a single terminal `OrchestrationFailed` event whose
+/// `details.resource = "history"`. The oversized delta never reaches the
+/// provider.
+///
+/// Orchestration code can read the running total via
+/// `OrchestrationContext::history_size_bytes()` and roll over with
+/// `continue_as_new()` before hitting this cap.
+///
+/// 5 MiB — comfortably below every reference provider's per-row aggregate
+/// limits, and large enough that typical workflows never approach it.
+pub const MAX_HISTORY_BYTES: usize = 5 * 1024 * 1024;
+
+/// Maximum size of a "large payload" — the values that flow through
+/// orchestration logic and live as a single event in history.
+///
+/// Covers: activity input/output, orchestration input/output,
+/// sub-orchestration input/output, `continue_as_new` carry-forward input.
+///
+/// 3 MiB — over half of `MAX_HISTORY_BYTES` so a single big payload is
+/// permitted, but two of them in the same execution will trip the history
+/// cap and force a `continue_as_new` decision.
+pub const MAX_PAYLOAD_BYTES: usize = 3 * 1024 * 1024;
+
+/// Maximum size for "small values" — short strings and discrete signals
+/// that are not currently capped by an existing constant.
+///
+/// Covers: orchestration name, activity name, sub-orchestration name,
+/// event name, queue name, instance ID, session ID, external event payload,
+/// queue message, error message, cancel reason.
+///
+/// Does **not** apply to values already governed by an existing constant
+/// (`MAX_CUSTOM_STATUS_BYTES`, `MAX_KV_VALUE_BYTES`, `MAX_TAG_NAME_BYTES`).
+///
+/// 64 KiB — same order as `MAX_KV_VALUE_BYTES`, generous enough that
+/// reasonable names/IDs (bytes-to-hundreds-of-bytes) are never near the cap,
+/// and large enough for stack traces and moderate event payloads.
+pub const MAX_SMALL_VALUE_BYTES: usize = 64 * 1024;

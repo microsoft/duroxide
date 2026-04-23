@@ -13,6 +13,7 @@
 
 use crate::providers::{ExecutionMetadata, ProviderError, ScheduledActivityIdentifier, WorkItem};
 use crate::{Event, EventKind};
+use metrics::counter;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -29,6 +30,11 @@ use super::super::{HistoryManager, Runtime, WorkItemReader};
 /// - KV value size limit ([`crate::runtime::limits::MAX_KV_VALUE_BYTES`])
 /// - KV key count limit ([`crate::runtime::limits::MAX_KV_KEYS`])
 ///
+/// `emit_limit_exceeded_errors` selects the error shape produced for any
+/// violation: when `true`, failures use `Configuration::LimitExceeded`;
+/// when `false`, failures preserve today's `Application::OrchestrationFailed`
+/// shape (mixed-cluster-safe during a rolling upgrade).
+///
 /// Returns `true` if a limit was violated (orchestration marked as failed).
 #[allow(clippy::too_many_arguments)]
 fn validate_limits(
@@ -40,6 +46,8 @@ fn validate_limits(
     instance: &str,
     execution_id: u64,
     kv_snapshot: &std::collections::HashMap<String, crate::providers::KvEntry>,
+    emit_limit_exceeded_errors: bool,
+    enforce_size_limits: bool,
 ) -> bool {
     // --- Custom status size ---
     let last_custom_status = history_delta.iter().rev().find_map(|e| {
@@ -62,6 +70,7 @@ fn validate_limits(
             "Custom status exceeds size limit, failing orchestration"
         );
         fail_orchestration_for_limit(
+            "custom_status",
             format!(
                 "Custom status size ({} bytes) exceeds limit ({} bytes)",
                 s.len(),
@@ -73,6 +82,8 @@ fn validate_limits(
             orchestrator_items,
             instance,
             execution_id,
+            emit_limit_exceeded_errors,
+            false, // pre-existing limit: keep delta for backward compatibility
         );
         return true;
     }
@@ -106,6 +117,7 @@ fn validate_limits(
             "Activity tag exceeds size limit, failing orchestration"
         );
         fail_orchestration_for_limit(
+            &format!("tag:{}", activity_name),
             format!(
                 "Activity '{}' tag size ({} bytes) exceeds limit ({} bytes)",
                 activity_name,
@@ -118,6 +130,8 @@ fn validate_limits(
             orchestrator_items,
             instance,
             execution_id,
+            emit_limit_exceeded_errors,
+            false, // pre-existing limit: keep delta for backward compatibility
         );
         return true;
     }
@@ -146,6 +160,7 @@ fn validate_limits(
             "KV value exceeds size limit, failing orchestration"
         );
         fail_orchestration_for_limit(
+            &format!("kv_value:{}", key),
             format!(
                 "KV value for key '{}' ({} bytes) exceeds limit ({} bytes)",
                 key,
@@ -158,6 +173,8 @@ fn validate_limits(
             orchestrator_items,
             instance,
             execution_id,
+            emit_limit_exceeded_errors,
+            false, // pre-existing limit: keep delta for backward compatibility
         );
         return true;
     }
@@ -192,6 +209,7 @@ fn validate_limits(
             "KV key count exceeds limit, failing orchestration"
         );
         fail_orchestration_for_limit(
+            "kv_keys",
             format!(
                 "KV key count ({}) exceeds limit ({})",
                 user_key_count,
@@ -203,6 +221,219 @@ fn validate_limits(
             orchestrator_items,
             instance,
             execution_id,
+            emit_limit_exceeded_errors,
+            false, // pre-existing limit: keep delta for backward compatibility
+        );
+        return true;
+    }
+
+    // ---------------------------------------------------------------------
+    // Tier-2 size limits (docs/proposals/size-limits.md § 5.1).
+    //
+    // Gated by `enforce_size_limits`: when off the runtime measures but
+    // does not fail. When on we walk the freshly produced delta and reject
+    // any oversized payload, name, identifier, or error string. We also
+    // run the aggregate `MAX_HISTORY_BYTES` check before persistence so
+    // an oversized delta never reaches the provider.
+    // ---------------------------------------------------------------------
+    if enforce_size_limits
+        && check_tier2_size_limits(
+            history_delta,
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+            emit_limit_exceeded_errors,
+        )
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Per-event tier-2 size checks plus the aggregate history-cap check.
+///
+/// Returns `true` when a limit was violated and the orchestration was
+/// failed. Side effects on violation: drop the in-memory delta, append a
+/// single terminal `OrchestrationFailed` event, clear pending worker and
+/// orchestrator items.
+#[allow(clippy::too_many_arguments)]
+fn check_tier2_size_limits(
+    history_delta: &[Event],
+    history_mgr: &mut HistoryManager,
+    metadata: &mut ExecutionMetadata,
+    worker_items: &mut Vec<WorkItem>,
+    orchestrator_items: &mut Vec<WorkItem>,
+    instance: &str,
+    execution_id: u64,
+    emit_limit_exceeded_errors: bool,
+) -> bool {
+    use crate::runtime::limits::{MAX_PAYLOAD_BYTES, MAX_SMALL_VALUE_BYTES};
+
+    // Helper: trip a tier-2 failure with delta-drop semantics.
+    let trip = |resource: String, message: String, hm: &mut HistoryManager, md: &mut ExecutionMetadata, wi: &mut Vec<WorkItem>, oi: &mut Vec<WorkItem>| {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            resource = %resource,
+            message = %message,
+            "Tier-2 size limit exceeded, failing orchestration"
+        );
+        fail_orchestration_for_limit(
+            &resource,
+            message,
+            hm,
+            md,
+            wi,
+            oi,
+            instance,
+            execution_id,
+            emit_limit_exceeded_errors,
+            true, // tier-2: drop delta per spec § 5.1
+        );
+    };
+
+    for event in history_delta {
+        match &event.kind {
+            EventKind::ActivityScheduled {
+                name,
+                input,
+                session_id,
+                ..
+            } => {
+                if name.len() > MAX_SMALL_VALUE_BYTES {
+                    trip(
+                        "name:activity".into(),
+                        format!("Activity name size ({} bytes) exceeds limit ({MAX_SMALL_VALUE_BYTES} bytes)", name.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+                if input.len() > MAX_PAYLOAD_BYTES {
+                    trip(
+                        format!("activity_input:{name}"),
+                        format!("Activity '{name}' input size ({} bytes) exceeds limit ({MAX_PAYLOAD_BYTES} bytes)", input.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+                if let Some(sid) = session_id
+                    && sid.len() > MAX_SMALL_VALUE_BYTES
+                {
+                    trip(
+                        "name:session".into(),
+                        format!("Activity '{name}' session_id size ({} bytes) exceeds limit ({MAX_SMALL_VALUE_BYTES} bytes)", sid.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+            }
+            EventKind::SubOrchestrationScheduled { name, instance: _, input } => {
+                if name.len() > MAX_SMALL_VALUE_BYTES {
+                    trip(
+                        "name:sub_orchestration".into(),
+                        format!("Sub-orchestration name size ({} bytes) exceeds limit ({MAX_SMALL_VALUE_BYTES} bytes)", name.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+                if input.len() > MAX_PAYLOAD_BYTES {
+                    trip(
+                        format!("sub_orch_input:{name}"),
+                        format!("Sub-orchestration '{name}' input size ({} bytes) exceeds limit ({MAX_PAYLOAD_BYTES} bytes)", input.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+            }
+            EventKind::OrchestrationChained { name, input, .. } => {
+                if name.len() > MAX_SMALL_VALUE_BYTES {
+                    trip(
+                        "name:orchestration".into(),
+                        format!("Detached orchestration name size ({} bytes) exceeds limit ({MAX_SMALL_VALUE_BYTES} bytes)", name.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+                if input.len() > MAX_PAYLOAD_BYTES {
+                    trip(
+                        format!("orchestration_input:{name}"),
+                        format!("Detached orchestration '{name}' input size ({} bytes) exceeds limit ({MAX_PAYLOAD_BYTES} bytes)", input.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+            }
+            EventKind::OrchestrationCompleted { output } => {
+                if output.len() > MAX_PAYLOAD_BYTES {
+                    trip(
+                        "orchestration_output".into(),
+                        format!("Orchestration output size ({} bytes) exceeds limit ({MAX_PAYLOAD_BYTES} bytes)", output.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+            }
+            EventKind::SubOrchestrationCompleted { result } => {
+                if result.len() > MAX_PAYLOAD_BYTES {
+                    trip(
+                        "sub_orch_output".into(),
+                        format!("Sub-orchestration result size ({} bytes) exceeds limit ({MAX_PAYLOAD_BYTES} bytes)", result.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+            }
+            EventKind::OrchestrationContinuedAsNew { input } => {
+                if input.len() > MAX_PAYLOAD_BYTES {
+                    trip(
+                        "continue_as_new_input".into(),
+                        format!("continue_as_new input size ({} bytes) exceeds limit ({MAX_PAYLOAD_BYTES} bytes)", input.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+            }
+            EventKind::OrchestrationFailed { details }
+            | EventKind::SubOrchestrationFailed { details }
+            | EventKind::ActivityFailed { details } => {
+                let msg = details.display_message();
+                if msg.len() > MAX_SMALL_VALUE_BYTES {
+                    trip(
+                        "error_message".into(),
+                        format!("Error message size ({} bytes) exceeds limit ({MAX_SMALL_VALUE_BYTES} bytes)", msg.len()),
+                        history_mgr, metadata, worker_items, orchestrator_items,
+                    );
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Aggregate history-cap check (docs/proposals/size-limits.md § 5.2).
+    //
+    // The pre-persist check uses the running counters maintained by
+    // HistoryManager: if `baseline_bytes + delta_bytes` would exceed
+    // MAX_HISTORY_BYTES we drop the delta and emit a single small
+    // terminal failure event. The minimal delta is well under the cap, so
+    // appending it cannot itself exceed the limit.
+    let proposed = history_mgr.proposed_total_bytes() as usize;
+    if proposed > crate::runtime::limits::MAX_HISTORY_BYTES {
+        trip(
+            "history".into(),
+            format!(
+                "Total history size ({proposed} bytes) would exceed limit ({} bytes)",
+                crate::runtime::limits::MAX_HISTORY_BYTES,
+            ),
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
         );
         return true;
     }
@@ -211,7 +442,21 @@ fn validate_limits(
 }
 
 /// Shared helper to fail an orchestration due to a limit violation.
+///
+/// `resource` is a short stable identifier of the offending site
+/// (e.g. `"custom_status"`, `"history"`, `"kv_value:foo"`). It is used as
+/// the `resource` field on `Configuration::LimitExceeded` when
+/// `emit_limit_exceeded_errors` is true; otherwise the `Application` shape
+/// is preserved (today's behavior, mixed-cluster-safe).
+///
+/// When `drop_delta` is `true`, the existing history delta is discarded
+/// before the failure event is appended (per `docs/proposals/size-limits.md`
+/// § 5.1 tier-2: rejected deltas never reach the provider). Pre-existing
+/// limit checks pass `false` to preserve their current behavior of leaving
+/// the offending event in the delta alongside the failure.
+#[allow(clippy::too_many_arguments)]
 fn fail_orchestration_for_limit(
+    resource: &str,
     message: String,
     history_mgr: &mut HistoryManager,
     metadata: &mut ExecutionMetadata,
@@ -219,12 +464,41 @@ fn fail_orchestration_for_limit(
     orchestrator_items: &mut Vec<WorkItem>,
     instance: &str,
     execution_id: u64,
+    emit_limit_exceeded_errors: bool,
+    drop_delta: bool,
 ) {
-    let error = crate::ErrorDetails::Application {
-        kind: crate::AppErrorKind::OrchestrationFailed,
-        message,
-        retryable: false,
+    let error = if emit_limit_exceeded_errors {
+        crate::ErrorDetails::Configuration {
+            kind: crate::ConfigErrorKind::LimitExceeded,
+            resource: resource.to_string(),
+            message: Some(message),
+        }
+    } else {
+        crate::ErrorDetails::Application {
+            kind: crate::AppErrorKind::OrchestrationFailed,
+            message,
+            retryable: false,
+        }
     };
+
+    if drop_delta {
+        history_mgr.clear_delta();
+        // The dropped delta may have included an OrchestrationStarted event that
+        // caused compute_execution_metadata to set pinned_duroxide_version. Since
+        // OrchestrationStarted is no longer in the delta, we must clear the pinned
+        // version to avoid the ack invariant assertion in
+        // ack_orchestration_with_changes().
+        metadata.pinned_duroxide_version = None;
+    }
+
+    // Always emit the limit-violations counter regardless of the error
+    // shape selected above. Uses the `metrics` facade so no MetricsProvider
+    // reference is needed here.
+    counter!(
+        "duroxide_limit_violations_total",
+        "resource" => resource.to_string(),
+    )
+    .increment(1);
 
     let failed_event = Event::with_event_id(
         history_mgr.next_event_id(),
@@ -723,7 +997,81 @@ impl Runtime {
             instance,
             execution_id_for_ack,
             &item.kv_snapshot,
+            self.options.emit_limit_exceeded_errors,
+            self.options.enforce_size_limits,
         );
+
+        // ── Slice-8 metrics ───────────────────────────────────────────────
+        // Always-on: payload bytes histogram and history bytes gauge. These
+        // run regardless of `enforce_size_limits` so operators can observe
+        // pressure before turning enforcement on.
+        {
+            let orch_name_for_metrics = if workitem_reader.has_orchestration_name() {
+                workitem_reader.orchestration_name.as_str()
+            } else {
+                "unknown"
+            };
+
+            // Per-payload histograms (always emitted).
+            self.record_payload_bytes_from_delta(&history_delta_snapshot);
+
+            // History bytes gauge (always emitted).
+            let proposed_bytes = history_mgr.proposed_total_bytes();
+            self.record_history_bytes(orch_name_for_metrics, proposed_bytes);
+
+            // history_terminated_oversize counter — emitted when the last
+            // event appended to delta is a limit-failure with resource="history".
+            // We detect this by checking the delta after validate_limits ran.
+            if let Some(last) = history_mgr.delta().last() {
+                if let crate::EventKind::OrchestrationFailed { details } = &last.kind {
+                    let is_history = match details {
+                        crate::ErrorDetails::Configuration {
+                            kind: crate::ConfigErrorKind::LimitExceeded,
+                            resource,
+                            ..
+                        } if resource == "history" => true,
+                        // When emit_limit_exceeded_errors=false, history violations
+                        // produce an Application error. Detect by checking the message.
+                        crate::ErrorDetails::Application { message, .. }
+                            if message.contains("Total history size") =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if is_history {
+                        self.record_limit_violation("history", orch_name_for_metrics);
+                    }
+                }
+            }
+
+            // 75 % / 90 % WARN thresholds — fire when the baseline crosses the
+            // threshold this turn (once per threshold per execution).
+            let max = crate::runtime::limits::MAX_HISTORY_BYTES as u64;
+            let baseline = history_mgr.baseline_history_bytes();
+            let threshold_75 = max * 3 / 4;
+            let threshold_90 = max * 9 / 10;
+            if baseline < threshold_75 && proposed_bytes >= threshold_75 {
+                tracing::warn!(
+                    target: "duroxide::runtime",
+                    instance_id = %instance,
+                    orchestration_name = %orch_name_for_metrics,
+                    total_history_bytes = %proposed_bytes,
+                    limit_bytes = %max,
+                    "Orchestration history at 75% of MAX_HISTORY_BYTES; consider continue_as_new()"
+                );
+            } else if baseline < threshold_90 && proposed_bytes >= threshold_90 {
+                tracing::warn!(
+                    target: "duroxide::runtime",
+                    instance_id = %instance,
+                    orchestration_name = %orch_name_for_metrics,
+                    total_history_bytes = %proposed_bytes,
+                    limit_bytes = %max,
+                    "Orchestration history at 90% of MAX_HISTORY_BYTES; approaching the history cap"
+                );
+            }
+        }
+        // ── end slice-8 metrics ───────────────────────────────────────────
 
         // Calculate metrics
         let duration_seconds = start_time.elapsed().as_secs_f64();

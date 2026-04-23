@@ -29,6 +29,7 @@
 //! 4. If the activity doesn't complete, it's aborted and the work item is dropped
 
 use crate::providers::WorkItem;
+use metrics::counter;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -616,6 +617,87 @@ async fn handle_activity_success(
     let duration_ms = start_time.elapsed().as_millis() as u64;
     let duration_seconds = duration_ms as f64 / 1000.0;
 
+    // Tier-3 size check (docs/proposals/size-limits.md § 5.1).
+    //
+    // When enforcement is on, drop oversized outputs before they reach the
+    // provider and synthesize an `ActivityFailed` instead. The shape of the
+    // failure obeys `emit_limit_exceeded_errors` so mixed-cluster wire
+    // formats stay consistent with tier-1/tier-2.
+    //
+    // Forensic logging records the size and a 16-hex-char BLAKE3 prefix
+    // (never the raw payload) so operators can correlate complaints from
+    // upstream systems without leaking the offending bytes.
+    if rt.options.enforce_size_limits
+        && result.len() > crate::runtime::limits::MAX_PAYLOAD_BYTES
+    {
+        let hash = blake3::hash(result.as_bytes());
+        let hash_hex: String = hash.to_hex().chars().take(16).collect();
+        tracing::warn!(
+            target: "duroxide::runtime",
+            instance_id = %ctx.instance,
+            execution_id = %ctx.execution_id,
+            activity_name = %ctx.activity_name,
+            activity_id = %ctx.activity_id,
+            worker_id = %ctx.worker_id,
+            output_size_bytes = %result.len(),
+            output_blake3_hex = %hash_hex,
+            limit_bytes = %crate::runtime::limits::MAX_PAYLOAD_BYTES,
+            "Activity output exceeds size limit; dropping payload and failing activity"
+        );
+
+        let message = format!(
+            "Activity '{}' output size ({} bytes) exceeds limit ({} bytes)",
+            ctx.activity_name,
+            result.len(),
+            crate::runtime::limits::MAX_PAYLOAD_BYTES,
+        );
+        let details = if rt.options.emit_limit_exceeded_errors {
+            crate::ErrorDetails::Configuration {
+                kind: crate::ConfigErrorKind::LimitExceeded,
+                resource: format!("activity_output:{}", ctx.activity_name),
+                message: Some(message),
+            }
+        } else {
+            crate::ErrorDetails::Application {
+                kind: crate::AppErrorKind::ActivityFailed,
+                message,
+                retryable: false,
+            }
+        };
+        // Drop the oversized payload before crossing the await boundary.
+        drop(result);
+
+        // Emit limit-violations counter (tier-3, metrics facade).
+        counter!(
+            "duroxide_limit_violations_total",
+            "resource" => format!("activity_output:{}", ctx.activity_name),
+        )
+        .increment(1);
+
+        rt.record_activity_execution(
+            &ctx.activity_name,
+            "limit_exceeded",
+            duration_seconds,
+            0,
+            ctx.tag.as_deref(),
+        );
+
+        let ack_result = rt
+            .history_store
+            .ack_work_item(
+                &ctx.lock_token,
+                Some(WorkItem::ActivityFailed {
+                    instance: ctx.instance.clone(),
+                    execution_id: ctx.execution_id,
+                    id: ctx.activity_id,
+                    details,
+                }),
+            )
+            .await;
+
+        return (ack_result, ActivityOutcome::AppError);
+    }
+
     tracing::debug!(
         target: "duroxide::runtime",
         instance_id = %ctx.instance,
@@ -657,6 +739,41 @@ async fn handle_activity_error(
 ) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
     let duration_ms = start_time.elapsed().as_millis() as u64;
     let duration_seconds = duration_ms as f64 / 1000.0;
+
+    // Tier-3 error string check (docs/proposals/size-limits.md § 5.1).
+    //
+    // Per spec, the error string is **truncated** rather than failed:
+    // failing-on-failure obscures the original cause. Truncation preserves
+    // the information that an activity failed while bounding the bytes
+    // we persist into history.
+    let error = if rt.options.enforce_size_limits
+        && error.len() > crate::runtime::limits::MAX_SMALL_VALUE_BYTES
+    {
+        let original_len = error.len();
+        let limit = crate::runtime::limits::MAX_SMALL_VALUE_BYTES;
+        // Truncate at a UTF-8 boundary at or below `limit`.
+        let mut cut = limit;
+        while cut > 0 && !error.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut truncated = String::with_capacity(cut + 32);
+        truncated.push_str(&error[..cut]);
+        truncated.push_str("... [truncated]");
+        tracing::warn!(
+            target: "duroxide::runtime",
+            instance_id = %ctx.instance,
+            execution_id = %ctx.execution_id,
+            activity_name = %ctx.activity_name,
+            activity_id = %ctx.activity_id,
+            worker_id = %ctx.worker_id,
+            error_size_bytes = %original_len,
+            limit_bytes = %limit,
+            "Activity error message exceeds size limit; truncating"
+        );
+        truncated
+    } else {
+        error
+    };
 
     tracing::warn!(
         target: "duroxide::runtime",

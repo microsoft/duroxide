@@ -88,3 +88,69 @@ client.prune_executions("my-instance", PruneOptions {
 - Pruning can be done while the workflow is actively running
 
 **Note on `keep_last` semantics:** Since the current execution is always protected and is always the highest execution_id, `keep_last: None`, `Some(0)`, and `Some(1)` are all equivalent—they all prune down to exactly the current execution. Use `None` for clarity when you want to prune all historical executions.
+
+## Anticipating the History Limit
+
+Every event appended to an orchestration's history consumes space. The runtime hard-caps
+history at **5 MiB** (`MAX_HISTORY_BYTES`). When an orchestration's persisted history
+reaches that cap its next turn is terminated with an error — so it's better to roll over
+before reaching the limit.
+
+`OrchestrationContext` exposes two accessors for this purpose:
+
+```rust
+/// Serialized byte size of history at the start of this turn (replay-safe).
+pub fn history_size_bytes(&self) -> usize
+
+/// history_size_bytes() / MAX_HISTORY_BYTES, clamped to 0.0..=1.0.
+pub fn history_pressure(&self) -> f32
+```
+
+Both values are set once per turn from the baseline history that existed when the turn
+started. They are **deterministic across replay** — the replay engine sets them before
+invoking the orchestration function, so every replay sees the same snapshot.
+
+### Choosing a rollover threshold
+
+A common pattern is to roll over at 80 % pressure, leaving a comfortable margin for the
+events that will be appended during the current turn:
+
+```rust
+async fn eternal_monitor(ctx: OrchestrationContext, state_json: String) -> Result<String, String> {
+    let state: State = serde_json::from_str(&state_json).unwrap_or_default();
+
+    // Roll over proactively before the hard cap is hit.
+    if ctx.history_pressure() >= 0.80 {
+        let trimmed = serde_json::to_string(&state.trim_for_handoff()).unwrap();
+        return ctx.continue_as_new(trimmed).await;
+    }
+
+    // Normal turn logic ...
+    let result = ctx.schedule_activity("DoWork", state_json.clone()).await?;
+    ctx.schedule_timer(std::time::Duration::from_secs(60)).await;
+    return ctx.continue_as_new(result).await;
+}
+```
+
+### Enforcement and error shape (opt-in)
+
+By default the hard cap is **observed but not enforced** — the accessors are always
+available but no turn is failed purely because of history size. Two `RuntimeOptions`
+toggles control enforcement:
+
+| Toggle | Default | Effect |
+|---|---|---|
+| `enforce_size_limits` | `false` | When `true`, terminates turns that would exceed 5 MiB |
+| `emit_limit_exceeded_errors` | `false` | When `true`, failed turns produce `ConfigErrorKind::LimitExceeded` instead of `Application::OrchestrationFailed` |
+
+Enable enforcement once you're confident your orchestrations roll over in time:
+
+```rust
+let runtime = Runtime::builder(provider)
+    .with_options(RuntimeOptions {
+        enforce_size_limits: true,
+        emit_limit_exceeded_errors: true,
+        ..Default::default()
+    })
+    .build();
+```

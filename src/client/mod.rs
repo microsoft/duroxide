@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use metrics::counter;
 use tracing::info;
 
 use crate::_typed_codec::{Codec, Json};
@@ -26,6 +27,16 @@ pub enum ClientError {
     /// Invalid input (client validation)
     InvalidInput { message: String },
 
+    /// A hardcoded runtime size or shape limit was exceeded.
+    ///
+    /// `resource` is a short stable identifier of the offending site
+    /// (e.g. `"orchestration_input"`, `"name:event"`, `"identifier:instance_id"`).
+    /// `message` is human-readable.
+    ///
+    /// Only produced when [`Client::with_size_limits_enforced`] has been
+    /// called on this client (mirrors `RuntimeOptions::enforce_size_limits`).
+    Configuration { resource: String, message: String },
+
     /// Operation timed out
     Timeout,
 
@@ -46,6 +57,7 @@ impl ClientError {
             ClientError::Provider(e) => e.is_retryable(),
             ClientError::ManagementNotAvailable => false,
             ClientError::InvalidInput { .. } => false,
+            ClientError::Configuration { .. } => false,
             ClientError::Timeout => true,
             ClientError::InstanceStillRunning { .. } => false,
             ClientError::CannotDeleteSubOrchestration { .. } => false,
@@ -63,6 +75,9 @@ impl std::fmt::Display for ClientError {
                 "Management features not available - provider doesn't implement ProviderAdmin"
             ),
             ClientError::InvalidInput { message } => write!(f, "Invalid input: {message}"),
+            ClientError::Configuration { resource, message } => {
+                write!(f, "Limit exceeded ({resource}): {message}")
+            }
             ClientError::Timeout => write!(f, "Operation timed out"),
             ClientError::InstanceStillRunning { instance_id } => write!(
                 f,
@@ -166,6 +181,12 @@ const POLL_DELAY_MULTIPLIER: u64 = 2;
 /// ```
 pub struct Client {
     store: Arc<dyn Provider>,
+    /// When `true`, every input-accepting client method validates user-controlled
+    /// bytes against the size limits in `crate::runtime::limits` and returns
+    /// `ClientError::Configuration` on violation. Mirrors
+    /// `RuntimeOptions::enforce_size_limits` so an operator can flip both
+    /// sides of a deployment in lockstep. Defaults to `false`.
+    enforce_size_limits: bool,
 }
 
 impl Client {
@@ -184,7 +205,50 @@ impl Client {
     /// let client2 = client.clone();
     /// ```
     pub fn new(store: Arc<dyn Provider>) -> Self {
-        Self { store }
+        Self {
+            store,
+            enforce_size_limits: false,
+        }
+    }
+
+    /// Enable client-side size limit enforcement on this `Client`.
+    ///
+    /// When enabled, methods that accept user-controlled bytes
+    /// (e.g. `start_orchestration`, `raise_event`, `enqueue_event`,
+    /// `cancel_instance`) validate inputs against the size constants in
+    /// [`crate::runtime::limits`] **before** writing to the provider, and
+    /// return [`ClientError::Configuration`] on violation. Nothing reaches
+    /// history.
+    ///
+    /// Operators flipping `RuntimeOptions::enforce_size_limits = true` should
+    /// also flip this on every `Client` they hand out, so call sites get
+    /// the early, well-localized error instead of the runtime-side terminal
+    /// failure on the next orchestration turn.
+    pub fn with_size_limits_enforced(mut self) -> Self {
+        self.enforce_size_limits = true;
+        self
+    }
+
+    /// Validate that `value` (named `field`, identified by `resource`) is
+    /// within `max_bytes`. Returns `Ok(())` immediately when enforcement
+    /// is disabled.
+    fn check_size(&self, resource: &str, field: &str, value: &str, max_bytes: usize) -> Result<(), ClientError> {
+        if !self.enforce_size_limits {
+            return Ok(());
+        }
+        if value.len() > max_bytes {
+            // Emit tier-1 limit violation counter via the `metrics` facade.
+            counter!(
+                "duroxide_limit_violations_total",
+                "resource" => resource.to_string(),
+            )
+            .increment(1);
+            return Err(ClientError::Configuration {
+                resource: resource.to_string(),
+                message: format!("{field} size ({} bytes) exceeds limit ({max_bytes} bytes)", value.len()),
+            });
+        }
+        Ok(())
     }
 
     /// Start an orchestration instance with string input.
@@ -237,10 +301,31 @@ impl Client {
         orchestration: impl Into<String>,
         input: impl Into<String>,
     ) -> Result<(), ClientError> {
+        let instance = instance.into();
+        let orchestration = orchestration.into();
+        let input = input.into();
+        self.check_size(
+            "identifier:instance_id",
+            "instance_id",
+            &instance,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            "name:orchestration",
+            "orchestration_name",
+            &orchestration,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            "orchestration_input",
+            "orchestration_input",
+            &input,
+            crate::runtime::limits::MAX_PAYLOAD_BYTES,
+        )?;
         let item = WorkItem::StartOrchestration {
-            instance: instance.into(),
-            orchestration: orchestration.into(),
-            input: input.into(),
+            instance,
+            orchestration,
+            input,
             version: None,
             parent_instance: None,
             parent_id: None,
@@ -264,11 +349,33 @@ impl Client {
         version: impl Into<String>,
         input: impl Into<String>,
     ) -> Result<(), ClientError> {
+        let instance = instance.into();
+        let orchestration = orchestration.into();
+        let version = version.into();
+        let input = input.into();
+        self.check_size(
+            "identifier:instance_id",
+            "instance_id",
+            &instance,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            "name:orchestration",
+            "orchestration_name",
+            &orchestration,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            "orchestration_input",
+            "orchestration_input",
+            &input,
+            crate::runtime::limits::MAX_PAYLOAD_BYTES,
+        )?;
         let item = WorkItem::StartOrchestration {
-            instance: instance.into(),
-            orchestration: orchestration.into(),
-            input: input.into(),
-            version: Some(version.into()),
+            instance,
+            orchestration,
+            input,
+            version: Some(version),
             parent_instance: None,
             parent_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
@@ -378,11 +485,28 @@ impl Client {
         event_name: impl Into<String>,
         data: impl Into<String>,
     ) -> Result<(), ClientError> {
-        let item = WorkItem::ExternalRaised {
-            instance: instance.into(),
-            name: event_name.into(),
-            data: data.into(),
-        };
+        let instance = instance.into();
+        let name = event_name.into();
+        let data = data.into();
+        self.check_size(
+            "identifier:instance_id",
+            "instance_id",
+            &instance,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            "name:event",
+            "event_name",
+            &name,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            &format!("external_event:{name}"),
+            "event_payload",
+            &data,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        let item = WorkItem::ExternalRaised { instance, name, data };
         self.store
             .enqueue_for_orchestrator(item, None)
             .await
@@ -423,11 +547,28 @@ impl Client {
         queue: impl Into<String>,
         data: impl Into<String>,
     ) -> Result<(), ClientError> {
-        let item = WorkItem::QueueMessage {
-            instance: instance.into(),
-            name: queue.into(),
-            data: data.into(),
-        };
+        let instance = instance.into();
+        let name = queue.into();
+        let data = data.into();
+        self.check_size(
+            "identifier:instance_id",
+            "instance_id",
+            &instance,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            "name:queue",
+            "queue_name",
+            &name,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            &format!("queue_message:{name}"),
+            "queue_message",
+            &data,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        let item = WorkItem::QueueMessage { instance, name, data };
         self.store
             .enqueue_for_orchestrator(item, None)
             .await
@@ -562,10 +703,21 @@ impl Client {
         instance: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<(), ClientError> {
-        let item = WorkItem::CancelInstance {
-            instance: instance.into(),
-            reason: reason.into(),
-        };
+        let instance = instance.into();
+        let reason = reason.into();
+        self.check_size(
+            "identifier:instance_id",
+            "instance_id",
+            &instance,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        self.check_size(
+            "cancel_reason",
+            "cancel_reason",
+            &reason,
+            crate::runtime::limits::MAX_SMALL_VALUE_BYTES,
+        )?;
+        let item = WorkItem::CancelInstance { instance, reason };
         self.store
             .enqueue_for_orchestrator(item, None)
             .await
