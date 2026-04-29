@@ -25,7 +25,11 @@ use super::super::{HistoryManager, Runtime, WorkItemReader};
 ///
 /// Currently enforces:
 /// - Custom status size limit ([`crate::runtime::limits::MAX_CUSTOM_STATUS_BYTES`])
-/// - Tag name size limit ([`crate::runtime::limits::MAX_TAG_NAME_BYTES`])
+/// - Tag name size limit (via [`crate::runtime::limits::Limits::max_name_bytes`])
+/// - Activity name size limit (via [`crate::runtime::limits::Limits::max_name_bytes`])
+/// - Sub-orchestration name size limit (via [`crate::runtime::limits::Limits::max_name_bytes`])
+/// - Session ID size limit (via [`crate::runtime::limits::Limits::max_name_bytes`])
+/// - KV key size limit (via [`crate::runtime::limits::Limits::max_identifier_bytes`])
 /// - KV value size limit ([`crate::runtime::limits::MAX_KV_VALUE_BYTES`])
 /// - KV key count limit ([`crate::runtime::limits::MAX_KV_KEYS`])
 ///
@@ -40,6 +44,7 @@ fn validate_limits(
     instance: &str,
     execution_id: u64,
     kv_snapshot: &std::collections::HashMap<String, crate::providers::KvEntry>,
+    limits: &crate::runtime::limits::Limits,
 ) -> bool {
     // --- Custom status size ---
     let last_custom_status = history_delta.iter().rev().find_map(|e| {
@@ -77,7 +82,7 @@ fn validate_limits(
         return true;
     }
 
-    // --- Tag name size ---
+    // --- Tag name size (rewired through limits.max_name_bytes) ---
     let oversized_tag = history_delta.iter().find_map(|e| {
         if let EventKind::ActivityScheduled {
             tag: Some(ref t),
@@ -85,8 +90,8 @@ fn validate_limits(
             ..
         } = e.kind
         {
-            if t.len() > crate::runtime::limits::MAX_TAG_NAME_BYTES {
-                Some((name.clone(), t.len()))
+            if crate::runtime::limits::measured_len(t) > limits.max_name_bytes {
+                Some((name.clone(), crate::runtime::limits::measured_len(t)))
             } else {
                 None
             }
@@ -102,16 +107,164 @@ fn validate_limits(
             execution_id = %execution_id,
             activity_name = %activity_name,
             tag_bytes = tag_len,
-            max_bytes = crate::runtime::limits::MAX_TAG_NAME_BYTES,
+            max_bytes = limits.max_name_bytes,
             "Activity tag exceeds size limit, failing orchestration"
         );
-        fail_orchestration_for_limit(
-            format!(
-                "Activity '{}' tag size ({} bytes) exceeds limit ({} bytes)",
-                activity_name,
-                tag_len,
-                crate::runtime::limits::MAX_TAG_NAME_BYTES,
-            ),
+        fail_orchestration_for_name_limit(
+            crate::runtime::limits::LimitViolation::NameTooLong {
+                kind: crate::runtime::limits::NameKind::TagName,
+                name: activity_name.clone(),
+                size: tag_len,
+                limit: limits.max_name_bytes,
+            },
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+        );
+        return true;
+    }
+
+    // --- Activity name size ---
+    let oversized_activity_name = history_delta.iter().find_map(|e| {
+        if let EventKind::ActivityScheduled { ref name, .. } = e.kind {
+            let len = crate::runtime::limits::measured_len(name);
+            if len > limits.max_name_bytes { Some((name.clone(), len)) } else { None }
+        } else {
+            None
+        }
+    });
+
+    if let Some((ref name, name_len)) = oversized_activity_name {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            activity_name = %name,
+            name_bytes = name_len,
+            max_bytes = limits.max_name_bytes,
+            "Activity name exceeds size limit, failing orchestration"
+        );
+        fail_orchestration_for_name_limit(
+            crate::runtime::limits::LimitViolation::NameTooLong {
+                kind: crate::runtime::limits::NameKind::ActivityName,
+                name: name.clone(),
+                size: name_len,
+                limit: limits.max_name_bytes,
+            },
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+        );
+        return true;
+    }
+
+    // --- Session ID size ---
+    let oversized_session_id = history_delta.iter().find_map(|e| {
+        if let EventKind::ActivityScheduled { session_id: Some(ref sid), ref name, .. } = e.kind {
+            let len = crate::runtime::limits::measured_len(sid);
+            if len > limits.max_name_bytes { Some((name.clone(), sid.clone(), len)) } else { None }
+        } else {
+            None
+        }
+    });
+
+    if let Some((ref activity_name, ref sid, sid_len)) = oversized_session_id {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            activity_name = %activity_name,
+            session_id_bytes = sid_len,
+            max_bytes = limits.max_name_bytes,
+            "Activity session ID exceeds size limit, failing orchestration"
+        );
+        fail_orchestration_for_name_limit(
+            crate::runtime::limits::LimitViolation::NameTooLong {
+                kind: crate::runtime::limits::NameKind::SessionId,
+                name: sid.clone(),
+                size: sid_len,
+                limit: limits.max_name_bytes,
+            },
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+        );
+        return true;
+    }
+
+    // --- Sub-orchestration name size ---
+    let oversized_sub_orch_name = history_delta.iter().find_map(|e| {
+        if let EventKind::SubOrchestrationScheduled { ref name, .. } = e.kind {
+            let len = crate::runtime::limits::measured_len(name);
+            if len > limits.max_name_bytes { Some((name.clone(), len)) } else { None }
+        } else {
+            None
+        }
+    });
+
+    if let Some((ref name, name_len)) = oversized_sub_orch_name {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            sub_orchestration_name = %name,
+            name_bytes = name_len,
+            max_bytes = limits.max_name_bytes,
+            "Sub-orchestration name exceeds size limit, failing orchestration"
+        );
+        fail_orchestration_for_name_limit(
+            crate::runtime::limits::LimitViolation::NameTooLong {
+                kind: crate::runtime::limits::NameKind::SubOrchestrationName,
+                name: name.clone(),
+                size: name_len,
+                limit: limits.max_name_bytes,
+            },
+            history_mgr,
+            metadata,
+            worker_items,
+            orchestrator_items,
+            instance,
+            execution_id,
+        );
+        return true;
+    }
+
+    // --- KV key size (identifier limit) ---
+    let oversized_kv_key = history_delta.iter().find_map(|e| {
+        if let EventKind::KeyValueSet { ref key, .. } = e.kind {
+            let len = crate::runtime::limits::measured_len(key);
+            if len > limits.max_identifier_bytes { Some((key.clone(), len)) } else { None }
+        } else {
+            None
+        }
+    });
+
+    if let Some((ref key, key_len)) = oversized_kv_key {
+        tracing::error!(
+            target: "duroxide::runtime",
+            instance_id = %instance,
+            execution_id = %execution_id,
+            kv_key = %key,
+            key_bytes = key_len,
+            max_bytes = limits.max_identifier_bytes,
+            "KV key exceeds size limit, failing orchestration"
+        );
+        fail_orchestration_for_name_limit(
+            crate::runtime::limits::LimitViolation::NameTooLong {
+                kind: crate::runtime::limits::NameKind::KvKey,
+                name: key.clone(),
+                size: key_len,
+                limit: limits.max_identifier_bytes,
+            },
             history_mgr,
             metadata,
             worker_items,
@@ -211,6 +364,9 @@ fn validate_limits(
 }
 
 /// Shared helper to fail an orchestration due to a limit violation.
+///
+/// Produces an `Application` error (Phase 4 will migrate to `Configuration { LimitExceeded }`).
+/// The `message` is stored verbatim in the failure event.
 fn fail_orchestration_for_limit(
     message: String,
     history_mgr: &mut HistoryManager,
@@ -240,6 +396,30 @@ fn fail_orchestration_for_limit(
 
     worker_items.clear();
     orchestrator_items.clear();
+}
+
+/// Convenience wrapper: fail an orchestration due to a structured [`LimitViolation`].
+///
+/// Encodes the violation into the message field so it is machine-parseable on
+/// retrieval while remaining human-readable to older runtimes.
+fn fail_orchestration_for_name_limit(
+    violation: crate::runtime::limits::LimitViolation,
+    history_mgr: &mut HistoryManager,
+    metadata: &mut ExecutionMetadata,
+    worker_items: &mut Vec<WorkItem>,
+    orchestrator_items: &mut Vec<WorkItem>,
+    instance: &str,
+    execution_id: u64,
+) {
+    fail_orchestration_for_limit(
+        violation.encode_into_message(),
+        history_mgr,
+        metadata,
+        worker_items,
+        orchestrator_items,
+        instance,
+        execution_id,
+    );
 }
 
 /// Error returned when orchestration processing fails before execution
@@ -723,6 +903,7 @@ impl Runtime {
             instance,
             execution_id_for_ack,
             &item.kv_snapshot,
+            &self.options.limits,
         );
 
         // Calculate metrics

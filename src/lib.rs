@@ -961,6 +961,16 @@ pub enum PoisonMessageType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ConfigErrorKind {
     Nondeterminism,
+    /// A runtime size or shape limit was exceeded.
+    ///
+    /// The structured [`crate::runtime::limits::LimitViolation`] details are
+    /// serialized into the `message` field of `ErrorDetails::Configuration`
+    /// using [`LimitViolation::encode_into_message()`] so older runtimes
+    /// still surface a human-readable error string.
+    ///
+    /// First producers land in Phase 2 (name/identifier limits) and Phase 4
+    /// (error-model migration for existing limits).
+    LimitExceeded,
 }
 
 /// Application error kinds.
@@ -1008,6 +1018,10 @@ impl ErrorDetails {
                     .as_ref()
                     .map(|m| format!("nondeterministic: {m}"))
                     .unwrap_or_else(|| format!("nondeterministic in {resource}")),
+                ConfigErrorKind::LimitExceeded => message
+                    .as_ref()
+                    .map(|m| format!("limit exceeded: {m}"))
+                    .unwrap_or_else(|| format!("limit exceeded in {resource}")),
             },
             ErrorDetails::Application { kind, message, .. } => match kind {
                 AppErrorKind::Cancelled { reason } => format!("canceled: {reason}"),

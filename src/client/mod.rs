@@ -166,6 +166,12 @@ const POLL_DELAY_MULTIPLIER: u64 = 2;
 /// ```
 pub struct Client {
     store: Arc<dyn Provider>,
+    /// Limits applied to Tier-1 (client-side) name and identifier checks.
+    ///
+    /// Defaults to [`crate::runtime::limits::Limits::permissive()`], preserving
+    /// pre-Phase-2 behavior. Set to [`crate::runtime::limits::Limits::recommended()`]
+    /// (or tighter) to enable enforcement.
+    limits: crate::runtime::limits::Limits,
 }
 
 impl Client {
@@ -184,7 +190,61 @@ impl Client {
     /// let client2 = client.clone();
     /// ```
     pub fn new(store: Arc<dyn Provider>) -> Self {
-        Self { store }
+        Self { store, limits: crate::runtime::limits::Limits::permissive() }
+    }
+
+    /// Create a client with custom size limits applied to Tier-1 (client-side) checks.
+    ///
+    /// Use [`crate::runtime::limits::Limits::recommended()`] to enable the documented
+    /// production defaults, or supply custom limits to tighten or loosen for your
+    /// deployment.
+    ///
+    /// # Parameters
+    ///
+    /// * `store` - Arc-wrapped Provider (same instance used by Runtime)
+    /// * `limits` - Size and shape limits for client-side validation
+    pub fn new_with_limits(store: Arc<dyn Provider>, limits: crate::runtime::limits::Limits) -> Self {
+        Self { store, limits }
+    }
+
+    /// Validate a *name* (orchestration, activity, event, queue, tag, session ID)
+    /// against the configured name byte limit.
+    fn check_name(
+        &self,
+        name: &str,
+        kind: crate::runtime::limits::NameKind,
+    ) -> Result<(), ClientError> {
+        let len = crate::runtime::limits::measured_len(name);
+        if len > self.limits.max_name_bytes {
+            let violation = crate::runtime::limits::LimitViolation::NameTooLong {
+                kind,
+                name: name.to_string(),
+                size: len,
+                limit: self.limits.max_name_bytes,
+            };
+            return Err(ClientError::InvalidInput { message: violation.display_message() });
+        }
+        Ok(())
+    }
+
+    /// Validate an *identifier* (instance ID, KV key) against the configured
+    /// identifier byte limit.
+    fn check_identifier(
+        &self,
+        id: &str,
+        kind: crate::runtime::limits::NameKind,
+    ) -> Result<(), ClientError> {
+        let len = crate::runtime::limits::measured_len(id);
+        if len > self.limits.max_identifier_bytes {
+            let violation = crate::runtime::limits::LimitViolation::NameTooLong {
+                kind,
+                name: id.to_string(),
+                size: len,
+                limit: self.limits.max_identifier_bytes,
+            };
+            return Err(ClientError::InvalidInput { message: violation.display_message() });
+        }
+        Ok(())
     }
 
     /// Start an orchestration instance with string input.
@@ -237,9 +297,13 @@ impl Client {
         orchestration: impl Into<String>,
         input: impl Into<String>,
     ) -> Result<(), ClientError> {
+        let instance = instance.into();
+        let orchestration = orchestration.into();
+        self.check_identifier(&instance, crate::runtime::limits::NameKind::InstanceId)?;
+        self.check_name(&orchestration, crate::runtime::limits::NameKind::OrchestrationName)?;
         let item = WorkItem::StartOrchestration {
-            instance: instance.into(),
-            orchestration: orchestration.into(),
+            instance,
+            orchestration,
             input: input.into(),
             version: None,
             parent_instance: None,
@@ -264,11 +328,17 @@ impl Client {
         version: impl Into<String>,
         input: impl Into<String>,
     ) -> Result<(), ClientError> {
+        let instance = instance.into();
+        let orchestration = orchestration.into();
+        let version = version.into();
+        self.check_identifier(&instance, crate::runtime::limits::NameKind::InstanceId)?;
+        self.check_name(&orchestration, crate::runtime::limits::NameKind::OrchestrationName)?;
+        self.check_name(&version, crate::runtime::limits::NameKind::PinnedVersion)?;
         let item = WorkItem::StartOrchestration {
-            instance: instance.into(),
-            orchestration: orchestration.into(),
+            instance,
+            orchestration,
             input: input.into(),
-            version: Some(version.into()),
+            version: Some(version),
             parent_instance: None,
             parent_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
@@ -378,9 +448,11 @@ impl Client {
         event_name: impl Into<String>,
         data: impl Into<String>,
     ) -> Result<(), ClientError> {
+        let event_name = event_name.into();
+        self.check_name(&event_name, crate::runtime::limits::NameKind::EventName)?;
         let item = WorkItem::ExternalRaised {
             instance: instance.into(),
-            name: event_name.into(),
+            name: event_name,
             data: data.into(),
         };
         self.store
@@ -423,9 +495,11 @@ impl Client {
         queue: impl Into<String>,
         data: impl Into<String>,
     ) -> Result<(), ClientError> {
+        let queue = queue.into();
+        self.check_name(&queue, crate::runtime::limits::NameKind::QueueName)?;
         let item = WorkItem::QueueMessage {
             instance: instance.into(),
-            name: queue.into(),
+            name: queue,
             data: data.into(),
         };
         self.store

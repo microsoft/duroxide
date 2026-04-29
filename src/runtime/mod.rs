@@ -342,6 +342,16 @@ pub struct RuntimeOptions {
     ///
     /// Default: `TagFilter::DefaultOnly` (untagged activities only)
     pub worker_tag_filter: crate::providers::TagFilter,
+
+    /// Runtime-configurable size and shape limits.
+    ///
+    /// Override individual fields to tighten limits for a deployment.
+    /// The default ([`limits::Limits::permissive()`]) disables all new
+    /// limit checks so existing orchestrations are unaffected on upgrade.
+    ///
+    /// Set to [`limits::Limits::recommended()`] to enable the documented
+    /// production defaults.
+    pub limits: limits::Limits,
 }
 
 impl Default for RuntimeOptions {
@@ -367,6 +377,7 @@ impl Default for RuntimeOptions {
             max_sessions_per_runtime: 10,
             worker_node_id: None,
             worker_tag_filter: crate::providers::TagFilter::default(),
+            limits: limits::Limits::default(),
         }
     }
 }

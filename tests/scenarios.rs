@@ -12,6 +12,7 @@
 //! - Single-thread runtime mode (for embedded hosts)
 //! - Rolling deployment scenarios (multi-node with version upgrades)
 //! - Unobserved future cancellation (select losers, dropped futures)
+//! - Name and identifier size limits (Phase 2)
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 #![allow(clippy::expect_used)]
@@ -39,3 +40,6 @@ mod replay_versioning;
 
 #[path = "scenarios/copilot_chat.rs"]
 mod copilot_chat;
+
+#[path = "scenarios/limits.rs"]
+mod limits;

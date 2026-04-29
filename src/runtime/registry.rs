@@ -278,6 +278,27 @@ impl<H: ?Sized> RegistryBuilder<H> {
     }
 }
 
+/// Validate a handler name against [`crate::runtime::limits::Limits::recommended()`].
+///
+/// Panics if the name exceeds the recommended byte limit, matching the existing
+/// behavior for duplicate registrations (which also panic). Uses static defaults
+/// rather than `RuntimeOptions::limits` because registry builders have no access
+/// to `RuntimeOptions` at registration time; the authoritative runtime check runs
+/// separately in `validate_limits()`.
+fn check_registry_name_limit(name: &str, kind: crate::runtime::limits::NameKind) {
+    let recommended = crate::runtime::limits::Limits::recommended();
+    let len = crate::runtime::limits::measured_len(name);
+    if len > recommended.max_name_bytes {
+        let violation = crate::runtime::limits::LimitViolation::NameTooLong {
+            kind,
+            name: name.to_string(),
+            size: len,
+            limit: recommended.max_name_bytes,
+        };
+        panic!("handler registration rejected: {}", violation.display_message());
+    }
+}
+
 // ============================================================================
 // Orchestration Builder - Specialized Methods
 // ============================================================================
@@ -289,6 +310,7 @@ impl OrchestrationRegistryBuilder {
         Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
     {
         let name = name.into();
+        check_registry_name_limit(&name, crate::runtime::limits::NameKind::OrchestrationName);
         if self.check_duplicate(&name, &DEFAULT_VERSION, "orchestration") {
             return self;
         }
@@ -317,6 +339,7 @@ impl OrchestrationRegistryBuilder {
             }
         };
         let name = name.into();
+        check_registry_name_limit(&name, crate::runtime::limits::NameKind::OrchestrationName);
         self.map
             .entry(name)
             .or_default()
@@ -330,6 +353,7 @@ impl OrchestrationRegistryBuilder {
         Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
     {
         let name = name.into();
+        check_registry_name_limit(&name, crate::runtime::limits::NameKind::OrchestrationName);
         // Version parsing should never fail for valid semver strings from registry
         let v = Version::parse(version.as_ref()).expect("Version should be valid semver");
         if self.check_duplicate(&name, &v, "orchestration") {
@@ -359,6 +383,7 @@ impl OrchestrationRegistryBuilder {
     {
         use super::FnOrchestration;
         let name = name.into();
+        check_registry_name_limit(&name, crate::runtime::limits::NameKind::OrchestrationName);
         // Version parsing should never fail for valid semver strings from registry
         let v = Version::parse(version.as_ref()).expect("Version should be valid semver");
         if self.check_duplicate(&name, &v, "orchestration") {
@@ -438,6 +463,7 @@ impl ActivityRegistryBuilder {
         if self.check_reserved_prefix(&name) {
             return self;
         }
+        check_registry_name_limit(&name, crate::runtime::limits::NameKind::ActivityName);
         if self.check_duplicate(&name, &DEFAULT_VERSION, "activity") {
             return self;
         }
@@ -471,6 +497,7 @@ impl ActivityRegistryBuilder {
         if self.check_reserved_prefix(&name) {
             return self;
         }
+        check_registry_name_limit(&name, crate::runtime::limits::NameKind::ActivityName);
         if self.check_duplicate(&name, &DEFAULT_VERSION, "activity") {
             return self;
         }

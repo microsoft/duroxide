@@ -320,7 +320,10 @@ async fn e2e_tagged_activity_starvation_times_out() {
     rt.shutdown(None).await;
 }
 
-/// An activity tag exceeding MAX_TAG_NAME_BYTES (256) fails the orchestration.
+/// An activity tag exceeding the configured `max_name_bytes` limit fails the orchestration.
+///
+/// This test explicitly sets `RuntimeOptions::limits` to `Limits::recommended()` because
+/// the default is now `Limits::permissive()` (no checks). See the size-limits proposal.
 #[tokio::test]
 async fn e2e_oversized_tag_fails_orchestration() {
     use duroxide::runtime::{self, RuntimeOptions, limits, registry::ActivityRegistry};
@@ -335,7 +338,7 @@ async fn e2e_oversized_tag_fails_orchestration() {
         })
         .build();
 
-    let oversized_tag = "x".repeat(limits::MAX_TAG_NAME_BYTES + 1);
+    let oversized_tag = "x".repeat(limits::Limits::recommended().max_name_bytes + 1);
     let orchestration = move |ctx: OrchestrationContext, _input: String| {
         let tag = oversized_tag.clone();
         async move {
@@ -350,6 +353,7 @@ async fn e2e_oversized_tag_fails_orchestration() {
 
     let opts = RuntimeOptions {
         worker_tag_filter: TagFilter::Any,
+        limits: limits::Limits::recommended(),
         ..Default::default()
     };
 
@@ -369,8 +373,8 @@ async fn e2e_oversized_tag_fails_orchestration() {
         runtime::OrchestrationStatus::Failed { details, .. } => {
             let msg = details.display_message();
             assert!(
-                msg.contains("tag size") && msg.contains("exceeds limit"),
-                "Expected tag size limit error, got: {msg}"
+                msg.contains("tag_name"),
+                "Expected tag_name limit error, got: {msg}"
             );
         }
         runtime::OrchestrationStatus::Completed { output, .. } => {
@@ -382,7 +386,7 @@ async fn e2e_oversized_tag_fails_orchestration() {
     rt.shutdown(None).await;
 }
 
-/// A tag at exactly MAX_TAG_NAME_BYTES (256 bytes) succeeds.
+/// A tag at exactly `Limits::recommended().max_name_bytes` (256 bytes) succeeds.
 #[tokio::test]
 async fn e2e_tag_at_boundary_succeeds() {
     use duroxide::runtime::{self, RuntimeOptions, limits, registry::ActivityRegistry};
@@ -397,7 +401,7 @@ async fn e2e_tag_at_boundary_succeeds() {
         })
         .build();
 
-    let boundary_tag = "x".repeat(limits::MAX_TAG_NAME_BYTES);
+    let boundary_tag = "x".repeat(limits::Limits::recommended().max_name_bytes);
     let orchestration = move |ctx: OrchestrationContext, _input: String| {
         let tag = boundary_tag.clone();
         async move {
@@ -412,6 +416,7 @@ async fn e2e_tag_at_boundary_succeeds() {
 
     let opts = RuntimeOptions {
         worker_tag_filter: TagFilter::Any,
+        limits: limits::Limits::recommended(),
         ..Default::default()
     };
 
