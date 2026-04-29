@@ -177,7 +177,7 @@ impl LimitViolation {
     pub fn encode_into_message(&self) -> String {
         let json = match self {
             LimitViolation::NameTooLong { kind, name, size, limit } => {
-                let safe_name = if name.len() > 128 { &name[..128] } else { name.as_str() };
+                let safe_name = truncate_at_char_boundary(name, 128);
                 format!(
                     r#"{{"v":"NameTooLong","kind":"{}","name":{},"size":{},"limit":{}}}"#,
                     kind.label(),
@@ -214,7 +214,7 @@ impl LimitViolation {
         match self {
             LimitViolation::NameTooLong { kind, name, size, limit } => {
                 let safe_name = if name.len() > 64 {
-                    format!("{}…", &name[..64])
+                    format!("{}…", truncate_at_char_boundary(name, 64))
                 } else {
                     name.clone()
                 };
@@ -264,6 +264,22 @@ impl NameKind {
 #[inline]
 pub fn measured_len(s: &str) -> usize {
     s.len()
+}
+
+/// Truncate a string to at most `max_bytes` UTF-8 bytes, ensuring the cut
+/// falls on a character boundary.
+///
+/// Returns a `&str` slice of the original string — always valid UTF-8.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk backward from max_bytes until we find a valid character boundary.
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
 }
 
 // ============================================================================

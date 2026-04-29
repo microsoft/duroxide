@@ -274,6 +274,10 @@ async fn tier2_oversized_activity_name_fails_orchestration() {
     )
     .await;
 
+    // The client uses permissive limits (default) here intentionally — we want to test
+    // that Tier-2 (runtime validate_limits) catches the oversized activity name even when
+    // Tier-1 (client-side) would have allowed it through. The orchestration name itself
+    // ("TestOrch", 8 bytes) is within limits, so start_orchestration succeeds.
     let client = Client::new(store.clone());
     client.start_orchestration("inst-act-name", "TestOrch", "").await.unwrap();
 
@@ -334,6 +338,9 @@ async fn tier2_oversized_sub_orchestration_name_fails_orchestration() {
     )
     .await;
 
+    // The client uses permissive limits (default) intentionally — we test that Tier-2
+    // (runtime validate_limits) catches the oversized sub-orchestration name even when
+    // Tier-1 would allow it through. The orchestration name "ParentOrch" is within limits.
     let client = Client::new(store.clone());
     client
         .start_orchestration("inst-sub-name", "ParentOrch", "")
