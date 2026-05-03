@@ -184,6 +184,23 @@ pub struct RuntimeOptions {
     /// Default: 2
     pub worker_concurrency: usize,
 
+    /// Maximum worker queue items requested in a single provider fetch.
+    ///
+    /// This is a fetch amortization knob, not a concurrency knob. The dispatcher
+    /// only requests as many items as it has available `worker_max_inflight`
+    /// permits, so increasing this value alone does not increase activity
+    /// concurrency.
+    /// Default: 1
+    pub worker_fetch_batch_size: usize,
+
+    /// Maximum concurrently executing activities in this runtime.
+    ///
+    /// Defaults to `worker_concurrency` to preserve legacy behavior. Increase
+    /// this separately from `worker_fetch_batch_size` when the desired change is
+    /// more activity parallelism rather than fewer fetch round trips.
+    /// Default: 2
+    pub worker_max_inflight: usize,
+
     /// Lock timeout for orchestrator queue items.
     /// When an orchestration message is dequeued, it's locked for this duration.
     /// Orchestration turns are typically fast (milliseconds), so a shorter timeout is appropriate.
@@ -353,6 +370,8 @@ impl Default for RuntimeOptions {
             dispatcher_long_poll_timeout: Duration::from_secs(30), // 30 seconds
             orchestration_concurrency: 2,
             worker_concurrency: 2,
+            worker_fetch_batch_size: 1,
+            worker_max_inflight: 2,
             orchestrator_lock_timeout: Duration::from_secs(5),
             orchestrator_lock_renewal_buffer: Duration::from_secs(2),
             worker_lock_timeout: Duration::from_secs(30),
