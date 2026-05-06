@@ -135,6 +135,12 @@ pub struct MetricsSnapshot {
     pub orch_continue_as_new: u64,
     pub suborchestration_calls: u64,
     pub provider_errors: u64,
+    /// Total number of size-limit violations recorded across all tiers
+    /// (tier-1 client, tier-2 orchestration turn, tier-3 worker output).
+    pub limit_violations: u64,
+    /// Number of orchestrations terminated because their history exceeded
+    /// `MAX_HISTORY_BYTES`.
+    pub history_terminated_oversize: u64,
 }
 
 /// Metrics provider using the `metrics` facade crate.
@@ -172,6 +178,10 @@ pub struct MetricsProvider {
 
     // Active orchestrations tracking (for gauge metrics)
     active_orchestrations_atomic: Arc<AtomicI64>,
+
+    // Size-limit metrics
+    limit_violations_atomic: AtomicU64,
+    history_terminated_oversize_atomic: AtomicU64,
 }
 
 impl MetricsProvider {
@@ -202,6 +212,8 @@ impl MetricsProvider {
             orch_queue_depth_atomic: Arc::new(AtomicU64::new(0)),
             worker_queue_depth_atomic: Arc::new(AtomicU64::new(0)),
             active_orchestrations_atomic: Arc::new(AtomicI64::new(0)),
+            limit_violations_atomic: AtomicU64::new(0),
+            history_terminated_oversize_atomic: AtomicU64::new(0),
         })
     }
 
@@ -627,7 +639,72 @@ impl MetricsProvider {
             orch_continue_as_new: self.orch_continue_as_new_atomic.load(Ordering::Relaxed),
             suborchestration_calls: self.suborchestration_calls_atomic.load(Ordering::Relaxed),
             provider_errors: self.provider_errors_atomic.load(Ordering::Relaxed),
+            limit_violations: self.limit_violations_atomic.load(Ordering::Relaxed),
+            history_terminated_oversize: self.history_terminated_oversize_atomic.load(Ordering::Relaxed),
         }
+    }
+
+    // ========================================================================
+    // Size-limit metrics
+    // ========================================================================
+
+    /// Record a size-limit violation at any tier (1, 2, or 3).
+    ///
+    /// Emits `duroxide_limit_violations_total { resource }` via the `metrics`
+    /// facade. `resource` is the stable identifier from
+    /// `docs/proposals/size-limits.md` (e.g. `"history"`,
+    /// `"activity_input:MyActivity"`).
+    #[inline]
+    pub fn record_limit_violation(&self, resource: &str) {
+        counter!(
+            "duroxide_limit_violations_total",
+            "resource" => resource.to_string(),
+        )
+        .increment(1);
+        self.limit_violations_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a history-oversize termination for `orchestration_name`.
+    ///
+    /// Emits `duroxide_history_terminated_oversize_total { orchestration_name }`.
+    /// Called alongside [`record_limit_violation`] when `resource == "history"`.
+    #[inline]
+    pub fn record_history_terminated_oversize(&self, orchestration_name: &str) {
+        counter!(
+            "duroxide_history_terminated_oversize_total",
+            "orchestration_name" => orchestration_name.to_string(),
+        )
+        .increment(1);
+        self.history_terminated_oversize_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the serialized history size for an orchestration after a committed turn.
+    ///
+    /// Emits `duroxide_history_bytes { orchestration_name }` as a histogram so
+    /// operators can observe population pressure across all running instances.
+    /// Always called — independent of `enforce_size_limits`.
+    #[inline]
+    pub fn record_history_bytes(&self, orchestration_name: &str, bytes: u64) {
+        histogram!(
+            "duroxide_history_bytes",
+            "orchestration_name" => orchestration_name.to_string(),
+        )
+        .record(bytes as f64);
+    }
+
+    /// Record the byte size of a single payload value at a named call site.
+    ///
+    /// Emits `duroxide_payload_bytes { kind }` as a histogram. `kind` is the
+    /// resource identifier string from `docs/proposals/size-limits.md` (e.g.
+    /// `"activity_input:FetchBatch"`, `"orchestration_input"`).
+    /// Always called — independent of `enforce_size_limits`.
+    #[inline]
+    pub fn record_payload_bytes(&self, kind: &str, bytes: usize) {
+        histogram!(
+            "duroxide_payload_bytes",
+            "kind" => kind.to_string(),
+        )
+        .record(bytes as f64);
     }
 }
 

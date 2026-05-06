@@ -4,6 +4,16 @@ use crate::{
 };
 use tracing::warn;
 
+/// Compute the serialized JSON size of an event in bytes.
+///
+/// Matches the encoding used by the SQLite provider when persisting events,
+/// so the running totals on `HistoryManager` are within a few bytes of the
+/// on-disk row size. Falls back to `0` only on serialization failure, which
+/// is treated as a programming error elsewhere in the codebase.
+pub(crate) fn serialized_event_size(event: &Event) -> u64 {
+    serde_json::to_vec(event).map(|v| v.len() as u64).unwrap_or(0)
+}
+
 /// Reader for extracting metadata from orchestration history
 ///
 /// This struct provides convenient access to key information derived from
@@ -42,6 +52,21 @@ pub struct HistoryManager {
 
     /// New events to be appended (history delta)
     delta: Vec<Event>,
+
+    /// Running total of serialized bytes in `history` (baseline only).
+    ///
+    /// Computed once in `from_history()` and never updated thereafter — the
+    /// baseline is immutable for the lifetime of a `HistoryManager`. Read by
+    /// `OrchestrationContext::history_size_bytes()` to give orchestration
+    /// code a deterministic view of how close it is to `MAX_HISTORY_BYTES`.
+    history_bytes: u64,
+
+    /// Running total of serialized bytes in `delta` (events appended this turn).
+    ///
+    /// Maintained incrementally on `append`/`extend` so the pre-persist
+    /// history-cap check (`history_bytes + delta_bytes <= MAX_HISTORY_BYTES`)
+    /// is `O(1)` per event added.
+    delta_bytes: u64,
 }
 
 impl HistoryManager {
@@ -50,6 +75,10 @@ impl HistoryManager {
     /// Scans through the history (in reverse for terminal states) to extract
     /// commonly needed information.
     pub fn from_history(history: &[Event]) -> Self {
+        // Pre-compute the total serialized size of the baseline history.
+        // Uses the same JSON encoding the SQLite provider stores, so the
+        // counter matches on-disk row sizes within a few bytes of overhead.
+        let history_bytes: u64 = history.iter().map(serialized_event_size).sum();
         let mut metadata = Self {
             orchestration_name: None,
             orchestration_version: None,
@@ -62,6 +91,8 @@ impl HistoryManager {
             current_execution_id: None,
             history: history.to_vec(),
             delta: Vec::new(),
+            history_bytes,
+            delta_bytes: 0,
         };
 
         // Scan forward for OrchestrationStarted (could be multiple due to CAN)
@@ -160,6 +191,7 @@ impl HistoryManager {
 
     /// Append a single event to the delta
     pub fn append(&mut self, event: Event) {
+        self.delta_bytes = self.delta_bytes.saturating_add(serialized_event_size(&event));
         self.delta.push(event);
     }
 
@@ -179,12 +211,51 @@ impl HistoryManager {
 
     /// Extend delta with multiple events
     pub fn extend(&mut self, events: Vec<Event>) {
+        for event in &events {
+            self.delta_bytes = self.delta_bytes.saturating_add(serialized_event_size(event));
+        }
         self.delta.extend(events);
+    }
+
+    /// Total serialized bytes of the baseline history (excludes this turn's delta).
+    ///
+    /// This is the value surfaced to orchestration code via
+    /// `OrchestrationContext::history_size_bytes()`. It is deterministic across
+    /// replay because the baseline history is fixed at construction time.
+    pub fn baseline_history_bytes(&self) -> u64 {
+        self.history_bytes
+    }
+
+    /// Total serialized bytes of the delta accumulated this turn.
+    ///
+    /// Maintained incrementally as events are appended.
+    pub fn delta_bytes(&self) -> u64 {
+        self.delta_bytes
+    }
+
+    /// Proposed total bytes if the current delta were to be persisted
+    /// (`baseline_history_bytes() + delta_bytes()`).
+    ///
+    /// Used by the pre-persist `MAX_HISTORY_BYTES` check.
+    pub fn proposed_total_bytes(&self) -> u64 {
+        self.history_bytes.saturating_add(self.delta_bytes)
     }
 
     /// Get a reference to the history delta
     pub fn delta(&self) -> &[Event] {
         &self.delta
+    }
+
+    /// Discard all events accumulated in the delta this turn and reset the
+    /// delta byte counter.
+    ///
+    /// Used by the dispatcher when a tier-2 limit violation is detected: per
+    /// `docs/proposals/size-limits.md` § 5.1, oversized deltas are dropped
+    /// in memory before a single terminal `OrchestrationFailed` event is
+    /// appended, so no part of the rejected work reaches the provider.
+    pub fn clear_delta(&mut self) {
+        self.delta.clear();
+        self.delta_bytes = 0;
     }
 
     /// Consume the manager and return the history delta

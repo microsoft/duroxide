@@ -342,6 +342,44 @@ pub struct RuntimeOptions {
     ///
     /// Default: `TagFilter::DefaultOnly` (untagged activities only)
     pub worker_tag_filter: crate::providers::TagFilter,
+
+    // =========================================================================
+    // Size limits — see `docs/proposals/size-limits.md`
+    // =========================================================================
+
+    /// When `true`, the runtime enforces [`crate::runtime::limits::MAX_HISTORY_BYTES`],
+    /// [`crate::runtime::limits::MAX_PAYLOAD_BYTES`], and
+    /// [`crate::runtime::limits::MAX_SMALL_VALUE_BYTES`] at all three tiers
+    /// (Client API, orchestration turn, worker output).
+    ///
+    /// When `false` (default), the runtime **measures** every value-bearing
+    /// call site and updates metrics (`duroxide.payload.bytes`,
+    /// `duroxide.history.bytes`) but never fails for a new-cap violation.
+    /// Use the off state to observe population pressure (via
+    /// `duroxide.history.bytes` and `OrchestrationContext::history_size_bytes()`)
+    /// and refactor at-risk orchestrations *before* turning enforcement on.
+    ///
+    /// Independent of `emit_limit_exceeded_errors`.
+    ///
+    /// Default: `false`
+    pub enforce_size_limits: bool,
+
+    /// When `true`, every limit failure (both pre-existing and new) emits
+    /// `ErrorDetails::Configuration { kind: ConfigErrorKind::LimitExceeded,
+    /// resource, message }`.
+    ///
+    /// When `false` (default), every limit failure emits
+    /// `ErrorDetails::Application { kind: OrchestrationFailed, retryable: false,
+    /// message }` — the shape pre-existing limits use today, recognizable to
+    /// every prior duroxide version. Leave off during a rolling upgrade until
+    /// every node in the cluster has been upgraded to a duroxide version that
+    /// recognizes the `LimitExceeded` variant; otherwise older nodes hit the
+    /// existing `FailedDeserialization` poison path on the unknown variant.
+    ///
+    /// Independent of `enforce_size_limits`.
+    ///
+    /// Default: `false`
+    pub emit_limit_exceeded_errors: bool,
 }
 
 impl Default for RuntimeOptions {
@@ -367,6 +405,8 @@ impl Default for RuntimeOptions {
             max_sessions_per_runtime: 10,
             worker_node_id: None,
             worker_tag_filter: crate::providers::TagFilter::default(),
+            enforce_size_limits: false,
+            emit_limit_exceeded_errors: false,
         }
     }
 }
@@ -655,6 +695,63 @@ impl Runtime {
     fn record_activity_poison(&self) {
         if let Some(provider) = self.metrics_provider() {
             provider.record_activity_poison();
+        }
+    }
+
+    /// Emit `duroxide_limit_violations_total { resource }` and, when the
+    /// resource is `"history"`, also `duroxide_history_terminated_oversize_total`.
+    #[inline]
+    pub(crate) fn record_limit_violation(&self, resource: &str, orchestration_name: &str) {
+        if let Some(provider) = self.metrics_provider() {
+            provider.record_limit_violation(resource);
+            if resource == "history" {
+                provider.record_history_terminated_oversize(orchestration_name);
+            }
+        }
+    }
+
+    /// Emit `duroxide_history_bytes { orchestration_name }` after a committed turn.
+    /// Always emitted independent of `enforce_size_limits`.
+    #[inline]
+    pub(crate) fn record_history_bytes(&self, orchestration_name: &str, bytes: u64) {
+        if let Some(provider) = self.metrics_provider() {
+            provider.record_history_bytes(orchestration_name, bytes);
+        }
+    }
+
+    /// Emit `duroxide_payload_bytes { kind }` for each payload-bearing event in a
+    /// freshly-produced history delta. Always emitted independent of `enforce_size_limits`.
+    pub(crate) fn record_payload_bytes_from_delta(&self, delta: &[crate::Event]) {
+        let provider = match self.metrics_provider() {
+            Some(p) => p,
+            None => return,
+        };
+        use crate::EventKind;
+        for event in delta {
+            match &event.kind {
+                EventKind::OrchestrationStarted { input, .. } => {
+                    provider.record_payload_bytes("orchestration_input", input.len());
+                }
+                EventKind::ActivityScheduled { name, input, .. } => {
+                    provider.record_payload_bytes(&format!("activity_input:{name}"), input.len());
+                }
+                EventKind::ActivityCompleted { result, .. } => {
+                    provider.record_payload_bytes("activity_output", result.len());
+                }
+                EventKind::SubOrchestrationScheduled { name, input, .. } => {
+                    provider.record_payload_bytes(&format!("sub_orch_input:{name}"), input.len());
+                }
+                EventKind::SubOrchestrationCompleted { result, .. } => {
+                    provider.record_payload_bytes("sub_orch_output", result.len());
+                }
+                EventKind::OrchestrationCompleted { output } => {
+                    provider.record_payload_bytes("orchestration_output", output.len());
+                }
+                EventKind::OrchestrationContinuedAsNew { input, .. } => {
+                    provider.record_payload_bytes("continue_as_new_input", input.len());
+                }
+                _ => {}
+            }
         }
     }
 

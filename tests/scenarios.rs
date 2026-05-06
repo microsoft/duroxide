@@ -39,3 +39,6 @@ mod replay_versioning;
 
 #[path = "scenarios/copilot_chat.rs"]
 mod copilot_chat;
+
+#[path = "scenarios/limits.rs"]
+mod limits;

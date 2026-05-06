@@ -466,7 +466,16 @@ CREATE TABLE registered_activities (
 
 ## 8. Event Size Limits
 
-### Problem
+> **Status: Superseded — implemented in `docs/proposals/size-limits.md` (2026-05-06).**
+>
+> The final design differs from the sketch below: limits are hardcoded constants
+> (not configurable per-runtime), enforcement is gated by two `RuntimeOptions` toggles
+> (`enforce_size_limits`, `emit_limit_exceeded_errors`), and the error type uses
+> `ConfigErrorKind::LimitExceeded` rather than a custom `SizeLimitError` enum.
+> See [`docs/ORCHESTRATION-GUIDE.md#size-limits`](../ORCHESTRATION-GUIDE.md#size-limits)
+> for the authoritative reference.
+
+### Problem (historical)
 
 Currently, there's no enforcement on the size of individual events. Large payloads in activity inputs/outputs, orchestration inputs, or external events can:
 - Cause memory pressure during replay (all events loaded into memory)

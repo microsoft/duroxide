@@ -2561,7 +2561,8 @@ async fn order_actor(ctx: OrchestrationContext, state_json: String) -> Result<()
 
 ### 1. Minimize History Size
 
-Each orchestration turn appends events. Keep history manageable:
+Each orchestration turn appends events. Keep history manageable with
+`continue_as_new()`. Use `ctx.history_pressure()` to roll over proactively:
 
 ```rust
 // ❌ Bad - Creates millions of events
@@ -2574,18 +2575,23 @@ async fn bad_loop(ctx: OrchestrationContext, _input: String) -> Result<String, S
 ```
 
 ```rust
-// ✅ Good - Use Continue As New to reset history
+// ✅ Good - Roll over when pressure approaches the hard cap
 async fn good_loop(ctx: OrchestrationContext, state_json: String) -> Result<String, String> {
     let state: State = serde_json::from_str(&state_json)?;
-    
+
+    // Proactively continue-as-new before hitting the 5 MiB history cap.
+    if ctx.history_pressure() >= 0.80 {
+        return ctx.continue_as_new(serde_json::to_string(&state)?).await;
+    }
+
     // Process batch of 100
     for i in 0..100 {
         ctx.schedule_activity("Process", (state.offset + i).to_string())
             .await?;
     }
-    
+
     state.offset += 100;
-    
+
     if state.offset < state.total {
         return ctx.continue_as_new(serde_json::to_string(&state)?).await;  // Fresh history
     } else {
@@ -2593,6 +2599,8 @@ async fn good_loop(ctx: OrchestrationContext, state_json: String) -> Result<Stri
     }
 }
 ```
+
+See [Size Limits](#size-limits) for the full constant table and enforcement options.
 
 ### 2. Batch Operations
 
@@ -2613,6 +2621,80 @@ async fn fast_updates(ctx: OrchestrationContext, items_json: String) -> Result<(
     Ok(())
 }
 ```
+
+---
+
+## Size Limits
+
+The runtime enforces hard caps on all values that pass through history or the provider.
+These caps are `pub const` values in `src/runtime/limits.rs` — they are **not
+configurable at runtime**.
+
+| Constant | Value | Applies to |
+|---|---|---|
+| `MAX_HISTORY_BYTES` | 5 MiB | Total serialized history per orchestration execution |
+| `MAX_PAYLOAD_BYTES` | 3 MiB | Activity inputs/outputs, orchestration inputs, sub-orch inputs/results, external event payloads, continue-as-new inputs |
+| `MAX_SMALL_VALUE_BYTES` | 64 KiB | Names (activity, sub-orch, orchestration), identifiers (instance ID, event name, queue name), error strings, cancel reasons |
+| `MAX_CUSTOM_STATUS_BYTES` | 64 KiB | Custom status strings |
+| `MAX_KV_VALUE_BYTES` | 16 KiB | Individual KV store values |
+| `MAX_KV_KEYS` | 100 | KV keys per instance |
+| `MAX_TAG_NAME_BYTES` | 256 | Activity tag names |
+
+### Enforcement is opt-in (two toggles)
+
+Both toggles default to `false` so upgrades are safe and no existing orchestration
+breaks without warning.
+
+| `RuntimeOptions` field | Default | Effect when `true` |
+|---|---|---|
+| `enforce_size_limits` | `false` | Fails activities/turns that would exceed a cap |
+| `emit_limit_exceeded_errors` | `false` | Produces `ConfigErrorKind::LimitExceeded` instead of `Application::OrchestrationFailed` |
+
+```rust
+let runtime = Runtime::builder(provider)
+    .with_options(RuntimeOptions {
+        enforce_size_limits: true,
+        emit_limit_exceeded_errors: true,  // optional — cleaner error shape
+        ..Default::default()
+    })
+    .build();
+```
+
+### Where enforcement happens
+
+| Tier | When | What is checked |
+|---|---|---|
+| **Tier 1 — Client** | `start_orchestration`, `raise_event`, `enqueue_event`, `cancel_instance` | Instance ID, orch name, event name, queue name, input/payload sizes |
+| **Tier 2 — Orchestration turn** | On ack, before persisting | Activity/sub-orch name & input, orch output, sub-orch result, CAN input, error strings; aggregate history cap pre-persist |
+| **Tier 3 — Activity worker** | After activity returns | Activity output size; error strings truncated (never fail) |
+
+When a tier-2 history-cap violation fires, the runtime **drops all side-effects**
+(scheduled activities, timers, enqueued events) and writes only a terminal
+`OrchestrationFailed` event, preventing the oversized data from ever reaching the
+provider.
+
+### Anticipating the history cap from orchestration code
+
+Use `ctx.history_pressure()` (see [Performance Considerations](#1-minimize-history-size)
+and [`docs/continue-as-new.md`](./continue-as-new.md#anticipating-the-history-limit))
+to roll over before hitting the hard cap:
+
+```rust
+if ctx.history_pressure() >= 0.80 {
+    return ctx.continue_as_new(compact_state).await;
+}
+```
+
+### Observability
+
+Three metrics are always emitted (regardless of enforcement):
+
+| Metric | Labels | Description |
+|---|---|---|
+| `duroxide_history_bytes` | `orchestration_name` | Serialized history size per turn (histogram) |
+| `duroxide_payload_bytes` | `kind` | Per-payload-site byte histogram |
+| `duroxide_limit_violations_total` | `resource` | Counter incremented on each violation |
+| `duroxide_history_terminated_oversize_total` | `orchestration_name` | Counter when history cap terminates an instance |
 
 ---
 

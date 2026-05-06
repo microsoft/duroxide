@@ -30,6 +30,10 @@ tracing = { version = "0.1", features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 semver = "1"
 
+# Forensic hashing of oversized values (logged size + hash, never raw bytes;
+# see docs/proposals/size-limits.md § 5.1 tier-3).
+blake3 = "1"
+
 # Metrics facade (always on, zero-cost if no recorder installed)
 metrics = "0.24"
 

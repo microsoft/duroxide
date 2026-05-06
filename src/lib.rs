@@ -961,6 +961,15 @@ pub enum PoisonMessageType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ConfigErrorKind {
     Nondeterminism,
+    /// A hardcoded runtime size or shape limit was exceeded.
+    ///
+    /// The associated `resource` field on [`ErrorDetails::Configuration`]
+    /// identifies the offending site (e.g. `"history"`,
+    /// `"activity_input:MyActivity"`, `"name:event"`). The `message` field
+    /// is human-readable and not parsed by tooling.
+    ///
+    /// See `docs/proposals/size-limits.md` for the full taxonomy.
+    LimitExceeded,
 }
 
 /// Application error kinds.
@@ -1008,6 +1017,10 @@ impl ErrorDetails {
                     .as_ref()
                     .map(|m| format!("nondeterministic: {m}"))
                     .unwrap_or_else(|| format!("nondeterministic in {resource}")),
+                ConfigErrorKind::LimitExceeded => message
+                    .as_ref()
+                    .map(|m| format!("limit exceeded ({resource}): {m}"))
+                    .unwrap_or_else(|| format!("limit exceeded ({resource})")),
             },
             ErrorDetails::Application { kind, message, .. } => match kind {
                 AppErrorKind::Cancelled { reason } => format!("canceled: {reason}"),
@@ -1662,6 +1675,16 @@ struct CtxInner {
     /// Keys written during the current turn are marked with `u64::MAX` (never prunable
     /// until the next turn, when their real timestamp will appear in the snapshot).
     kv_metadata: std::collections::HashMap<String, u64>,
+
+    /// Total serialized bytes of the persisted history at the start of this turn.
+    ///
+    /// Surfaced via [`OrchestrationContext::history_size_bytes`] so orchestration
+    /// code can deterministically anticipate `MAX_HISTORY_BYTES` and roll over
+    /// with `continue_as_new()` before hitting the cap.
+    ///
+    /// Stable for the duration of a turn (excludes events emitted by this turn).
+    /// Seeded by the replay engine before invoking the orchestration handler.
+    history_size_bytes_at_turn_start: usize,
 }
 
 impl CtxInner {
@@ -1713,6 +1736,7 @@ impl CtxInner {
 
             kv_state: std::collections::HashMap::new(),
             kv_metadata: std::collections::HashMap::new(),
+            history_size_bytes_at_turn_start: 0,
         }
     }
 
@@ -2406,6 +2430,51 @@ impl OrchestrationContext {
     #[doc(hidden)]
     pub fn set_is_replaying(&self, is_replaying: bool) {
         self.inner.lock().unwrap().is_replaying = is_replaying;
+    }
+
+    /// Total serialized bytes of this execution's history at the start of the
+    /// current turn.
+    ///
+    /// Excludes events emitted by the in-flight turn, so the value is stable
+    /// for the duration of `await` resumptions and identical across replays
+    /// of the same turn. Use it together with [`MAX_HISTORY_BYTES`] (or the
+    /// convenience [`history_pressure`](Self::history_pressure)) to decide
+    /// when to roll over with `continue_as_new()` before the runtime fails
+    /// the orchestration with `LimitExceeded { resource: "history" }`.
+    ///
+    /// [`MAX_HISTORY_BYTES`]: crate::runtime::limits::MAX_HISTORY_BYTES
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use duroxide::OrchestrationContext;
+    /// # async fn example(ctx: OrchestrationContext) -> Result<String, String> {
+    /// if ctx.history_pressure() > 0.75 {
+    ///     return ctx.continue_as_new(String::new()).await;
+    /// }
+    /// # Ok(String::new())
+    /// # }
+    /// ```
+    pub fn history_size_bytes(&self) -> usize {
+        self.inner.lock().unwrap().history_size_bytes_at_turn_start
+    }
+
+    /// Ratio of [`history_size_bytes`](Self::history_size_bytes) to
+    /// [`MAX_HISTORY_BYTES`](crate::runtime::limits::MAX_HISTORY_BYTES),
+    /// clamped to `0.0..=1.0`.
+    ///
+    /// Convenience wrapper for the common "am I close to the cap?" check.
+    pub fn history_pressure(&self) -> f32 {
+        let bytes = self.history_size_bytes() as f32;
+        let cap = crate::runtime::limits::MAX_HISTORY_BYTES as f32;
+        (bytes / cap).clamp(0.0, 1.0)
+    }
+
+    /// Seed the turn-start history size (called by the replay engine before
+    /// invoking the orchestration handler).
+    #[doc(hidden)]
+    pub fn set_history_size_bytes(&self, bytes: usize) {
+        self.inner.lock().unwrap().history_size_bytes_at_turn_start = bytes;
     }
 
     /// Bind an external subscription to a schedule_id (used by replay engine and test harness).

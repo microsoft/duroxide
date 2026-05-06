@@ -552,6 +552,16 @@ impl ReplayEngine {
             }
         }
 
+        // Seed history_size_bytes for OrchestrationContext::history_size_bytes().
+        // We expose the size of working_history (baseline + completion-derived
+        // events that exist before user code runs), which is stable for the
+        // duration of the turn and identical across replays of the same turn.
+        let history_size_bytes: usize = working_history
+            .iter()
+            .map(|e| crate::runtime::state_helpers::serialized_event_size(e) as usize)
+            .sum();
+        ctx.set_history_size_bytes(history_size_bytes);
+
         let ctx_for_future = ctx.clone();
         let h = handler.clone();
         let inp = input.clone();
