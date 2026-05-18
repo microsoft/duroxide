@@ -229,8 +229,9 @@ async fn activity_duplicate_completion_workitems_dedup() {
 }
 // merged file: imports above already declared; avoid reimporting
 
-// Simulate crash windows by interleaving dequeue and persistence.
-// We approximate by injecting duplicates around the same window; idempotence + peek-lock should ensure correctness.
+// Simulate crash windows by controlling provider dequeue/ack boundaries directly.
+// The lock-expiry case below verifies that a recovered queue row can be processed
+// together with a second visible external event for the same orchestration.
 
 #[tokio::test]
 async fn crash_after_dequeue_before_append_completion() {
@@ -275,14 +276,14 @@ async fn crash_after_dequeue_before_append_completion() {
     assert_eq!(fetched.messages.len(), 1);
     assert!(matches!(fetched.messages[0], WorkItem::ExternalRaised { .. }));
 
-    // After the unacked dequeue's lock expires, a duplicate/new copy arrives.
-    // Restarting the runtime should fetch both the recovered locked row and the
-    // fresh visible row in one batch.
+    // After the unacked dequeue's lock expires, a duplicate external arrival is
+    // enqueued. Restarting the runtime should fetch both the recovered row and
+    // the second visible row in one batch.
     tokio::time::sleep(lock_timeout + Duration::from_millis(50)).await;
     store.enqueue_for_orchestrator(wi.clone(), None).await.unwrap();
 
-    // Restart runtime — dispatcher picks up the expired locked row and the new
-    // duplicate in one batch.
+    // Restart runtime: the dispatcher picks up the expired locked row and the
+    // second visible row together.
     let rt = runtime::Runtime::start_with_store(
         store.clone(),
         ActivityRegistry::builder().build(),
@@ -302,8 +303,8 @@ async fn crash_after_dequeue_before_append_completion() {
     )
     .await;
     assert!(ok, "timeout waiting for completion");
-    // Both external events are materialized in history (unconditional materialization).
-    // Only the first is delivered (causal check); the duplicate is a no-op at replay time.
+    // Both external events are materialized in history. Replay delivers one to
+    // the pending wait; the second has no matching wait and is causally ignored.
     let hist = store.read(inst).await.unwrap_or_default();
     let evs: Vec<&Event> = hist
         .iter()
