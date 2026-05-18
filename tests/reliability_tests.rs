@@ -236,12 +236,14 @@ async fn activity_duplicate_completion_workitems_dedup() {
 async fn crash_after_dequeue_before_append_completion() {
     let (store, _td) = common::create_sqlite_store_disk().await;
 
-    let orch = |ctx: OrchestrationContext, _input: String| async move {
-        // Wait for external then complete with payload
-        let v = ctx.schedule_wait("Evt").await;
-        Ok(v)
+    let make_orch = || {
+        |ctx: OrchestrationContext, _input: String| async move {
+            // Wait for external then complete with payload
+            let v = ctx.schedule_wait("Evt").await;
+            Ok(v)
+        }
     };
-    let orchestration_registry = OrchestrationRegistry::builder().register("WaitEvt", orch).build();
+    let orchestration_registry = OrchestrationRegistry::builder().register("WaitEvt", make_orch()).build();
     let activity_registry = ActivityRegistry::builder().build();
     let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
     let client = duroxide::Client::new(store.clone());
@@ -251,15 +253,28 @@ async fn crash_after_dequeue_before_append_completion() {
     client.start_orchestration(inst, "WaitEvt", "").await.unwrap();
     assert!(common::wait_for_subscription(store.clone(), inst, "Evt", 2_000).await);
 
-    // Enqueue the external work item
+    // Stop the runtime so both duplicates land in the queue before processing.
+    // This guarantees the dispatcher picks them up in one batch (no race).
+    rt.shutdown(None).await;
+
+    // Enqueue the external work item twice (simulates crash-before-append:
+    // the item was dequeued but the completion was never persisted, so after
+    // lock expiry the item becomes visible again alongside a new copy).
     let wi = WorkItem::ExternalRaised {
         instance: inst.to_string(),
         name: "Evt".to_string(),
         data: "ok".to_string(),
     };
     let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
-    // Simulate crash-before-append by enqueuing duplicate before runtime gets to append
     let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
+
+    // Restart runtime — dispatcher picks up both events in one batch
+    let rt = runtime::Runtime::start_with_store(
+        store.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder().register("WaitEvt", make_orch()).build(),
+    )
+    .await;
 
     // Wait for completion, ensure a single ExternalEvent recorded
     let ok = common::wait_for_history(
