@@ -253,22 +253,36 @@ async fn crash_after_dequeue_before_append_completion() {
     client.start_orchestration(inst, "WaitEvt", "").await.unwrap();
     assert!(common::wait_for_subscription(store.clone(), inst, "Evt", 2_000).await);
 
-    // Stop the runtime so both duplicates land in the queue before processing.
-    // This guarantees the dispatcher picks them up in one batch (no race).
+    // Stop the runtime after the subscription is recorded so this test owns the
+    // crash window instead of racing the dispatcher.
     rt.shutdown(None).await;
 
-    // Enqueue the external work item twice (simulates crash-before-append:
-    // the item was dequeued but the completion was never persisted, so after
-    // lock expiry the item becomes visible again alongside a new copy).
     let wi = WorkItem::ExternalRaised {
         instance: inst.to_string(),
         name: "Evt".to_string(),
         data: "ok".to_string(),
     };
-    let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
-    let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
 
-    // Restart runtime — dispatcher picks up both events in one batch
+    // First copy is dequeued and locked, but never acked. This simulates a
+    // process crash after dequeue and before the ExternalEvent is appended.
+    let lock_timeout = Duration::from_millis(100);
+    store.enqueue_for_orchestrator(wi.clone(), None).await.unwrap();
+    let (fetched, _lock_token, _attempt_count) = store
+        .fetch_orchestration_item(lock_timeout, Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("first external event should be fetched");
+    assert_eq!(fetched.messages.len(), 1);
+    assert!(matches!(fetched.messages[0], WorkItem::ExternalRaised { .. }));
+
+    // After the unacked dequeue's lock expires, a duplicate/new copy arrives.
+    // Restarting the runtime should fetch both the recovered locked row and the
+    // fresh visible row in one batch.
+    tokio::time::sleep(lock_timeout + Duration::from_millis(50)).await;
+    store.enqueue_for_orchestrator(wi.clone(), None).await.unwrap();
+
+    // Restart runtime — dispatcher picks up the expired locked row and the new
+    // duplicate in one batch.
     let rt = runtime::Runtime::start_with_store(
         store.clone(),
         ActivityRegistry::builder().build(),
@@ -276,7 +290,7 @@ async fn crash_after_dequeue_before_append_completion() {
     )
     .await;
 
-    // Wait for completion, ensure a single ExternalEvent recorded
+    // Wait for completion.
     let ok = common::wait_for_history(
         store.clone(),
         inst,
