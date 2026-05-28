@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/duroxide.svg)](https://crates.io/crates/duroxide)
 [![Documentation](https://docs.rs/duroxide/badge.svg)](https://docs.rs/duroxide)
 
-> Notice: This is a "preview" version.
+> **Preview:** This project is currently in preview.
 
 **Duroxide is a lightweight, embeddable durable execution runtime for Rust.**
 
