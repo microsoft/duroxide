@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Run the full duroxide test suite in two passes:
 #   Pass 1: --all-features  (enables replay-version-test, runs v2 acceptance tests)
 #   Pass 2: no features      (runs v1 serde rejection tests — proves v2 events are rejected)

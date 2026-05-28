@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Async block pattern tests for simplified replay mode.
 //!
 //! These tests validate complex async block patterns including:

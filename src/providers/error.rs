@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 /// Provider-specific error with retry classification
 ///
 /// Providers return this error type to indicate whether an error should be retried.

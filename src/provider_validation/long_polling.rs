@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Long polling validation tests for providers.
 //!
 //! These tests verify correct polling behavior. Providers that don't support long polling

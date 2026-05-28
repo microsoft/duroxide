@@ -1,3 +1,6 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+
 -- Add last_updated_at_ms timestamp to kv_store entries.
 -- Set by the runtime at set_kv_value() time, persisted by the provider.
 -- Pre-existing rows default to 0 (unknown update time until rewritten).

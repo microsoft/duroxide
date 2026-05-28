@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Provider Validation Tests
 //!
 //! Comprehensive test suite for validating provider implementations.

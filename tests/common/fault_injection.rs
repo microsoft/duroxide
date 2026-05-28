@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Fault Injection Providers for Testing
 //!
 //! Provides wrapper providers that can inject faults for testing error handling,

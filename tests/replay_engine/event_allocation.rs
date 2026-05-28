@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Event ID Allocation Tests
 //!
 //! Tests verifying correct event ID assignment for new events.

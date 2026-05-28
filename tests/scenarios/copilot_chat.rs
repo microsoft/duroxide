@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Scenario test: "Chat with your orchestration"
 //!
 //! Demonstrates a conversational pattern where an external client sends typed

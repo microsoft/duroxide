@@ -1,3 +1,6 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+
 -- Add activity identity columns to worker_queue for efficient cancellation lookups
 -- These columns denormalize the activity identity from the work_item JSON
 

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Provider validation tests for custom status.
 //!
 //! These tests validate that a Provider implementation correctly handles

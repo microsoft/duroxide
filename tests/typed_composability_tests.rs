@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Tests verifying that `_typed()` schedule methods return `DurableFuture` and
 //! compose correctly with `ctx.join()`, `ctx.select2()`, and `DurableFuture::map()`.
 //!

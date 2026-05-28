@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! # Duroxide: Durable execution framework in Rust
 //!
 //! Duroxide is a framework for building reliable, long-running code based workflows that can survive

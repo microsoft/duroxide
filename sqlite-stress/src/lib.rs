@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! SQLite Stress Tests for Duroxide
 //!
 //! This library provides SQLite-specific stress test implementations for Duroxide,

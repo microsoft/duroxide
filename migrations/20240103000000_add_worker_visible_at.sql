@@ -1,3 +1,6 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+
 -- Add visible_at column to worker_queue for proper visibility control
 -- This mirrors the orchestrator_queue pattern where visibility and locking are separate concerns
 

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Runtime module: Mutex poisoning indicates a panic - all lock().unwrap()/expect() are intentional.
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Instrumented provider wrapper that adds metrics to any provider implementation.
 
 use async_trait::async_trait;

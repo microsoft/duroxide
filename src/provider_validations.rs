@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Provider Validation Infrastructure
 //!
 //! This module provides reusable test infrastructure for validating custom Provider implementations.

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Tests for schedule_activity_with_retry functionality
 //!
 //! This file contains:

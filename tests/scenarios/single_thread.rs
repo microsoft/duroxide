@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Single-thread runtime scenario tests
 //!
 //! These tests validate duroxide's behavior when running in tokio's

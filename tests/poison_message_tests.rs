@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Poison Message Handling Tests
 //!
 //! These tests validate the runtime behavior when messages exceed max_attempts.

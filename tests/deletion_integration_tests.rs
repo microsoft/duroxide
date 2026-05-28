@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Integration tests for deletion operations via Client API.
 //!
 //! These tests verify end-to-end deletion behavior with real orchestration execution.

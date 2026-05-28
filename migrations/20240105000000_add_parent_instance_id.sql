@@ -1,3 +1,6 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+
 -- Add parent_instance_id to instances table for cascading delete support
 -- NULL means this is a root orchestration, non-NULL means it's a sub-orchestration
 

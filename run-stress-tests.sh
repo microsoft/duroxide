@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Run Duroxide stress tests
 #
 # This script runs the stress test suite including:

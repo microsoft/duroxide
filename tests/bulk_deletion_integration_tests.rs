@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Integration tests for bulk delete instances operations via Client API.
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::clone_on_ref_ptr)]

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Provider validation tests for bulk delete instance operations.
 //!
 //! These tests verify that providers correctly implement the delete_instance_bulk API,

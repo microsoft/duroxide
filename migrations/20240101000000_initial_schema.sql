@@ -1,3 +1,6 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+
 -- Initial schema for Duroxide SQLite provider
 
 -- Instance metadata

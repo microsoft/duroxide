@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Partial Completion Tests
 //!
 //! Tests where history has schedule events but completions haven't arrived yet.

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Example demonstrating duroxide with observability enabled.
 //!
 //! This example shows how to configure structured logging and metrics

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Runtime limits and constants.
 //!
 //! Collect all hard limits in one place so they're easy to find, document,

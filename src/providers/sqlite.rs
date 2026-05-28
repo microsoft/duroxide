@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // SQLite provider: Mutex/lock operations should panic on poison
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]

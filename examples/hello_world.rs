@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Hello World Example - Start here to learn Duroxide basics
 //!
 //! This example demonstrates:

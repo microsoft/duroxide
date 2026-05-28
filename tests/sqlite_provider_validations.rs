@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Provider validation tests for SQLite
 //!
 //! This test file validates the SQLite provider using the reusable

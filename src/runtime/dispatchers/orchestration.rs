@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Orchestration dispatcher implementation for Runtime
 //!
 //! This module contains the orchestration dispatcher logic that:

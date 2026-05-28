@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Property-based tests using proptest to verify invariants
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::clone_on_ref_ptr)]

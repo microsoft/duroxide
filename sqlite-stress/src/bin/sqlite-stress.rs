@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! SQLite Stress Test Binary
 //!
 //! This binary runs the SQLite stress test suite across multiple configurations.

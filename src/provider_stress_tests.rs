@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Provider Stress Test Infrastructure
 //!
 //! This module provides reusable stress test infrastructure for validating custom Provider implementations

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Observability infrastructure for metrics and structured logging.
 //!
 //! This module provides metrics via the `metrics` facade crate and structured logging

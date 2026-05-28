@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Observability-focused tests covering tracing for activities and orchestrations.
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::clone_on_ref_ptr)]

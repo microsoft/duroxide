@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! End-to-end samples: start here to learn the API by example.
 //!
 //! Each test demonstrates a common orchestration pattern using

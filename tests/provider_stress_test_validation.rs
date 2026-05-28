@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Minimal validation test for the provider stress test infrastructure.
 //!
 //! This test just ensures the stress test infrastructure doesn't break.

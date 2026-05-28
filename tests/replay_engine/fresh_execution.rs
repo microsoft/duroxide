@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Fresh Execution Tests
 //!
 //! Tests where the orchestration starts from OrchestrationStarted with no prior schedule events.

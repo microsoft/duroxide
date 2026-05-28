@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Fan-Out/Fan-In Pattern Example
 //!
 //! This example demonstrates parallel execution of multiple activities

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Replay Engine Tests
 //!
 //! This module contains comprehensive tests for the ReplayEngine,

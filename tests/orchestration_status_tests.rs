@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Tests for OrchestrationStatus determination across all scenarios
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::clone_on_ref_ptr)]

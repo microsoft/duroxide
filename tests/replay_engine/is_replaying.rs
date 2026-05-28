@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! is_replaying State Tests
 //!
 //! Tests verifying the context's replay state tracking.

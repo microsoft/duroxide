@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Nondeterminism Detection Tests
 //!
 //! Tests verifying the engine detects replay mismatches.

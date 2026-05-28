@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Rolling deployment scenario tests
 //!
 //! These tests simulate real-world rolling deployment scenarios where:

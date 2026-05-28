@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Handler Panic Handling Tests
 //!
 //! Tests for orchestration panics.
