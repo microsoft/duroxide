@@ -2769,11 +2769,11 @@ impl OrchestrationContext {
         }
     }
 
-    /// Generate a new deterministic GUID.
+    /// Generate a new GUID.
     ///
-    /// This schedules a built-in activity that generates a unique identifier.
-    /// The GUID is deterministic across replays (the same value is returned
-    /// when the orchestration replays).
+    /// This schedules a built-in activity that generates a random version-4
+    /// UUID. The value is recorded in history, so the same GUID is returned
+    /// when the orchestration replays.
     ///
     /// # Example
     ///
@@ -2871,36 +2871,13 @@ impl OrchestrationContext {
     }
 }
 
-/// Generate a deterministic GUID for use in orchestrations.
+/// Generate a GUID for use in orchestrations.
 ///
-/// Uses timestamp + thread-local counter for uniqueness.
+/// Returns a random version-4 UUID. The value is produced once inside the
+/// built-in syscall activity and recorded in history, so the same value is
+/// returned on every replay.
 pub(crate) fn generate_guid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    // Thread-local counter for uniqueness within the same timestamp
-    thread_local! {
-        static COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-    let counter = COUNTER.with(|c| {
-        let val = c.get();
-        c.set(val.wrapping_add(1));
-        val
-    });
-
-    // Format as UUID-like string
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (timestamp >> 96) as u32,
-        ((timestamp >> 80) & 0xFFFF) as u16,
-        (counter & 0xFFFF) as u16,
-        ((timestamp >> 64) & 0xFFFF) as u16,
-        (timestamp & 0xFFFFFFFFFFFF) as u64
-    )
+    uuid::Uuid::new_v4().to_string()
 }
 
 impl OrchestrationContext {
