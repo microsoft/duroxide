@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leading groups were always zero and the rest was largely sequential). It now
   uses `uuid::Uuid::new_v4()`. The value is still recorded in history, so
   replays remain deterministic.
+- **SQLite provider lock tokens now use a random UUID** instead of
+  `nanos + process id`, removing a predictable-token pattern in work-item
+  ownership checks.
 
 ## [0.1.29] - 2026-05-08
 

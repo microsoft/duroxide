@@ -48,6 +48,20 @@ async fn test_new_guid() {
         let parts: Vec<&str> = output.split(',').collect();
         assert_eq!(parts.len(), 2);
         assert_ne!(parts[0], parts[1]);
+
+        // Guard the security-relevant contract: each value is a UUID v4, not the
+        // old predictable timestamp+counter scheme (which zeroed groups 1, 2, 4).
+        for guid in &parts {
+            let g: Vec<&str> = guid.split('-').collect();
+            assert_eq!(g.len(), 5, "expected 8-4-4-4-12 format, got {guid}");
+            assert_eq!(&g[2][0..1], "4", "{guid} is not a UUID v4");
+            let variant = u8::from_str_radix(&g[3][0..1], 16).unwrap();
+            assert!((0x8..=0xb).contains(&variant), "{guid} has wrong variant");
+            assert!(
+                !(g[0] == "00000000" && g[1] == "0000"),
+                "{guid} matches the old timestamp-shift pattern"
+            );
+        }
     } else {
         panic!("Orchestration did not complete successfully: {status:?}");
     }

@@ -491,11 +491,7 @@ impl SqliteProvider {
 
     /// Generate a unique lock token
     fn generate_lock_token() -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after UNIX epoch")
-            .as_nanos();
-        format!("lock_{now}_{}", std::process::id())
+        format!("lock_{}", uuid::Uuid::new_v4())
     }
 
     /// Get current timestamp in milliseconds
