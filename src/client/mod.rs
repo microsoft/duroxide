@@ -168,6 +168,24 @@ pub struct Client {
     store: Arc<dyn Provider>,
 }
 
+/// Reject instance ids that collide with the reserved sub-orchestration markers.
+///
+/// Child sub-orchestration instance ids are auto-generated as
+/// `{parent}::sub::{event_id}` (see [`crate::build_child_instance_id`]). A
+/// user-supplied id matching that form could pre-occupy a future child id, so
+/// the `sub::` prefix and `::sub::` infix are reserved. Other uses of `::` remain
+/// valid.
+fn validate_instance_id(instance: &str) -> Result<(), ClientError> {
+    if instance.starts_with(crate::SUB_ORCH_AUTO_PREFIX) || instance.contains("::sub::") {
+        return Err(ClientError::InvalidInput {
+            message: format!(
+                "instance id '{instance}' uses the reserved sub-orchestration marker 'sub::'"
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl Client {
     /// Create a client bound to a Provider instance.
     ///
@@ -211,6 +229,9 @@ impl Client {
     /// - Must be unique across all orchestrations
     /// - Can be any string (alphanumeric + hyphens recommended)
     /// - Reusing an instance ID that already exists will fail
+    /// - Must not use the reserved sub-orchestration marker `sub::` (as a prefix
+    ///   or in the `::sub::` form); these are reserved for auto-generated child
+    ///   instance ids. Such ids are rejected with [`ClientError::InvalidInput`].
     ///
     /// # Example
     ///
@@ -230,6 +251,8 @@ impl Client {
     ///
     /// # Errors
     ///
+    /// Returns `ClientError::InvalidInput` if the instance id uses the reserved
+    /// `sub::` marker.
     /// Returns `ClientError::Provider` if the provider fails to enqueue the orchestration.
     pub async fn start_orchestration(
         &self,
@@ -237,8 +260,10 @@ impl Client {
         orchestration: impl Into<String>,
         input: impl Into<String>,
     ) -> Result<(), ClientError> {
+        let instance = instance.into();
+        validate_instance_id(&instance)?;
         let item = WorkItem::StartOrchestration {
-            instance: instance.into(),
+            instance,
             orchestration: orchestration.into(),
             input: input.into(),
             version: None,
@@ -256,6 +281,8 @@ impl Client {
     ///
     /// # Errors
     ///
+    /// Returns `ClientError::InvalidInput` if the instance id uses the reserved
+    /// `sub::` marker.
     /// Returns `ClientError::Provider` if the provider fails to enqueue the orchestration.
     pub async fn start_orchestration_versioned(
         &self,
@@ -264,8 +291,10 @@ impl Client {
         version: impl Into<String>,
         input: impl Into<String>,
     ) -> Result<(), ClientError> {
+        let instance = instance.into();
+        validate_instance_id(&instance)?;
         let item = WorkItem::StartOrchestration {
-            instance: instance.into(),
+            instance,
             orchestration: orchestration.into(),
             input: input.into(),
             version: Some(version.into()),

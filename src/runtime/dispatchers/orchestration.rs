@@ -593,13 +593,18 @@ impl Runtime {
             || (temp_history_mgr.is_continued_as_new && !workitem_reader.is_continue_as_new)
         {
             warn!(instance = %instance, "Instance is terminal (completed/failed or CAN without start), acking batch without processing");
+            // If a StartOrchestration in this discarded batch is a sub-orchestration whose
+            // parent differs from this instance's own recorded parent, the instance id was
+            // reused for an unrelated child. Notify that parent with a SubOrchFailed so it
+            // fails fast instead of awaiting a completion that will never arrive.
+            let orchestrator_items = self.terminal_collision_notifications(&item).await;
             let _ = self
                 .ack_orchestration_with_changes(
                     lock_token,
                     item.execution_id,
                     vec![],
                     vec![],
-                    vec![],
+                    orchestrator_items,
                     ExecutionMetadata::default(),
                     vec![], // cancelled_activities - none for terminal instances
                 )
@@ -1398,5 +1403,63 @@ impl Runtime {
 
         // Record metrics for poison detection
         self.record_orchestration_poison();
+    }
+
+    /// Build `SubOrchFailed` notifications for a terminal instance that received a
+    /// `StartOrchestration` belonging to a different parent.
+    ///
+    /// Sub-orchestration child instance ids are auto-generated as
+    /// `{parent}::sub::{event_id}`. If that id already names a terminal instance, the
+    /// incoming `StartOrchestration` is discarded by the terminal fast-ack path. Without
+    /// this notification the scheduling parent would await a completion forever. We only
+    /// notify when the incoming work item's parent differs from the terminal instance's
+    /// own recorded parent, so genuine redelivery of a completed child's start (parent
+    /// already notified) does not spuriously fail the parent again.
+    async fn terminal_collision_notifications(&self, item: &crate::providers::OrchestrationItem) -> Vec<WorkItem> {
+        // The terminal instance's own parent, as recorded in its history.
+        let own_parent = item.history.iter().find_map(|e| match &e.kind {
+            EventKind::OrchestrationStarted {
+                parent_instance: Some(pi),
+                parent_id: Some(pid),
+                ..
+            } => Some((pi.clone(), *pid)),
+            _ => None,
+        });
+
+        let mut notifications = Vec::new();
+        for msg in &item.messages {
+            if let WorkItem::StartOrchestration {
+                parent_instance: Some(parent_instance),
+                parent_id: Some(parent_id),
+                ..
+            } = msg
+            {
+                // Skip genuine redelivery: same parent that already owns this instance.
+                if own_parent.as_ref() == Some(&(parent_instance.clone(), *parent_id)) {
+                    continue;
+                }
+                warn!(
+                    instance = %item.instance,
+                    parent_instance = %parent_instance,
+                    parent_id = %parent_id,
+                    "Sub-orchestration target instance id already exists and is terminal; notifying parent of failure"
+                );
+                let parent_execution_id = self.get_execution_id_for_instance(parent_instance, None).await;
+                notifications.push(WorkItem::SubOrchFailed {
+                    parent_instance: parent_instance.clone(),
+                    parent_execution_id,
+                    parent_id: *parent_id,
+                    details: crate::ErrorDetails::Application {
+                        kind: crate::AppErrorKind::OrchestrationFailed,
+                        message: format!(
+                            "sub-orchestration instance id '{}' already exists and is terminal",
+                            item.instance
+                        ),
+                        retryable: false,
+                    },
+                });
+            }
+        }
+        notifications
     }
 }
