@@ -57,9 +57,8 @@ async fn test_new_guid() {
 
 #[tokio::test]
 async fn test_new_guid_is_random_uuid_v4() {
-    // new_guid() should return a standard random UUID v4, not a structured
-    // timestamp+counter value. Assert RFC 4122 v4 structure and that values
-    // are unique and non-sequential.
+    // new_guid() should return random UUID v4s, not structured
+    // timestamp+counter values.
     let store = Arc::new(
         duroxide::providers::sqlite::SqliteProvider::new_in_memory()
             .await
@@ -101,21 +100,20 @@ async fn test_new_guid_is_random_uuid_v4() {
         assert_eq!(parts[4].len(), 12);
         assert!(g.chars().filter(|c| *c != '-').all(|c| c.is_ascii_hexdigit()));
 
-        // RFC 4122: version nibble (first char of group 3) must be '4'.
+        // Version nibble must be '4'.
         assert_eq!(&parts[2][0..1], "4", "guid {g} is not a UUID v4");
-        // Variant: high bits of group 4 must be 10xx => first nibble in 8..=b.
+        // Variant nibble must be 8..=b.
         let variant = u8::from_str_radix(&parts[3][0..1], 16).unwrap();
         assert!((0x8..=0xb).contains(&variant), "guid {g} has wrong variant");
 
-        // The old scheme always produced groups 1, 2, 4 = zero.
-        // A real v4 effectively never does. Assert they're not all-zero.
+        // The old scheme always zeroed groups 1, 2, 4; v4 effectively never does.
         assert!(
             !(parts[0] == "00000000" && parts[1] == "0000"),
             "guid {g} matches the old timestamp-shift pattern"
         );
     }
 
-    // All 16 must be unique (no sequential counter collisions / reuse).
+    // All 16 must be unique.
     let mut sorted = guids.clone();
     sorted.sort_unstable();
     sorted.dedup();

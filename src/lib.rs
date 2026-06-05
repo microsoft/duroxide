@@ -2769,13 +2769,11 @@ impl OrchestrationContext {
         }
     }
 
-    /// Generate a new random GUID (UUID v4).
+    /// Generate a new random GUID.
     ///
-    /// This schedules a built-in activity that generates a random identifier.
-    /// The value is recorded in history, so it is stable across replays (the
-    /// same value is returned when the orchestration replays) — this is a safe,
-    /// deterministic replacement for calling `Uuid::new_v4()` directly inside an
-    /// orchestration.
+    /// Schedules a built-in activity that returns a random UUID. The value is
+    /// recorded in history, so it is stable across replays — a replay-safe
+    /// replacement for calling `Uuid::new_v4()` directly in an orchestration.
     ///
     /// # Example
     ///
@@ -2873,11 +2871,10 @@ impl OrchestrationContext {
     }
 }
 
-/// Generate a random GUID (UUID v4) for use in orchestrations.
+/// Generate a random GUID for use in orchestrations.
 ///
-/// The value is generated once inside the built-in syscall activity and
-/// persisted in history, so replays deterministically return the recorded
-/// value — using a random value here does not break replay determinism.
+/// Recorded in history by the syscall activity, so replays return the same
+/// value — using a random value here does not break determinism.
 pub(crate) fn generate_guid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
