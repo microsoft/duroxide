@@ -820,7 +820,7 @@ ctx.trace_error("Payment failed");
 #### System Calls (Deterministic Non-Determinism)
 
 ```rust
-// Generate deterministic GUID
+// Generate a random (UUID v4) GUID, recorded in history so it is replay-stable
 async fn new_guid(&self) -> Result<String, String>
 
 // Get deterministic UTC timestamp

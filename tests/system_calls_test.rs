@@ -56,6 +56,75 @@ async fn test_new_guid() {
 }
 
 #[tokio::test]
+async fn test_new_guid_is_random_uuid_v4() {
+    // new_guid() should return a standard random UUID v4, not a structured
+    // timestamp+counter value. Assert RFC 4122 v4 structure and that values
+    // are unique and non-sequential.
+    let store = Arc::new(
+        duroxide::providers::sqlite::SqliteProvider::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    let activities = ActivityRegistry::builder().build();
+
+    let orchestrations = OrchestrationRegistry::builder()
+        .register("ManyGuids", |ctx: OrchestrationContext, _input: String| async move {
+            let mut out = Vec::new();
+            for _ in 0..16 {
+                out.push(ctx.new_guid().await?);
+            }
+            Ok(out.join(","))
+        })
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = duroxide::Client::new(store.clone());
+    client.start_orchestration("many-guids", "ManyGuids", "").await.unwrap();
+    let status = client
+        .wait_for_orchestration("many-guids", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    let duroxide::runtime::OrchestrationStatus::Completed { output, .. } = status else {
+        panic!("orchestration did not complete: {status:?}");
+    };
+    let guids: Vec<&str> = output.split(',').collect();
+    assert_eq!(guids.len(), 16);
+
+    for g in &guids {
+        let parts: Vec<&str> = g.split('-').collect();
+        assert_eq!(parts.len(), 5, "expected 8-4-4-4-12 format, got {g}");
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+        assert!(g.chars().filter(|c| *c != '-').all(|c| c.is_ascii_hexdigit()));
+
+        // RFC 4122: version nibble (first char of group 3) must be '4'.
+        assert_eq!(&parts[2][0..1], "4", "guid {g} is not a UUID v4");
+        // Variant: high bits of group 4 must be 10xx => first nibble in 8..=b.
+        let variant = u8::from_str_radix(&parts[3][0..1], 16).unwrap();
+        assert!((0x8..=0xb).contains(&variant), "guid {g} has wrong variant");
+
+        // The old scheme always produced groups 1, 2, 4 = zero.
+        // A real v4 effectively never does. Assert they're not all-zero.
+        assert!(
+            !(parts[0] == "00000000" && parts[1] == "0000"),
+            "guid {g} matches the old timestamp-shift pattern"
+        );
+    }
+
+    // All 16 must be unique (no sequential counter collisions / reuse).
+    let mut sorted = guids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 16, "guids are not all unique");
+
+    rt.shutdown(None).await;
+}
+
+#[tokio::test]
 async fn test_utc_now_ms() {
     let store = Arc::new(
         duroxide::providers::sqlite::SqliteProvider::new_in_memory()

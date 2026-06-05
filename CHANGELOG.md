@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`ctx.new_guid()` now returns a standard UUID v4.** The previous
+  implementation derived the value from `SystemTime::now()` nanoseconds plus a
+  thread-local counter, which produced low-entropy, structured values (the
+  leading groups were always zero and the rest was largely sequential). It now
+  uses `uuid::Uuid::new_v4()`. The value is still recorded in history, so
+  replays remain deterministic.
+
 ## [0.1.29] - 2026-05-08
 
 **Release:** <https://crates.io/crates/duroxide/0.1.29>
