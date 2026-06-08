@@ -873,6 +873,24 @@ pub fn is_auto_generated_sub_orch_id(instance: &str) -> bool {
     instance.starts_with(SUB_ORCH_AUTO_PREFIX)
 }
 
+/// Build the auto-generated sub-orchestration suffix for a given parent execution
+/// and scheduling event id.
+///
+/// The first execution uses `sub::{event_id}` for backward compatibility. Later
+/// executions (after `continue_as_new`) include the execution id as
+/// `sub::{execution_id}_{event_id}`: event ids reset on continue-as-new, so a parent
+/// that schedules a sub-orchestration at the same position on each iteration would
+/// otherwise regenerate an identical child id and collide with the now-terminal
+/// child from the previous iteration.
+#[inline]
+pub(crate) fn auto_sub_orch_suffix(execution_id: u64, event_id: u64) -> String {
+    if execution_id == INITIAL_EXECUTION_ID {
+        format!("{SUB_ORCH_AUTO_PREFIX}{event_id}")
+    } else {
+        format!("{SUB_ORCH_AUTO_PREFIX}{execution_id}_{event_id}")
+    }
+}
+
 /// Build the full child instance ID, adding parent prefix only for auto-generated IDs.
 ///
 /// - Auto-generated IDs (starting with "sub::"): `{parent}::{child}` (e.g., `parent-1::sub::5`)

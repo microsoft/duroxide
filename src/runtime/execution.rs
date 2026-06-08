@@ -85,6 +85,12 @@ impl Runtime {
         // Execute orchestration turn
         let messages = &workitem_reader.completion_messages;
 
+        // Record this instance's current execution id so sub-orchestrations scheduled in
+        // this turn route their completions back to the right execution. A turn that only
+        // schedules a sub-orchestration would otherwise leave a post-continue-as-new
+        // execution unrecorded, dropping the child's completion.
+        self.get_execution_id_for_instance(instance, Some(execution_id)).await;
+
         debug!(
             instance = %instance,
             message_count = messages.len(),
