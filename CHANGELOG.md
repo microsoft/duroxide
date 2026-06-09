@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or contain `::sub::`; other uses of `::` remain supported. Applications that used
   the reserved marker in root instance ids must rename those ids before upgrading.
   See [docs/migration-guide.md](docs/migration-guide.md) for guidance.
+- **`ctx.new_guid()` now returns a standard UUID v4.** The previous
+  implementation derived the value from `SystemTime::now()` nanoseconds plus a
+  thread-local counter, which produced low-entropy, structured values (the
+  leading groups were always zero and the rest was largely sequential). It now
+  uses `uuid::Uuid::new_v4()`. The value is still recorded in history, so
+  replays remain deterministic.
+- **SQLite provider lock tokens now use a random UUID** instead of
+  `nanos + process id`, removing a predictable-token pattern in work-item
+  ownership checks.
 
 ### Fixed
 

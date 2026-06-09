@@ -48,6 +48,13 @@ async fn test_new_guid() {
         let parts: Vec<&str> = output.split(',').collect();
         assert_eq!(parts.len(), 2);
         assert_ne!(parts[0], parts[1]);
+
+        // Guard the security-relevant contract: each value is a standard UUID v4,
+        // not the old predictable timestamp+counter scheme.
+        for guid in &parts {
+            let parsed = uuid::Uuid::parse_str(guid).unwrap_or_else(|e| panic!("{guid} is not a valid UUID: {e}"));
+            assert_eq!(parsed.get_version_num(), 4, "{guid} is not a UUID v4");
+        }
     } else {
         panic!("Orchestration did not complete successfully: {status:?}");
     }

@@ -14,7 +14,7 @@ waits 30 days looks exactly like one that waits 30 milliseconds — and if the
 process dies in the middle, it resumes right where it left off, without
 re-running the work it already finished.
 
-Inspired by the [Durable Task Framework](https://github.com/Azure/durabletask)
+Inspired by the [Durable Task Framework](https://aka.ms/durabletask)
 and [Temporal](https://temporal.io/).
 
 ### What you get

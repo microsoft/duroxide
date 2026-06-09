@@ -550,7 +550,7 @@ Some operations are provided as **built-in activities** (under reserved names) s
 `ActivityScheduled` + `ActivityCompleted` event flow as user activities. This ensures replay determinism
 without special-case logic in the replay engine.
 
-- `ctx.new_guid()` – Generate a deterministic UUID
+- `ctx.new_guid()` – Generate a random UUID (recorded in history, so replay-stable)
 - `ctx.utc_now()` – Get the current time (replay-safe)
 
 Example usage:

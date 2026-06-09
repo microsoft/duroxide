@@ -325,7 +325,7 @@ async fn safe_orchestration(ctx: OrchestrationContext, count: i32) -> Result<Str
     // ✅ Logging (replay-safe)
     ctx.trace_info("Step completed");
     
-    // ✅ Deterministic GUIDs
+    // ✅ Replay-safe GUIDs
     let id = ctx.new_guid().await?;
     
     // ✅ Deterministic timestamps
@@ -441,7 +441,7 @@ fn schedule_activity_on_session_typed<In: Serialize, Out: DeserializeOwned>(
 ) -> impl Future<Output = Result<Out, String>>
 
 // Usage:
-let session_id = ctx.new_guid().await?;  // Deterministic, replay-safe
+let session_id = ctx.new_guid().await?;  // Random, replay-safe
 let result = ctx.schedule_activity_on_session("RunTurn", &input, &session_id).await?;
 ```
 
@@ -820,7 +820,7 @@ ctx.trace_error("Payment failed");
 #### System Calls (Deterministic Non-Determinism)
 
 ```rust
-// Generate deterministic GUID
+// Generate a random (UUID v4) GUID, recorded in history so it is replay-stable
 async fn new_guid(&self) -> Result<String, String>
 
 // Get deterministic UTC timestamp
