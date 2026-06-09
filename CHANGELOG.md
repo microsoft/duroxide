@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Reserved the `sub::` marker for runtime-generated sub-orchestration instance ids.
+  `Client::start_orchestration` and `Client::start_orchestration_versioned` now
+  return `ClientError::InvalidInput` for root instance ids that start with `sub::`
+  or contain `::sub::`; other uses of `::` remain supported. Applications that used
+  the reserved marker in root instance ids must rename those ids before upgrading.
+  See [docs/migration-guide.md](docs/migration-guide.md) for guidance.
+
+### Fixed
+
+- **Parent hang on sub-orchestration instance-id collision** — When an auto-generated
+  child instance id already named a terminal instance, the scheduling parent could await
+  a completion that never arrived. The runtime now notifies the parent with a
+  sub-orchestration failure so it fails fast. The failure (and all sub-orchestration
+  completion/failure notifications) is routed to the parent's current execution using
+  durable provider state instead of process-local memory, so routing stays correct across
+  runtime restarts and multiple dispatcher nodes.
+- **Sub-orchestration id reuse across continue-as-new** — Child instance ids generated
+  after a parent `continue_as_new` now include the parent execution id
+  (`{parent}::sub::{execution_id}_{event_id}`), preventing collisions with the terminal
+  child of a previous iteration that schedules at the same position.
+
 ## [0.1.29] - 2026-05-08
 
 **Release:** <https://crates.io/crates/duroxide/0.1.29>

@@ -2,6 +2,36 @@
 
 This guide helps you migrate between Duroxide versions and handle orchestration versioning.
 
+## Reserved `sub::` instance-id marker (Unreleased)
+
+The `sub::` marker is now reserved for runtime-generated sub-orchestration instance ids.
+`Client::start_orchestration` and `Client::start_orchestration_versioned` reject root
+instance ids that:
+
+- start with `sub::`, or
+- contain the `::sub::` infix.
+
+Such ids return `ClientError::InvalidInput`. Ordinary uses of `::` in instance ids remain
+valid (e.g. `tenant-7::order-42`); only the `sub::` marker is reserved.
+
+This prevents a root instance id from pre-occupying an auto-generated child id. Child
+sub-orchestration ids take the form `{parent}::sub::{event_id}` on the first parent
+execution and `{parent}::sub::{execution_id}_{event_id}` after `continue_as_new`.
+
+Before upgrading client code, audit your root instance-id scheme for the reserved marker:
+
+```text
+# Reject — start with `sub::` or contain `::sub::`
+sub::job-1
+tenant-7::sub::order-42
+
+# Accept — ordinary `::` is fine
+tenant-7::order-42
+order-2026-06-09
+```
+
+Rename any root instance ids that use the reserved marker before upgrading.
+
 ## Orchestration Versioning
 
 Duroxide supports versioning to handle code evolution while maintaining compatibility with running instances.

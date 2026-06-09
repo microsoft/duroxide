@@ -170,11 +170,12 @@ pub struct Client {
 
 /// Reject instance ids that collide with the reserved sub-orchestration markers.
 ///
-/// Child sub-orchestration instance ids are auto-generated as
-/// `{parent}::sub::{event_id}` (see [`crate::build_child_instance_id`]). A
-/// user-supplied id matching that form could pre-occupy a future child id, so
-/// the `sub::` prefix and `::sub::` infix are reserved. Other uses of `::` remain
-/// valid.
+/// Child sub-orchestration instance ids reserve the `sub::` marker (see
+/// [`crate::auto_sub_orch_suffix`], the canonical formatter). The first parent
+/// execution uses `{parent}::sub::{event_id}`; executions after continue-as-new use
+/// `{parent}::sub::{execution_id}_{event_id}`. A user-supplied id matching either form
+/// could pre-occupy a future child id, so the `sub::` prefix and `::sub::` infix are
+/// reserved. Other uses of `::` remain valid.
 fn validate_instance_id(instance: &str) -> Result<(), ClientError> {
     if instance.starts_with(crate::SUB_ORCH_AUTO_PREFIX) || instance.contains("::sub::") {
         return Err(ClientError::InvalidInput {

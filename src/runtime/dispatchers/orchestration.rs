@@ -1378,7 +1378,7 @@ impl Runtime {
                 parent_id = %parent_id,
                 "Enqueue SubOrchFailed to parent (poison)"
             );
-            let parent_execution_id = self.get_execution_id_for_instance(&parent_instance, None).await;
+            let parent_execution_id = self.parent_execution_id_for_routing(&parent_instance).await;
             vec![WorkItem::SubOrchFailed {
                 parent_instance,
                 parent_execution_id,
@@ -1408,13 +1408,15 @@ impl Runtime {
     /// Build `SubOrchFailed` notifications for a terminal instance that received a
     /// `StartOrchestration` belonging to a different parent.
     ///
-    /// Sub-orchestration child instance ids are auto-generated as
-    /// `{parent}::sub::{event_id}`. If that id already names a terminal instance, the
-    /// incoming `StartOrchestration` is discarded by the terminal fast-ack path. Without
-    /// this notification the scheduling parent would await a completion forever. We only
-    /// notify when the incoming work item's parent differs from the terminal instance's
-    /// own recorded parent, so genuine redelivery of a completed child's start (parent
-    /// already notified) does not spuriously fail the parent again.
+    /// Sub-orchestration child instance ids reserve the `sub::` marker (see
+    /// [`crate::auto_sub_orch_suffix`]): the first parent execution uses
+    /// `{parent}::sub::{event_id}` and executions after continue-as-new use
+    /// `{parent}::sub::{execution_id}_{event_id}`. If such an id already names a terminal
+    /// instance, the incoming `StartOrchestration` is discarded by the terminal fast-ack
+    /// path. Without this notification the scheduling parent would await a completion
+    /// forever. We only notify when the incoming work item's parent differs from the
+    /// terminal instance's own recorded parent, so genuine redelivery of a completed
+    /// child's start (parent already notified) does not spuriously fail the parent again.
     async fn terminal_collision_notifications(&self, item: &crate::providers::OrchestrationItem) -> Vec<WorkItem> {
         // The terminal instance's own parent, as recorded in its history.
         let own_parent = item.history.iter().find_map(|e| match &e.kind {
@@ -1444,7 +1446,7 @@ impl Runtime {
                     parent_id = %parent_id,
                     "Sub-orchestration target instance id already exists and is terminal; notifying parent of failure"
                 );
-                let parent_execution_id = self.get_execution_id_for_instance(parent_instance, None).await;
+                let parent_execution_id = self.parent_execution_id_for_routing(parent_instance).await;
                 notifications.push(WorkItem::SubOrchFailed {
                     parent_instance: parent_instance.clone(),
                     parent_execution_id,

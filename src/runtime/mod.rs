@@ -6,7 +6,6 @@
 //
 use crate::providers::{ExecutionMetadata, Provider, WorkItem};
 use crate::{Event, EventKind, OrchestrationContext};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -492,8 +491,6 @@ pub struct Runtime {
     joins: Mutex<Vec<JoinHandle<()>>>,
     history_store: Arc<dyn Provider>,
     orchestration_registry: OrchestrationRegistry,
-    /// Track the current execution ID for each active instance
-    current_execution_ids: Mutex<HashMap<String, u64>>,
     /// Shutdown flag checked by dispatchers
     shutdown_flag: Arc<AtomicBool>,
     /// Runtime configuration options
@@ -842,28 +839,32 @@ impl Runtime {
         None
     }
 
-    /// Get the current execution ID for an instance, or fetch from store if not tracked
+    /// Resolve a parent instance's current execution id for routing a sub-orchestration
+    /// completion or failure back to it.
     ///
-    /// If `current_execution_id` is provided and the instance matches, use it directly.
-    /// Otherwise, check in-memory tracking, then fall back to INITIAL_EXECUTION_ID.
-    async fn get_execution_id_for_instance(&self, instance: &str, current_execution_id: Option<u64>) -> u64 {
-        // If this is the current instance being processed, use the provided execution_id
-        if let Some(exec_id) = current_execution_id {
-            // Update in-memory tracking for future calls
-            self.current_execution_ids
-                .lock()
-                .await
-                .insert(instance.to_string(), exec_id);
-            return exec_id;
+    /// Reads the durable execution id from the provider rather than process-local memory,
+    /// so routing is correct when a restarted runtime or a different dispatcher node emits
+    /// the notification. A misrouted notification (e.g. defaulting to execution 1 while the
+    /// parent is on execution 2+) is filtered out during replay and would leave the parent
+    /// awaiting forever. `Provider::read` returns the parent's current-execution history, so
+    /// any event's `execution_id` is the current one. On a read error (or no history yet) we
+    /// fall back to `INITIAL_EXECUTION_ID`.
+    async fn parent_execution_id_for_routing(&self, parent_instance: &str) -> u64 {
+        match self.history_store.read(parent_instance).await {
+            Ok(events) => events
+                .iter()
+                .map(|e| e.execution_id)
+                .max()
+                .unwrap_or(crate::INITIAL_EXECUTION_ID),
+            Err(e) => {
+                tracing::warn!(
+                    parent_instance = %parent_instance,
+                    error = %e,
+                    "failed to read parent history for sub-orchestration routing; defaulting to INITIAL_EXECUTION_ID"
+                );
+                crate::INITIAL_EXECUTION_ID
+            }
         }
-
-        // First check in-memory tracking
-        if let Some(&exec_id) = self.current_execution_ids.lock().await.get(instance) {
-            return exec_id;
-        }
-
-        // Fall back to INITIAL_EXECUTION_ID (no longer querying Provider::latest_execution_id)
-        crate::INITIAL_EXECUTION_ID
     }
 
     /// Start a new runtime using the in-memory SQLite provider.
@@ -971,7 +972,6 @@ impl Runtime {
             joins: Mutex::new(joins),
             history_store,
             orchestration_registry,
-            current_execution_ids: Mutex::new(HashMap::new()),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
 
             options,

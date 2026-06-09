@@ -85,12 +85,6 @@ impl Runtime {
         // Execute orchestration turn
         let messages = &workitem_reader.completion_messages;
 
-        // Record this instance's current execution id so sub-orchestrations scheduled in
-        // this turn route their completions back to the right execution. A turn that only
-        // schedules a sub-orchestration would otherwise leave a post-continue-as-new
-        // execution unrecorded, dropping the child's completion.
-        self.get_execution_id_for_instance(instance, Some(execution_id)).await;
-
         debug!(
             instance = %instance,
             message_count = messages.len(),
@@ -157,7 +151,6 @@ impl Runtime {
                             session_id,
                             tag,
                         } => {
-                            let execution_id = self.get_execution_id_for_instance(instance, Some(execution_id)).await;
                             worker_items.push(WorkItem::ActivityExecute {
                                 instance: instance.to_string(),
                                 execution_id,
@@ -172,8 +165,6 @@ impl Runtime {
                             scheduling_event_id,
                             fire_at_ms,
                         } => {
-                            let execution_id = self.get_execution_id_for_instance(instance, Some(execution_id)).await;
-
                             // Enqueue TimerFired to orchestrator queue with delayed visibility
                             // Provider will use fire_at_ms for the visible_at timestamp
                             // Note: fire_at_ms is computed at scheduling time (wall-clock),
@@ -250,7 +241,7 @@ impl Runtime {
                     tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, parent_instance=%parent_instance, parent_id=%parent_id, "Enqueue SubOrchCompleted to parent");
                     orchestrator_items.push(WorkItem::SubOrchCompleted {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.get_execution_id_for_instance(&parent_instance, None).await,
+                        parent_execution_id: self.parent_execution_id_for_routing(&parent_instance).await,
                         parent_id,
                         result: output.clone(),
                     });
@@ -283,7 +274,7 @@ impl Runtime {
                     tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, parent_instance=%parent_instance, parent_id=%parent_id, "Enqueue SubOrchFailed to parent");
                     orchestrator_items.push(WorkItem::SubOrchFailed {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.get_execution_id_for_instance(&parent_instance, None).await,
+                        parent_execution_id: self.parent_execution_id_for_routing(&parent_instance).await,
                         parent_id,
                         details: details.clone(),
                     });
@@ -370,7 +361,7 @@ impl Runtime {
                 if let Some((parent_instance, parent_id)) = parent_link {
                     orchestrator_items.push(WorkItem::SubOrchFailed {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.get_execution_id_for_instance(&parent_instance, None).await,
+                        parent_execution_id: self.parent_execution_id_for_routing(&parent_instance).await,
                         parent_id,
                         details: details.clone(),
                     });
