@@ -1,6 +1,3 @@
--- Copyright (c) Microsoft Corporation.
--- Licensed under the MIT License.
-
 -- KV store: instance-scoped key-value pairs, materialized from history events.
 -- Primary key is (instance_id, key) — only the latest value per key is stored.
 -- execution_id tracks which execution last wrote this key (for pruning).

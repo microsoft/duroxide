@@ -203,20 +203,14 @@ that fits how you want to author and host your workflows:
   are available (SQLite built-in, PostgreSQL via
   [duroxide-pg](https://github.com/microsoft/duroxide-pg), or bring your own).
 - **[duroxide-python](https://github.com/microsoft/duroxide-python)** — Python
-  SDK over the Duroxide runtime. Use this when you want to author workflows in
+  SDK over the duroxide runtime. Use this when you want to author workflows in
   **Python**.
 - **[duroxide-node](https://github.com/microsoft/duroxide-node)** — Node.js /
-  TypeScript SDK over the Duroxide runtime. Use this when you want to author
+  TypeScript SDK over the duroxide runtime. Use this when you want to author
   workflows in **JavaScript / TypeScript**.
 - **[duroxide-pg](https://github.com/microsoft/duroxide-pg)** — PostgreSQL
-  provider for the Duroxide runtime. Plug this into duroxide / duroxide-python /
+  provider for the duroxide runtime. Plug this into duroxide / duroxide-python /
   duroxide-node when you want **PostgreSQL** as the durable store.
-
-### Notes
-- Import as `duroxide` in Rust source.
-- Timers are real time (Tokio sleep). External events are via `Runtime::raise_event`.
-- Unknown-instance messages are logged and dropped. Providers persist history only (queues are in-memory runtime components).
-- Logging is replay-safe by treating it as a system activity via `ctx.trace_*` helpers; logs are emitted through tracing at completion time (not persisted as history events).
 
 ## Learn more
 

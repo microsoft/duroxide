@@ -1,6 +1,3 @@
--- Copyright (c) Microsoft Corporation.
--- Licensed under the MIT License.
-
 -- Add session_id column to worker_queue for session-based worker affinity routing
 ALTER TABLE worker_queue ADD COLUMN session_id TEXT;
 CREATE INDEX idx_worker_queue_session ON worker_queue(session_id);

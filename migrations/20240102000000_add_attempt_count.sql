@@ -1,6 +1,3 @@
--- Copyright (c) Microsoft Corporation.
--- Licensed under the MIT License.
-
 -- Add attempt_count column for poison message detection
 
 -- Add attempt_count to orchestrator_queue (non-negative integer)

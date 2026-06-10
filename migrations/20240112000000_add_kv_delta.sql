@@ -1,6 +1,3 @@
--- Copyright (c) Microsoft Corporation.
--- Licensed under the MIT License.
-
 -- KV delta table: captures KV mutations from the current execution only.
 -- Values are merged into kv_store on execution completion (Completed, CAN, Failed).
 -- Snapshot seeding reads from kv_store only (prior-execution state).
