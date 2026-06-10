@@ -23,7 +23,7 @@ Please do not report security vulnerabilities through public GitHub issues. Foll
 ## Before submitting changes
 
 - Code
-  - [ ] Build passes locally (`cargo nt`)
+  - [ ] Build passes locally (`cargo test`)
   - [ ] Lints/clippy (if applicable) are clean
   - [ ] Tests added or updated for behavior changes
 - Documentation
@@ -35,7 +35,7 @@ Please do not report security vulnerabilities through public GitHub issues. Foll
 
 ## Development workflow
 
-- Write or update tests first for behavior changes (happy path + 1-2 edge cases).
+- Write or update tests first (happy path + 1-2 edge cases).
 - Keep public APIs stable where possible; note breakages clearly.
 - Prefer small, focused commits with descriptive messages.
 - For non-trivial changes, include a short design rationale in the pull request description with code pointers.
@@ -44,7 +44,7 @@ Please do not report security vulnerabilities through public GitHub issues. Foll
 Before opening a pull request, run the checks relevant to your change:
 
 ```bash
-cargo nt
+cargo test
 cargo clippy --all-targets --all-features
 cargo test --doc
 ```
