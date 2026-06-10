@@ -224,8 +224,10 @@ that fits how you want to author and host your workflows:
 ## Development
 
 ```bash
-cargo build                          # Build
-cargo test --all -- --nocapture      # Run all tests
+cargo build --all-features           # Build
+cargo nt                             # Run regular tests with nextest
+cargo test --doc --all-features      # Run doctests
+./run-tests.sh                       # Full two-pass CI test suite
 ./run-stress-tests.sh                # Stress tests (see STRESS_TEST_MONITORING.md)
 ```
 

@@ -23,7 +23,7 @@ Please do not report security vulnerabilities through public GitHub issues. Foll
 ## Before submitting changes
 
 - Code
-  - [ ] Build passes locally (`cargo test`)
+  - [ ] Regular tests pass locally (`cargo nt`)
   - [ ] Lints/clippy (if applicable) are clean
   - [ ] Tests added or updated for behavior changes
 - Documentation
@@ -44,9 +44,9 @@ Please do not report security vulnerabilities through public GitHub issues. Foll
 Before opening a pull request, run the checks relevant to your change:
 
 ```bash
-cargo test
+cargo nt
 cargo clippy --all-targets --all-features
-cargo test --doc
+cargo test --doc --all-features
 ```
 
 For broader runtime changes, also run the comprehensive two-pass suite:
