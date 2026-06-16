@@ -8,6 +8,7 @@
 use super::helpers::*;
 use async_trait::async_trait;
 use duroxide::{OrchestrationContext, OrchestrationHandler};
+use duroxide::runtime::replay_engine::ReplayEngine;
 use std::sync::Arc;
 
 /// Auto-generated instance ID should be sub::{event_id}.
@@ -38,6 +39,30 @@ fn auto_instance_id() {
         } => {
             // Instance should be sub::{event_id}
             assert_eq!(instance, &format!("sub::{scheduling_event_id}"));
+        }
+        _ => panic!("Expected StartSubOrchestration action"),
+    }
+}
+
+/// Auto-generated instance ID includes execution_id after continue-as-new generations.
+#[test]
+fn auto_instance_id_includes_execution_id_for_later_generations() {
+    let mut started = started_event(1); // OrchestrationStarted
+    started.execution_id = 2;
+    let history = vec![started];
+    let mut engine = ReplayEngine::new(TEST_INSTANCE.to_string(), 2, history);
+    let result = execute(&mut engine, SubOrchHandler::new("Child", "child-input"));
+
+    assert_continue(&result);
+
+    assert_eq!(engine.pending_actions().len(), 1);
+    match &engine.pending_actions()[0] {
+        duroxide::Action::StartSubOrchestration {
+            instance,
+            scheduling_event_id,
+            ..
+        } => {
+            assert_eq!(instance, &format!("sub::2.{scheduling_event_id}"));
         }
         _ => panic!("Expected StartSubOrchestration action"),
     }

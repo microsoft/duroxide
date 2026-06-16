@@ -57,8 +57,8 @@ There are two modes for child instance ID assignment:
 
 **Auto-generated (default):**
 - Use `schedule_sub_orchestration()` - no instance ID parameter
-- Runtime generates `instance = "sub::{event_id}"` and prefixes with parent: `"{parent_instance}::sub::{id}"`
-- This guarantees the same child id on replays and prevents collisions across parents
+- Runtime generates `instance = "sub::{event_id}"` for execution 1, and `instance = "sub::{execution_id}.{event_id}"` for later continue-as-new executions; then prefixes with parent.
+- This guarantees the same child id on replays and prevents collisions across parents and continue-as-new generations.
 
 **Explicit:**
 - Use `schedule_sub_orchestration_with_id("Child", "my-instance-id", input)`
@@ -161,5 +161,4 @@ let root = |ctx: OrchestrationContext, input: String| async move {
 - API to specify explicit child instance ids.
 - Provider-backed durable completion routing (enqueue `SubOrchCompleted/Failed` items), leasing, DLQ.
 - Visualization: render sub-orchestration edges in Mermaid diagrams under each parent.
-
 

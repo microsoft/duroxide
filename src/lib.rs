@@ -862,7 +862,9 @@ pub const INITIAL_EVENT_ID: u64 = 1;
 pub const SUB_ORCH_AUTO_PREFIX: &str = "sub::";
 
 /// Prefix for placeholder instance IDs before event ID assignment.
-/// These are replaced with `sub::{event_id}` during action processing.
+/// These are replaced during action processing:
+/// - execution 1: `sub::{event_id}`
+/// - execution N>1: `sub::{execution_id}.{event_id}`
 pub(crate) const SUB_ORCH_PENDING_PREFIX: &str = "sub::pending_";
 
 /// Determine if a sub-orchestration instance ID is auto-generated (needs parent prefix).

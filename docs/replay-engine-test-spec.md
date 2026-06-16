@@ -253,7 +253,8 @@ Tests for deterministic child instance ID.
 
 | Test | Baseline | Handler | Expected |
 |------|----------|---------|----------|
-| `auto_instance_id` | `[Started]` | `schedule_sub_orchestration("Child", input)` | Instance = `sub::{event_id}` |
+| `auto_instance_id` | `[Started]` | `schedule_sub_orchestration("Child", input)` | Instance = `sub::{event_id}` (execution 1) |
+| `auto_instance_id_includes_execution_id_for_later_generations` | `[Started(execution=2)]` | `schedule_sub_orchestration("Child", input)` | Instance = `sub::2.{event_id}` |
 | `explicit_instance_preserved` | `[Started]` | `schedule_sub_orchestration_with_instance("my-id", ...)` | Instance = "my-id" |
 | `replay_uses_history_instance` | `[Started, SubOrchScheduled{instance:"sub::2"}]` | Same schedule | Binds to same instance |
 
