@@ -270,6 +270,7 @@ impl Client {
             version: None,
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
         self.store
@@ -301,6 +302,7 @@ impl Client {
             version: Some(version.into()),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
         self.store

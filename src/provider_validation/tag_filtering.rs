@@ -581,6 +581,7 @@ pub async fn test_tag_preserved_through_ack_orchestration_item(factory: &dyn Pro
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },

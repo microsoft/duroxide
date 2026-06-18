@@ -1091,6 +1091,7 @@ impl Runtime {
                     input: workitem_reader.input.clone(),
                     parent_instance: workitem_reader.parent_instance.clone(),
                     parent_id: workitem_reader.parent_id,
+                    parent_execution_id: workitem_reader.parent_execution_id,
                     carry_forward_events,
                     initial_custom_status,
                 },
@@ -1285,47 +1286,50 @@ impl Runtime {
         let mut history_mgr = HistoryManager::from_history(&item.history);
 
         // Track parent info for sub-orchestration failure notification
-        let mut parent_link: Option<(String, u64)> = None;
+        let mut parent_link: Option<(String, Option<u64>, u64)> = None;
 
         // If history is empty, we need to create an OrchestrationStarted event first
         if history_mgr.is_empty() {
             // Try to extract orchestration name from work items
-            let (orchestration_name, input, parent_instance, parent_id, carry_forward_events) = item
-                .messages
-                .iter()
-                .find_map(|msg| match msg {
-                    WorkItem::StartOrchestration {
-                        orchestration,
-                        input,
-                        parent_instance,
-                        parent_id,
-                        ..
-                    } => Some((
-                        orchestration.clone(),
-                        input.clone(),
-                        parent_instance.clone(),
-                        *parent_id,
-                        None,
-                    )),
-                    WorkItem::ContinueAsNew {
-                        orchestration,
-                        input,
-                        carry_forward_events,
-                        ..
-                    } => Some((
-                        orchestration.clone(),
-                        input.clone(),
-                        None,
-                        None,
-                        Some(carry_forward_events.clone()),
-                    )),
-                    _ => None,
-                })
-                .unwrap_or_else(|| (item.orchestration_name.clone(), String::new(), None, None, None));
+            let (orchestration_name, input, parent_instance, parent_id, parent_execution_id, carry_forward_events) =
+                item.messages
+                    .iter()
+                    .find_map(|msg| match msg {
+                        WorkItem::StartOrchestration {
+                            orchestration,
+                            input,
+                            parent_instance,
+                            parent_id,
+                            parent_execution_id,
+                            ..
+                        } => Some((
+                            orchestration.clone(),
+                            input.clone(),
+                            parent_instance.clone(),
+                            *parent_id,
+                            *parent_execution_id,
+                            None,
+                        )),
+                        WorkItem::ContinueAsNew {
+                            orchestration,
+                            input,
+                            carry_forward_events,
+                            ..
+                        } => Some((
+                            orchestration.clone(),
+                            input.clone(),
+                            None,
+                            None,
+                            None,
+                            Some(carry_forward_events.clone()),
+                        )),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| (item.orchestration_name.clone(), String::new(), None, None, None, None));
 
             // Save parent link for notification
             if let (Some(pi), Some(pid)) = (&parent_instance, parent_id) {
-                parent_link = Some((pi.clone(), pid));
+                parent_link = Some((pi.clone(), parent_execution_id, pid));
             }
 
             history_mgr.append(Event::with_event_id(
@@ -1339,6 +1343,7 @@ impl Runtime {
                     input,
                     parent_instance,
                     parent_id,
+                    parent_execution_id,
                     carry_forward_events,
                     initial_custom_status: None,
                 },
@@ -1349,10 +1354,11 @@ impl Runtime {
                 if let EventKind::OrchestrationStarted {
                     parent_instance: Some(pi),
                     parent_id: Some(pid),
+                    parent_execution_id,
                     ..
                 } = &event.kind
                 {
-                    parent_link = Some((pi.clone(), *pid));
+                    parent_link = Some((pi.clone(), *parent_execution_id, *pid));
                     break;
                 }
             }
@@ -1365,12 +1371,12 @@ impl Runtime {
             output: Some(error.display_message()),
             orchestration_name: Some(item.orchestration_name.clone()),
             orchestration_version: Some(item.version.clone()),
-            parent_instance_id: parent_link.as_ref().map(|(pi, _)| pi.clone()),
+            parent_instance_id: parent_link.as_ref().map(|(pi, _, _)| pi.clone()),
             pinned_duroxide_version: None, // Poison path — version already set at creation
         };
 
         // If this is a sub-orchestration, notify parent of failure
-        let orchestrator_items = if let Some((parent_instance, parent_id)) = parent_link {
+        let orchestrator_items = if let Some((parent_instance, parent_execution_id, parent_id)) = parent_link {
             tracing::debug!(
                 target = "duroxide::runtime::execution",
                 instance = %item.instance,
@@ -1378,7 +1384,7 @@ impl Runtime {
                 parent_id = %parent_id,
                 "Enqueue SubOrchFailed to parent (poison)"
             );
-            let parent_execution_id = self.parent_execution_id_for_routing(&parent_instance).await;
+            let parent_execution_id = self.resolve_parent_execution_id(&parent_instance, parent_execution_id).await;
             vec![WorkItem::SubOrchFailed {
                 parent_instance,
                 parent_execution_id,
@@ -1433,6 +1439,7 @@ impl Runtime {
             if let WorkItem::StartOrchestration {
                 parent_instance: Some(parent_instance),
                 parent_id: Some(parent_id),
+                parent_execution_id,
                 ..
             } = msg
             {
@@ -1446,7 +1453,11 @@ impl Runtime {
                     parent_id = %parent_id,
                     "Sub-orchestration target instance id already exists and is terminal; notifying parent of failure"
                 );
-                let parent_execution_id = self.parent_execution_id_for_routing(parent_instance).await;
+                // Prefer the execution id stamped on the colliding start; fall back to a
+                // durable provider read for work items produced by older runtimes.
+                let parent_execution_id = self
+                    .resolve_parent_execution_id(parent_instance, *parent_execution_id)
+                    .await;
                 notifications.push(WorkItem::SubOrchFailed {
                     parent_instance: parent_instance.clone(),
                     parent_execution_id,

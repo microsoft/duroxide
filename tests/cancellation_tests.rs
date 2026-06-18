@@ -1236,6 +1236,7 @@ async fn cancel_before_orchestration_starts() {
                 input: "input".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: 1,
             },
             None,

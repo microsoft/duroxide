@@ -30,10 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Parent hang on sub-orchestration instance-id collision** — When an auto-generated
   child instance id already named a terminal instance, the scheduling parent could await
   a completion that never arrived. The runtime now notifies the parent with a
-  sub-orchestration failure so it fails fast. The failure (and all sub-orchestration
-  completion/failure notifications) is routed to the parent's current execution using
-  durable provider state instead of process-local memory, so routing stays correct across
-  runtime restarts and multiple dispatcher nodes.
+  sub-orchestration failure so it fails fast. The parent execution that scheduled the child
+  is stamped onto the child start at schedule time and persisted in the child's
+  `OrchestrationStarted` event, so the failure (and all sub-orchestration completion/failure
+  notifications) is routed to exactly that parent execution. This is correct across runtime
+  restarts and multiple dispatcher nodes, and avoids a TOCTOU window where the parent's
+  *current* execution at completion time could differ from the execution that scheduled the
+  child. When the stamp is absent (children started by an older runtime, or work items from
+  before this change), routing falls back to a durable provider read, keeping mixed-version
+  clusters correct during rolling upgrades.
 - **Sub-orchestration id reuse across continue-as-new** — Child instance ids generated
   after a parent `continue_as_new` now include the parent execution id
   (`{parent}::sub::{execution_id}_{event_id}`), preventing collisions with the terminal

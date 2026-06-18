@@ -32,6 +32,28 @@ order-2026-06-09
 
 Rename any root instance ids that use the reserved marker before upgrading.
 
+## Durable sub-orchestration routing (`parent_execution_id`)
+
+Sub-orchestration completion and failure notifications are now routed to the exact parent
+execution that scheduled the child. To do this, the scheduling parent's execution id is
+stamped onto the child's start and persisted in the child's history:
+
+- `WorkItem::StartOrchestration` gains an optional `parent_execution_id` field.
+- `EventKind::OrchestrationStarted` gains an optional `parent_execution_id` field.
+
+Both fields are `Option<u64>`, serialized with `#[serde(default, skip_serializing_if = "Option::is_none")]`,
+so the wire and history formats remain backward compatible:
+
+- **Old → new:** A new runtime reading an old child history (or an old work item) sees
+  `parent_execution_id = None` and falls back to a durable provider read of the parent's
+  current execution — the previous behavior.
+- **New → old:** An old runtime ignores the extra field (it is skipped when absent and not
+  required when deserializing).
+
+No action is required to upgrade. Mixed-version clusters route correctly during a rolling
+upgrade. The provider-read fallback is retained only for histories/work items created before
+this change.
+
 ## Orchestration Versioning
 
 Duroxide supports versioning to handle code evolution while maintaining compatibility with running instances.

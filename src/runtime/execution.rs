@@ -63,6 +63,7 @@ impl Runtime {
                         version: version.clone(),
                         parent_instance: None,
                         parent_id: None,
+                        parent_execution_id: None,
                         execution_id: crate::INITIAL_EXECUTION_ID,
                     });
                 }
@@ -76,7 +77,7 @@ impl Runtime {
         // (works for both existing history and newly appended OrchestrationStarted in delta)
         let (input, parent_link) = history_mgr.extract_context();
 
-        if let Some((ref pinst, pid)) = parent_link {
+        if let Some((ref pinst, _pexec, pid)) = parent_link {
             tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, parent_instance=%pinst, parent_id=%pid, "Detected parent link for orchestration");
         } else {
             tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, "No parent link for orchestration");
@@ -191,6 +192,10 @@ impl Runtime {
                                 version: version.clone(),
                                 parent_instance: Some(instance.to_string()),
                                 parent_id: Some(*scheduling_event_id),
+                                // Stamp the scheduling parent execution so the child's
+                                // completion/failure routes back to this exact execution,
+                                // even across continue-as-new, restarts, or other nodes.
+                                parent_execution_id: Some(execution_id),
                                 execution_id: crate::INITIAL_EXECUTION_ID,
                             });
                         }
@@ -208,6 +213,7 @@ impl Runtime {
                                 version: version.clone(),
                                 parent_instance: None,
                                 parent_id: None,
+                                parent_execution_id: None,
                                 execution_id: crate::INITIAL_EXECUTION_ID,
                             });
                         }
@@ -237,11 +243,13 @@ impl Runtime {
                 ));
 
                 // Notify parent if this is a sub-orchestration
-                if let Some((parent_instance, parent_id)) = parent_link {
+                if let Some((parent_instance, parent_execution_id, parent_id)) = parent_link {
                     tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, parent_instance=%parent_instance, parent_id=%parent_id, "Enqueue SubOrchCompleted to parent");
+                    let parent_execution_id =
+                        self.resolve_parent_execution_id(&parent_instance, parent_execution_id).await;
                     orchestrator_items.push(WorkItem::SubOrchCompleted {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.parent_execution_id_for_routing(&parent_instance).await,
+                        parent_execution_id,
                         parent_id,
                         result: output.clone(),
                     });
@@ -270,11 +278,13 @@ impl Runtime {
                 history_mgr.append_failed(details.clone());
 
                 // Notify parent if this is a sub-orchestration
-                if let Some((parent_instance, parent_id)) = parent_link {
+                if let Some((parent_instance, parent_execution_id, parent_id)) = parent_link {
                     tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, parent_instance=%parent_instance, parent_id=%parent_id, "Enqueue SubOrchFailed to parent");
+                    let parent_execution_id =
+                        self.resolve_parent_execution_id(&parent_instance, parent_execution_id).await;
                     orchestrator_items.push(WorkItem::SubOrchFailed {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.parent_execution_id_for_routing(&parent_instance).await,
+                        parent_execution_id,
                         parent_id,
                         details: details.clone(),
                     });
@@ -358,10 +368,12 @@ impl Runtime {
                 }
 
                 // Notify parent if this is a sub-orchestration
-                if let Some((parent_instance, parent_id)) = parent_link {
+                if let Some((parent_instance, parent_execution_id, parent_id)) = parent_link {
+                    let parent_execution_id =
+                        self.resolve_parent_execution_id(&parent_instance, parent_execution_id).await;
                     orchestrator_items.push(WorkItem::SubOrchFailed {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.parent_execution_id_for_routing(&parent_instance).await,
+                        parent_execution_id,
                         parent_id,
                         details: details.clone(),
                     });

@@ -839,16 +839,32 @@ impl Runtime {
         None
     }
 
+    /// Resolve the parent execution id for routing a sub-orchestration completion or
+    /// failure back to its parent.
+    ///
+    /// Prefers the `stamped` value carried durably from schedule time (the exact parent
+    /// execution that scheduled this child). When absent — children started by an older
+    /// runtime, or work items produced before this field existed — falls back to a durable
+    /// provider read via [`Self::parent_execution_id_for_routing`]. This keeps mixed-version
+    /// clusters correct during rolling upgrades.
+    async fn resolve_parent_execution_id(&self, parent_instance: &str, stamped: Option<u64>) -> u64 {
+        match stamped {
+            Some(execution_id) => execution_id,
+            None => self.parent_execution_id_for_routing(parent_instance).await,
+        }
+    }
+
     /// Resolve a parent instance's current execution id for routing a sub-orchestration
     /// completion or failure back to it.
     ///
-    /// Reads the durable execution id from the provider rather than process-local memory,
-    /// so routing is correct when a restarted runtime or a different dispatcher node emits
-    /// the notification. A misrouted notification (e.g. defaulting to execution 1 while the
-    /// parent is on execution 2+) is filtered out during replay and would leave the parent
-    /// awaiting forever. `Provider::read` returns the parent's current-execution history, so
-    /// any event's `execution_id` is the current one. On a read error (or no history yet) we
-    /// fall back to `INITIAL_EXECUTION_ID`.
+    /// This is the legacy fallback used only when the durable `parent_execution_id` stamp
+    /// is missing (old child histories / old work items). It reads the execution id from the
+    /// provider rather than process-local memory, so routing is correct when a restarted
+    /// runtime or a different dispatcher node emits the notification. A misrouted notification
+    /// (e.g. defaulting to execution 1 while the parent is on execution 2+) is filtered out
+    /// during replay and would leave the parent awaiting forever. `Provider::read` returns the
+    /// parent's current-execution history, so any event's `execution_id` is the current one.
+    /// On a read error (or no history yet) we fall back to `INITIAL_EXECUTION_ID`.
     async fn parent_execution_id_for_routing(&self, parent_instance: &str) -> u64 {
         match self.history_store.read(parent_instance).await {
             Ok(events) => events

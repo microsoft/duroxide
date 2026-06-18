@@ -25,6 +25,10 @@ pub struct HistoryManager {
     /// Parent event ID if this is a sub-orchestration
     pub parent_id: Option<u64>,
 
+    /// Parent execution id if this is a sub-orchestration (from OrchestrationStarted).
+    /// Used to route this child's completion/failure back to the exact parent execution.
+    pub parent_execution_id: Option<u64>,
+
     /// Whether the orchestration has completed successfully
     pub is_completed: bool,
 
@@ -56,6 +60,7 @@ impl HistoryManager {
             orchestration_input: None,
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             is_completed: false,
             is_failed: false,
             is_continued_as_new: false,
@@ -76,6 +81,7 @@ impl HistoryManager {
                 input,
                 parent_instance,
                 parent_id,
+                parent_execution_id,
                 ..
             } = &event.kind
             {
@@ -85,6 +91,7 @@ impl HistoryManager {
                 metadata.orchestration_input = Some(input.clone());
                 metadata.parent_instance = parent_instance.clone();
                 metadata.parent_id = *parent_id;
+                metadata.parent_execution_id = *parent_execution_id;
                 metadata.current_execution_id = Some(execution_id_counter);
                 last_started_index = Some(idx);
                 // Don't break - we want the LAST (most recent) OrchestrationStarted
@@ -250,12 +257,16 @@ impl HistoryManager {
     }
 
     /// Extract input and parent linkage from history for orchestration context
-    /// This looks at the full history including any newly appended events in the delta
-    pub fn extract_context(&self) -> (String, Option<(String, u64)>) {
+    /// This looks at the full history including any newly appended events in the delta.
+    ///
+    /// The returned parent link is `(parent_instance, parent_execution_id, parent_id)`,
+    /// where `parent_execution_id` is the durable execution id stamped at child-start time
+    /// (`None` for children started by older runtimes; callers fall back to a provider read).
+    pub fn extract_context(&self) -> (String, Option<(String, Option<u64>, u64)>) {
         // First check if we have metadata from the initial scan
         if let Some(ref input) = self.orchestration_input {
             let parent_link = if let (Some(parent_inst), Some(parent_id)) = (&self.parent_instance, self.parent_id) {
-                Some((parent_inst.clone(), parent_id))
+                Some((parent_inst.clone(), self.parent_execution_id, parent_id))
             } else {
                 None
             };
@@ -268,11 +279,12 @@ impl HistoryManager {
                 input,
                 parent_instance,
                 parent_id,
+                parent_execution_id,
                 ..
             } = &e.kind
             {
                 let parent_link = if let (Some(pinst), Some(pid)) = (parent_instance.clone(), *parent_id) {
-                    Some((pinst, pid))
+                    Some((pinst, *parent_execution_id, pid))
                 } else {
                     None
                 };
@@ -384,6 +396,10 @@ pub struct WorkItemReader {
     /// Parent event ID (from start item or None)
     pub parent_id: Option<u64>,
 
+    /// Parent execution id (from start item or None) — used to route this child's
+    /// completion/failure back to the exact parent execution that scheduled it.
+    pub parent_execution_id: Option<u64>,
+
     /// Whether this is a ContinueAsNew
     pub is_continue_as_new: bool,
 }
@@ -428,7 +444,7 @@ impl WorkItemReader {
         }
 
         // Extract parameters from start item or use defaults
-        let (orchestration_name, input, version, parent_instance, parent_id, is_continue_as_new) =
+        let (orchestration_name, input, version, parent_instance, parent_id, parent_execution_id, is_continue_as_new) =
             if let Some(ref item) = start_item {
                 match item {
                     WorkItem::StartOrchestration {
@@ -437,6 +453,7 @@ impl WorkItemReader {
                         version,
                         parent_instance,
                         parent_id,
+                        parent_execution_id,
                         ..
                     } => (
                         orchestration.clone(),
@@ -444,6 +461,7 @@ impl WorkItemReader {
                         version.clone(),
                         parent_instance.clone(),
                         *parent_id,
+                        *parent_execution_id,
                         false,
                     ),
                     WorkItem::ContinueAsNew {
@@ -467,7 +485,7 @@ impl WorkItemReader {
                         carried.append(&mut completion_messages);
                         completion_messages = carried;
 
-                        (orchestration.clone(), input.clone(), version.clone(), None, None, true)
+                        (orchestration.clone(), input.clone(), version.clone(), None, None, None, true)
                     }
                     _ => unreachable!(),
                 }
@@ -485,7 +503,8 @@ impl WorkItemReader {
                 let version = history_mgr.version();
                 let parent_instance = history_mgr.parent_instance.clone();
                 let parent_id = history_mgr.parent_id;
-                (orchestration_name, input, version, parent_instance, parent_id, false)
+                let parent_execution_id = history_mgr.parent_execution_id;
+                (orchestration_name, input, version, parent_instance, parent_id, parent_execution_id, false)
             };
 
         Self {
@@ -496,6 +515,7 @@ impl WorkItemReader {
             version,
             parent_instance,
             parent_id,
+            parent_execution_id,
             is_continue_as_new,
         }
     }
@@ -536,6 +556,7 @@ mod tests {
                 input: "test-input".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -564,6 +585,7 @@ mod tests {
                     input: "test-input".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -599,6 +621,7 @@ mod tests {
                     input: "test-input".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -638,6 +661,7 @@ mod tests {
                     input: "input1".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -662,6 +686,7 @@ mod tests {
                     input: "input2".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -688,6 +713,7 @@ mod tests {
                 input: "test".to_string(),
                 parent_instance: Some("parent-instance".to_string()),
                 parent_id: Some(42),
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -708,6 +734,7 @@ mod tests {
                 version: Some("1.0.0".to_string()),
                 parent_instance: Some("parent".to_string()),
                 parent_id: Some(42),
+                parent_execution_id: None,
                 execution_id: crate::INITIAL_EXECUTION_ID,
             },
             WorkItem::ActivityCompleted {
@@ -781,6 +808,7 @@ mod tests {
                 input: "test-input".to_string(),
                 parent_instance: Some("parent-inst".to_string()),
                 parent_id: Some(42),
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -822,6 +850,7 @@ mod tests {
                 version: None,
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: crate::INITIAL_EXECUTION_ID,
             },
             WorkItem::StartOrchestration {
@@ -831,6 +860,7 @@ mod tests {
                 version: None,
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: crate::INITIAL_EXECUTION_ID,
             },
         ];
@@ -861,6 +891,7 @@ mod tests {
                 input: "test-input".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -901,6 +932,7 @@ mod tests {
                 input: "test-input".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -921,6 +953,7 @@ mod tests {
                 input: "test-input".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -941,6 +974,7 @@ mod tests {
                 input: "test-input".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },

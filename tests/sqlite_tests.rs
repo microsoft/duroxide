@@ -53,6 +53,7 @@ async fn test_sqlite_provider_basic() {
         input: r#"{"test": true}"#.to_string(),
         parent_instance: None,
         parent_id: None,
+        parent_execution_id: None,
         execution_id: duroxide::INITIAL_EXECUTION_ID,
     };
 
@@ -88,6 +89,7 @@ async fn test_sqlite_provider_basic() {
                 input: r#"{"test": true}"#.to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -140,6 +142,7 @@ async fn test_execution_status_completed() {
                 input: "{}".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: duroxide::INITIAL_EXECUTION_ID,
             },
             None,
@@ -209,6 +212,7 @@ async fn test_execution_status_failed() {
                 input: "{}".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: duroxide::INITIAL_EXECUTION_ID,
             },
             None,
@@ -420,6 +424,7 @@ async fn test_sqlite_file_concurrent_access() {
                 input: format!("{{\"id\": {i}}}"),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: duroxide::INITIAL_EXECUTION_ID,
             };
 
@@ -457,6 +462,7 @@ async fn test_sqlite_file_concurrent_access() {
                         input: format!("{{\"id\": {acked_count}}}"),
                         parent_instance: None,
                         parent_id: None,
+                        parent_execution_id: None,
                         carry_forward_events: None,
                         initial_custom_status: None,
                     },
@@ -586,6 +592,7 @@ async fn test_sqlite_provider_transactional() {
         input: "{}".to_string(),
         parent_instance: None,
         parent_id: None,
+        parent_execution_id: None,
         execution_id: duroxide::INITIAL_EXECUTION_ID,
     };
 
@@ -613,6 +620,7 @@ async fn test_sqlite_provider_transactional() {
                 input: "{}".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -748,6 +756,7 @@ async fn test_sqlite_provider_timer_queue() {
                 input: "{}".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: duroxide::INITIAL_EXECUTION_ID,
             },
             None,
@@ -776,6 +785,7 @@ async fn test_sqlite_provider_timer_queue() {
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -806,6 +816,7 @@ async fn test_execution_status_running() {
         input: "test".to_string(),
         parent_instance: None,
         parent_id: None,
+        parent_execution_id: None,
         execution_id: duroxide::INITIAL_EXECUTION_ID,
     };
 
@@ -831,6 +842,7 @@ async fn test_execution_status_running() {
                 input: "test".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -883,6 +895,7 @@ async fn test_execution_output_captured_on_continue_as_new() {
         input: "test".to_string(),
         parent_instance: None,
         parent_id: None,
+        parent_execution_id: None,
         execution_id: duroxide::INITIAL_EXECUTION_ID,
     };
 
@@ -908,6 +921,7 @@ async fn test_execution_output_captured_on_continue_as_new() {
                 input: "test".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -972,6 +986,7 @@ async fn test_instrumented_provider_semantic_equivalence() {
         version: None,
         parent_instance: None,
         parent_id: None,
+        parent_execution_id: None,
         execution_id: 1,
     };
 
@@ -1004,6 +1019,7 @@ async fn test_instrumented_provider_semantic_equivalence() {
             input: "test".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             carry_forward_events: None,
             initial_custom_status: None,
         },

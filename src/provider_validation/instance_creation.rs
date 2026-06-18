@@ -49,6 +49,7 @@ pub async fn test_instance_creation_via_metadata<F: ProviderFactory>(factory: &F
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -139,6 +140,7 @@ pub async fn test_no_instance_creation_on_enqueue<F: ProviderFactory>(factory: &
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -172,6 +174,7 @@ pub async fn test_null_version_handling<F: ProviderFactory>(factory: &F) {
         version: None, // No version provided
         parent_instance: None,
         parent_id: None,
+        parent_execution_id: None,
         execution_id: 1,
     };
 
@@ -207,6 +210,7 @@ pub async fn test_null_version_handling<F: ProviderFactory>(factory: &F) {
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -279,6 +283,7 @@ pub async fn test_sub_orchestration_instance_creation<F: ProviderFactory>(factor
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -291,6 +296,7 @@ pub async fn test_sub_orchestration_instance_creation<F: ProviderFactory>(factor
                 version: None,
                 parent_instance: Some("parent-instance".to_string()),
                 parent_id: Some(1),
+                parent_execution_id: None,
                 execution_id: 1,
             }],
             ExecutionMetadata {
@@ -329,6 +335,7 @@ pub async fn test_sub_orchestration_instance_creation<F: ProviderFactory>(factor
                     input: "{}".to_string(),
                     parent_instance: Some("parent-instance".to_string()),
                     parent_id: Some(1),
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -355,6 +362,7 @@ pub async fn test_sub_orchestration_instance_creation<F: ProviderFactory>(factor
                 version: None,
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: 1,
             },
             None,

@@ -314,6 +314,7 @@ async fn provider_seed_without_pinned_version(provider: &dyn Provider, instance:
                 version: Some("1.0.0".to_string()),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: INITIAL_EXECUTION_ID,
             },
             None,

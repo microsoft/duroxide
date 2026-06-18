@@ -40,6 +40,7 @@ async fn orchestration_attempt_count_increments_on_abandon() {
                 version: Some("1.0.0".to_string()),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 execution_id: INITIAL_EXECUTION_ID,
             },
             None,

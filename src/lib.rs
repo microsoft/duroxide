@@ -1117,6 +1117,13 @@ pub enum EventKind {
         input: String,
         parent_instance: Option<String>,
         parent_id: Option<u64>,
+        /// Execution id of the parent that scheduled this sub-orchestration, persisted at
+        /// child-start time. Used to route this child's completion/failure back to the
+        /// exact parent execution that awaited it. `None` for root orchestrations and for
+        /// children started by older runtimes (routing then falls back to a provider read).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        parent_execution_id: Option<u64>,
         /// Persistent events carried forward from the previous execution during continue-as-new.
         /// Present only on CAN-initiated executions for audit trail. Each tuple is (event_name, data).
         #[serde(skip_serializing_if = "Option::is_none")]

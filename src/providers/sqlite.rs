@@ -3437,6 +3437,7 @@ mod tests {
                     input: input.to_string(),
                     parent_instance: parent_instance.map(|s| s.to_string()),
                     parent_id,
+                    parent_execution_id: None,
                     execution_id: next_execution_id,
                 },
                 None,
@@ -3463,6 +3464,7 @@ mod tests {
                         input: input.to_string(),
                         parent_instance: parent_instance.map(|s| s.to_string()),
                         parent_id,
+                        parent_execution_id: None,
                         carry_forward_events: None,
                         initial_custom_status: None,
                     },
@@ -3499,6 +3501,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
 
@@ -3529,6 +3532,7 @@ mod tests {
                 input: "{}".to_string(),
                 parent_instance: None,
                 parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: None,
                 initial_custom_status: None,
             },
@@ -3574,6 +3578,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
 
@@ -3598,6 +3603,7 @@ mod tests {
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -3731,6 +3737,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
 
@@ -3887,6 +3894,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
         store.enqueue_for_orchestrator(item, None).await.unwrap();
@@ -4017,6 +4025,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
 
@@ -4073,6 +4082,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
 
@@ -4152,6 +4162,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
 
@@ -4205,6 +4216,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: 1,
         };
         store.enqueue_for_orchestrator(start_item, None).await.unwrap();
@@ -4228,6 +4240,7 @@ mod tests {
                         input: "{}".to_string(),
                         parent_instance: None,
                         parent_id: None,
+                        parent_execution_id: None,
                         carry_forward_events: None,
                         initial_custom_status: None,
                     },
@@ -4414,6 +4427,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
         store.enqueue_for_orchestrator(item, None).await.unwrap();
@@ -4516,6 +4530,7 @@ mod tests {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             execution_id: crate::INITIAL_EXECUTION_ID,
         };
         store.enqueue_for_orchestrator(item, None).await.unwrap();
