@@ -355,6 +355,119 @@ async fn scheduled_child_suffix(store: &Arc<dyn Provider>, parent_instance: &str
         .unwrap_or_else(|| panic!("execution {execution_id} should schedule a sub-orchestration"))
 }
 
+/// Routing regression (affandar): a sub-orchestration's completion/failure must be addressed
+/// to the parent execution that *scheduled* the child, not to whatever execution is current
+/// when the child finishes.
+///
+/// This is the scenario the durable `parent_execution_id` stamp defends against, distinct from
+/// the awaited case (where the parent is blocked and the two coincide). Here the child outlives
+/// the execution that scheduled it:
+///
+/// 1. Execution 1 schedules a child, lets it start, then continues-as-new **without awaiting**
+///    it. The child keeps running (continue-as-new does not cancel outstanding children) and
+///    finishes only when the test releases it.
+/// 2. Execution 2 schedules **no** sub-orchestration and parks on an external event, so it is
+///    still alive when the child's late completion notification arrives.
+/// 3. The child's `SubOrchCompleted` is emitted while the parent's current execution is 2.
+///
+/// With the stamp, the notification is addressed to execution 1 (terminal) and the replay
+/// execution filter discards it, so execution 2 is untouched. Without the stamp — routing via
+/// the parent's *current* execution at completion time — the notification is addressed to
+/// execution 2, where event id 2 is not a sub-orchestration schedule, so it is applied as a
+/// nondeterministic completion and poisons the parent. The assertion that execution 2 is still
+/// running (then completes cleanly once released) fails under that buggy routing.
+#[tokio::test]
+async fn suborch_completion_routes_to_scheduling_execution_not_current() {
+    let store: Arc<dyn Provider> = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let parent_id = "stale-suborch-route-job";
+
+    let parent = |ctx: OrchestrationContext, input: String| async move {
+        let n: u32 = input.parse().unwrap_or(0);
+        if n == 0 {
+            // Execution 1: schedule the child (event id 2), give it a turn to start, then
+            // continue-as-new without ever awaiting it. The child outlives this parent
+            // execution and finishes only once the test releases it, by which time the
+            // parent's current execution is already 2.
+            let _child = ctx.schedule_sub_orchestration("Child", "x");
+            ctx.schedule_timer(Duration::from_millis(50)).await;
+            return ctx.continue_as_new("1").await;
+        }
+        // Execution 2: schedule no sub-orchestration. Park on an external event so this
+        // execution stays alive while the child's stale notification is processed.
+        ctx.schedule_wait("Release").await;
+        Ok("done".to_string())
+    };
+    // Child parks on an external event so the test controls exactly when it completes —
+    // after execution 2 has been established.
+    let child = |ctx: OrchestrationContext, _input: String| async move {
+        ctx.schedule_wait("ChildGo").await;
+        Ok("child-late".to_string())
+    };
+
+    let orchestrations = OrchestrationRegistry::builder()
+        .register("Parent", parent)
+        .register("Child", child)
+        .build();
+    let activities = ActivityRegistry::builder().build();
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = Client::new(store.clone());
+
+    client.start_orchestration(parent_id, "Parent", "0").await.unwrap();
+
+    // Wait until (a) the parent has advanced to execution 2 and (b) the child (scheduled in
+    // execution 1 as `{parent}::sub::2`) is running and subscribed to its release event.
+    let child_instance = format!("{parent_id}::sub::2");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let parent_on_exec_2 = store.read_with_execution(parent_id, 2).await.is_ok_and(|h| {
+            h.iter()
+                .any(|e| matches!(&e.kind, EventKind::OrchestrationStarted { .. }))
+        });
+        let child_running = matches!(
+            client.get_orchestration_status(&child_instance).await.unwrap(),
+            OrchestrationStatus::Running { .. }
+        );
+        if parent_on_exec_2 && child_running {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parent never reached execution 2 with a running child"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Release the child *after* execution 2 is established, so its completion notification is
+    // emitted while the parent's current execution is 2 (the divergence the stamp guards).
+    client.raise_event(&child_instance, "ChildGo", "go").await.unwrap();
+
+    // Let the child's stale notification drain through the orchestrator queue and be processed
+    // by the parent *before* we release execution 2.
+    wait_for_orchestrator_queue_drained(&store, Duration::from_secs(5)).await;
+
+    // Correct routing addresses the stale notification to execution 1 (terminal), so the
+    // replay filter discards it and execution 2 is still running, waiting for Release.
+    // Buggy current-execution routing applies it to execution 2 and poisons the parent.
+    let status = client.get_orchestration_status(parent_id).await.unwrap();
+    assert!(
+        matches!(status, OrchestrationStatus::Running { .. }),
+        "execution 2 must still be running (stale child notification must not poison it); got {status:?}"
+    );
+
+    // Release execution 2 and confirm it completes cleanly.
+    client.raise_event(parent_id, "Release", "go").await.unwrap();
+    let final_status = client
+        .wait_for_orchestration(parent_id, Duration::from_secs(5))
+        .await
+        .expect("parent should complete after release");
+    assert!(
+        matches!(&final_status, OrchestrationStatus::Completed { output, .. } if output == "done"),
+        "parent should complete with \"done\"; got {final_status:?}"
+    );
+
+    rt.shutdown(None).await;
+}
+
 /// Legacy / provider-bypass defense: execution-scoped routing of a terminal-collision
 /// failure within a single end-to-end run.
 ///
