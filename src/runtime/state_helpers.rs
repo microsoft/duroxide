@@ -167,14 +167,12 @@ impl HistoryManager {
     }
 
     /// Append an OrchestrationFailed event with the next event_id
-    pub fn append_failed(&mut self, details: crate::ErrorDetails) {
+    pub fn append_failed(&mut self, instance_id: &str, execution_id: u64, details: crate::ErrorDetails) {
         let next_id = self.next_event_id();
-        // Note: instance_id and execution_id should be set from context
-        // For now, use placeholder values as this will be set by the caller
         self.append(Event::with_event_id(
             next_id,
-            "", // instance_id should be set by caller
-            0,  // execution_id should be set by caller
+            instance_id,
+            execution_id,
             None,
             EventKind::OrchestrationFailed { details },
         ));

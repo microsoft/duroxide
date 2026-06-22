@@ -1360,6 +1360,26 @@ async fn sample_cancellation_parent_cascades_to_children_fs() {
     .await;
     assert!(ok, "timeout waiting for parent cancel failure");
 
+    // Regression: the terminal OrchestrationFailed event must preserve the
+    // instance_id/execution_id so telemetry pipelines reading event payloads
+    // can correlate the cancellation back to the workflow instance.
+    let parent_hist = store.read("inst-sample-cancel").await.unwrap_or_default();
+    let failed = parent_hist
+        .iter()
+        .rev()
+        .find(|e| matches!(&e.kind, EventKind::OrchestrationFailed { .. }))
+        .expect("parent history should contain OrchestrationFailed");
+    assert_eq!(
+        failed.instance_id,
+        "inst-sample-cancel",
+        "OrchestrationFailed must carry the instance_id"
+    );
+    assert_ne!(
+        failed.execution_id,
+        0,
+        "OrchestrationFailed must carry a non-placeholder execution_id"
+    );
+
     // Find child instance (prefix is parent::sub::<id>) and check it was canceled too
     let mgmt = store.as_management_capability().expect("ProviderAdmin required");
     let children: Vec<String> = mgmt
