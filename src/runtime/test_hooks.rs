@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Test hooks for simulating various conditions during testing.
 //!
 //! This module provides test-only hooks that allow tests to inject delays

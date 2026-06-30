@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Replay with Completions Tests
 //!
 //! Tests where the baseline history contains both schedule AND completion events.

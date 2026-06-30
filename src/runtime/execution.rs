@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Execution module uses Mutex locks - poison indicates a panic and should propagate
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
@@ -275,7 +278,7 @@ impl Runtime {
                 Self::emit_terminal_cancellation_breadcrumbs(history_mgr, instance, execution_id, &outstanding);
 
                 // Add failure event last
-                history_mgr.append_failed(details.clone());
+                history_mgr.append_failed(instance, execution_id, details.clone());
 
                 // Notify parent if this is a sub-orchestration
                 if let Some((parent_instance, parent_execution_id, parent_id)) = parent_link {
@@ -358,7 +361,7 @@ impl Runtime {
                 Self::emit_terminal_cancellation_breadcrumbs(history_mgr, instance, execution_id, &outstanding);
 
                 // Add failure event last, and propagate cancellation to outstanding sub-orchestrations.
-                history_mgr.append_failed(details.clone());
+                history_mgr.append_failed(instance, execution_id, details.clone());
 
                 for (_schedule_id, child_suffix) in &outstanding.sub_orchestrations {
                     orchestrator_items.push(WorkItem::CancelInstance {

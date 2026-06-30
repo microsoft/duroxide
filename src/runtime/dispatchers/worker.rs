@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Worker (activity) dispatcher implementation for Runtime
 //!
 //! This module contains the worker dispatcher logic that:

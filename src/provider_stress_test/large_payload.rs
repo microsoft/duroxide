@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Large payload stress test scenario.
 //!
 //! Tests memory consumption and history management with large event payloads.

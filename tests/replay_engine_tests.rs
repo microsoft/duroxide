@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Replay Engine Test Suite
 //!
 //! This test file pulls in the replay_engine module which contains

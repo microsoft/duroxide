@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Timers and External Events Example
 //!
 //! This example demonstrates:

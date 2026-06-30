@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Bug reproduction test for issue #49: WorkItemReader doesn't extract version from history during replay
 //!
 //! This test reproduces the exact scenario where:

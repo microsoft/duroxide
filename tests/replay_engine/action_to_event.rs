@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Action to Event Recording Tests
 //!
 //! Tests verifying that each orchestration action type correctly

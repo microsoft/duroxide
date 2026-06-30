@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 use crate::{Either2, Either3};
 use std::future::Future;
 use std::pin::Pin;

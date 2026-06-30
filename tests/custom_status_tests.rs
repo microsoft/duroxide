@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Custom status e2e tests
 //
 // Validates set_custom_status(), reset_custom_status(), and the custom_status

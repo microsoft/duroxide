@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Dispatcher implementations for Runtime
 //!
 //! This module contains the dispatcher logic split into separate concerns:

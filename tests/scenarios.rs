@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Scenario tests derived from real-world usage patterns
 //!
 //! This module contains regression tests that model specific scenarios found in actual

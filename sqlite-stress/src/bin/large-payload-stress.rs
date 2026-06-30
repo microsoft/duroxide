@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Large Payload SQLite Stress Test Binary
 //!
 //! This binary runs the large payload stress test with SQLite provider.

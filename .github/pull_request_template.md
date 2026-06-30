@@ -5,7 +5,8 @@ Describe the change and motivation.
 ## Checklist
 
 - [ ] Tests added/updated
-- [ ] `cargo test` passes locally
+- [ ] Regular tests pass locally (`cargo nt`)
+- [ ] Doc tests pass locally (`cargo test --doc --all-features`)
 - [ ] Docs updated
   - [ ] Existing docs updated where behavior changed
   - [ ] New doc added under `docs/` if introducing a new area

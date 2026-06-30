@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Interactive observability dashboard for duroxide.
 //!
 //! This CLI tool demonstrates how to consume and display duroxide metrics

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Management and observability provider interface.
 //!
 //! Separate from the core Provider trait, this interface provides

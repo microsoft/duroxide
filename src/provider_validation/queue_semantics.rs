@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 use crate::provider_validation::{Event, EventKind, ExecutionMetadata, create_instance, start_item};
 use crate::provider_validations::ProviderFactory;
 use crate::providers::{TagFilter, WorkItem};

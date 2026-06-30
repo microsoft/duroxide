@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Edge Case Tests
 //!
 //! Various edge cases and boundary conditions.

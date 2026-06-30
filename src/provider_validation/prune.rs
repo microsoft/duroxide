@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Provider validation tests for execution pruning operations.
 //!
 //! These tests verify that providers correctly implement the prune API,

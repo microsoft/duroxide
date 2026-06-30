@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Core stress test infrastructure - types, runner, and utilities.
 
 use crate::providers::Provider;

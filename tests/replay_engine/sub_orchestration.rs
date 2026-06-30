@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Sub-orchestration Instance ID Generation Tests
 //!
 //! Tests for deterministic child instance ID generation.

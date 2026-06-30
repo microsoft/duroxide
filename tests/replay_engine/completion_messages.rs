@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Completion Message Processing Tests
 //!
 //! Tests for WorkItem → Event conversion and filtering via prep_completions.

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // KV store e2e tests
 //
 // Validates set_value(), get_value(), clear_value(), clear_all_values(),

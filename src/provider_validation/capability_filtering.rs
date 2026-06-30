@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Capability filtering provider validation tests.
 //!
 //! These tests validate that providers correctly implement the capability filtering

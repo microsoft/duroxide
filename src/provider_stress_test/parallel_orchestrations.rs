@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Parallel orchestrations stress test scenario.
 //!
 //! Tests fan-out/fan-in orchestration patterns with concurrent instance execution.

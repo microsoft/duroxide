@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Generic versioned registry for orchestrations and activities
 //!
 //! This module provides a unified `Registry<H>` type that can store both orchestration

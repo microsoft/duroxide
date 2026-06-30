@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Replay engine uses Mutex locks - poison indicates a panic and should propagate
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]

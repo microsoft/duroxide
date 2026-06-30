@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Activity Failure Handling Tests
 //!
 //! Tests for different error categories in activity failures.

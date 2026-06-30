@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Orchestration dispatcher implementation for Runtime
 //!
 //! This module contains the orchestration dispatcher logic that:
@@ -977,7 +980,7 @@ impl Runtime {
 
                 // Create a new history manager to append the failure event
                 let mut failure_history_mgr = HistoryManager::from_history(&item.history);
-                failure_history_mgr.append_failed(infra_error.clone());
+                failure_history_mgr.append_failed(&item.instance, item.execution_id, infra_error.clone());
 
                 // Try to commit the failure event
                 let failure_delta = failure_history_mgr.delta().to_vec();
@@ -1365,7 +1368,7 @@ impl Runtime {
             }
         }
 
-        history_mgr.append_failed(error.clone());
+        history_mgr.append_failed(&item.instance, item.execution_id, error.clone());
 
         let metadata = ExecutionMetadata {
             status: Some("Failed".to_string()),

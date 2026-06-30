@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Replay engine extensibility verification via topic-based external events.
 //!
 //! This test proves that the replay engine can be extended with new EventKind variants

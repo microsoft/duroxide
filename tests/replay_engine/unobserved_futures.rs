@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Unobserved Future Cancellation Tests
 //!
 //! Tests for cancellation of DurableFuture when dropped without completion.

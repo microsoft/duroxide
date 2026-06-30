@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Capability filtering scenario tests (Category C, D, E, G, H)
 //!
 //! End-to-end tests with real Runtime + Client + SQLite provider that validate:

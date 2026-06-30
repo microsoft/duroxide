@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Tag filtering validation tests for providers.
 //!
 //! These tests verify that `fetch_work_item` correctly filters activities by tag

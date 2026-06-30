@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Shared tracing capture helper for tests that need to assert on log output.
 
 use std::collections::BTreeMap;

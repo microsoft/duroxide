@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Track stress test results with git history and rolling averages
 
 set -e

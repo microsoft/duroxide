@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 use duroxide::Either2;
 use duroxide::runtime;
 use duroxide::runtime::registry::ActivityRegistry;

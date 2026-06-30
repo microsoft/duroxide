@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! End-to-end tests for the activity session (implicit sessions v2) feature.
 //!
 //! Tests verify session routing works correctly through the full runtime stack:

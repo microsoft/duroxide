@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Cancellation Tests
 //!
 //! Tests for OrchestrationCancelRequested handling.

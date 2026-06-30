@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Session Routing Provider Validation Tests
 //!
 //! Tests that validate the implicit session routing contract for providers.

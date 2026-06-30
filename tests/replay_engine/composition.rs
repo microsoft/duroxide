@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Select/Join Composition Tests
 //!
 //! Tests for aggregate future behavior (select, join).

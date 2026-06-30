@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Session Scenario Test — Durable-Copilot-SDK Pattern
 //!
 //! This test faithfully models the durable-copilot-sdk's architecture, the primary

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Poison Message Detection Validation Tests
 //!
 //! These tests validate that providers correctly track attempt counts
