@@ -593,10 +593,11 @@ impl Runtime {
             || (temp_history_mgr.is_continued_as_new && !workitem_reader.is_continue_as_new)
         {
             warn!(instance = %instance, "Instance is terminal (completed/failed or CAN without start), acking batch without processing");
-            // If a StartOrchestration in this discarded batch is a sub-orchestration whose
-            // parent differs from this instance's own recorded parent, the instance id was
-            // reused for an unrelated child. Notify that parent with a SubOrchFailed so it
-            // fails fast instead of awaiting a completion that will never arrive.
+            // If this terminal instance receives a StartOrchestration for the same child id,
+            // the incoming start is discarded here. When that start belongs to a different
+            // scheduling parent than the terminal child originally recorded, notify the
+            // incoming parent with SubOrchFailed so it does not wait forever for a child
+            // start that was never accepted.
             let orchestrator_items = self.terminal_collision_notifications(&item).await;
             let _ = self
                 .ack_orchestration_with_changes(

@@ -850,7 +850,11 @@ impl Runtime {
     async fn resolve_parent_execution_id(&self, parent_instance: &str, stamped: Option<u64>) -> u64 {
         match stamped {
             Some(execution_id) => execution_id,
-            None => self.parent_execution_id_for_routing(parent_instance).await,
+            None => {
+                // TODO: Remove this legacy fallback in the next major version and require
+                // sub-orchestration parent links to carry parent_execution_id.
+                self.parent_execution_id_for_routing(parent_instance).await
+            }
         }
     }
 
