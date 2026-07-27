@@ -1388,7 +1388,9 @@ impl Runtime {
                 parent_id = %parent_id,
                 "Enqueue SubOrchFailed to parent (poison)"
             );
-            let parent_execution_id = self.resolve_parent_execution_id(&parent_instance, parent_execution_id).await;
+            let parent_execution_id = self
+                .resolve_parent_execution_id(&parent_instance, parent_execution_id)
+                .await;
             vec![WorkItem::SubOrchFailed {
                 parent_instance,
                 parent_execution_id,
@@ -1416,28 +1418,25 @@ impl Runtime {
     }
 
     /// Build `SubOrchFailed` notifications for a terminal instance that received a
-    /// `StartOrchestration` belonging to a different parent.
+    /// `StartOrchestration` from a scheduling parent.
     ///
-    /// Sub-orchestration child instance ids reserve the `sub::` marker (see
-    /// [`crate::auto_sub_orch_suffix`]): the first parent execution uses
-    /// `{parent}::sub::{event_id}` and executions after continue-as-new use
-    /// `{parent}::sub::{execution_id}_{event_id}`. If such an id already names a terminal
-    /// instance, the incoming `StartOrchestration` is discarded by the terminal fast-ack
-    /// path. Without this notification the scheduling parent would await a completion
-    /// forever. We only notify when the incoming work item's parent differs from the
-    /// terminal instance's own recorded parent, so genuine redelivery of a completed
-    /// child's start (parent already notified) does not spuriously fail the parent again.
+    /// The terminal fast-ack path discards the whole batch without processing it. If the batch
+    /// contains a child start, that child is never created, and the scheduling parent would
+    /// await a completion that never arrives. Notify the parent instead so it fails fast.
+    ///
+    /// This is reachable whenever a child instance id already names a terminal instance.
+    /// Auto-generated ids cannot collide — they embed both the parent instance id and its
+    /// execution (see [`crate::auto_sub_orch_suffix`]) — so in practice the id came from
+    /// [`crate::OrchestrationContext::schedule_sub_orchestration_with_id`] and some earlier
+    /// orchestration already used it.
+    ///
+    /// Every child start reaching here is a genuine collision, never a redelivery of the
+    /// child's own start: child starts are enqueued only from `pending_actions` (replay
+    /// matches already-scheduled children against history instead of re-emitting them), and
+    /// the provider contract requires `ack_orchestration_item` to delete the batch, append
+    /// history, and enqueue outbound work in a single transaction. A child's start is
+    /// therefore consumed exactly once, before the child can reach a terminal state.
     async fn terminal_collision_notifications(&self, item: &crate::providers::OrchestrationItem) -> Vec<WorkItem> {
-        // The terminal instance's own parent, as recorded in its history.
-        let own_parent = item.history.iter().find_map(|e| match &e.kind {
-            EventKind::OrchestrationStarted {
-                parent_instance: Some(pi),
-                parent_id: Some(pid),
-                ..
-            } => Some((pi.clone(), *pid)),
-            _ => None,
-        });
-
         let mut notifications = Vec::new();
         for msg in &item.messages {
             if let WorkItem::StartOrchestration {
@@ -1447,10 +1446,6 @@ impl Runtime {
                 ..
             } = msg
             {
-                // Skip genuine redelivery: same parent that already owns this instance.
-                if own_parent.as_ref() == Some(&(parent_instance.clone(), *parent_id)) {
-                    continue;
-                }
                 warn!(
                     instance = %item.instance,
                     parent_instance = %parent_instance,

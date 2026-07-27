@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or contain `::sub::`; other uses of `::` remain supported. Applications that used
   the reserved marker in root instance ids must rename those ids before upgrading.
   See [docs/migration-guide.md](docs/migration-guide.md) for guidance.
+- `ctx.schedule_orchestration()` and `ctx.schedule_orchestration_versioned()` now enforce the
+  same reserved-marker rule. These start a **root** instance with a caller-supplied id used
+  verbatim, so they could previously squat an id the runtime would later generate for a
+  sub-orchestration. They return `()`, so a violation panics, surfacing as a deterministic
+  orchestration failure on the first execution.
+- `ctx.schedule_sub_orchestration_with_id()` and
+  `ctx.schedule_sub_orchestration_versioned_with_id()` now reject explicit child ids that
+  **start with** `sub::`. The returned future resolves immediately to an `Err` and nothing
+  is scheduled or written to history. That prefix is a control signal the runtime reads to
+  mean "auto-generated suffix", so such an id was previously rewritten rather than used
+  verbatim (`sub::my-child` became `{parent}::sub::my-child`, and the internal
+  `sub::pending_` placeholder shape was discarded outright). The `::sub::` infix remains
+  valid for explicit child ids — the runtime generates it itself, e.g. a grandchild of
+  `root` is `root::sub::2::sub::2`.
 - **`ctx.new_guid()` now returns a standard UUID v4.** The previous
   implementation derived the value from `SystemTime::now()` nanoseconds plus a
   thread-local counter, which produced low-entropy, structured values (the

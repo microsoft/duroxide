@@ -486,7 +486,15 @@ impl WorkItemReader {
                         carried.append(&mut completion_messages);
                         completion_messages = carried;
 
-                        (orchestration.clone(), input.clone(), version.clone(), None, None, None, true)
+                        (
+                            orchestration.clone(),
+                            input.clone(),
+                            version.clone(),
+                            None,
+                            None,
+                            None,
+                            true,
+                        )
                     }
                     _ => unreachable!(),
                 }
@@ -505,7 +513,15 @@ impl WorkItemReader {
                 let parent_instance = history_mgr.parent_instance.clone();
                 let parent_id = history_mgr.parent_id;
                 let parent_execution_id = history_mgr.parent_execution_id;
-                (orchestration_name, input, version, parent_instance, parent_id, parent_execution_id, false)
+                (
+                    orchestration_name,
+                    input,
+                    version,
+                    parent_instance,
+                    parent_id,
+                    parent_execution_id,
+                    false,
+                )
             };
 
         Self {

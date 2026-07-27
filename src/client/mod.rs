@@ -173,18 +173,20 @@ pub struct Client {
 
 /// Reject instance ids that collide with the reserved sub-orchestration markers.
 ///
-/// Child sub-orchestration instance ids reserve the `sub::` marker (see
-/// [`crate::auto_sub_orch_suffix`], the canonical formatter). The first parent
-/// execution uses `{parent}::sub::{event_id}`; executions after continue-as-new use
-/// `{parent}::sub::{execution_id}_{event_id}`. A user-supplied id matching either form
-/// could pre-occupy a future child id, so the `sub::` prefix and `::sub::` infix are
-/// reserved. Other uses of `::` remain valid.
+/// Delegates to [`crate::uses_reserved_root_marker`], the single definition of the root-id
+/// rule, shared with detached starts via
+/// [`crate::OrchestrationContext::schedule_orchestration`]. Root ids must avoid both a
+/// leading `sub::` and the `::sub::` infix, since either could pre-occupy an id the runtime
+/// will later generate for a child. Other uses of `::` remain valid.
+///
+/// This is deliberately stricter than the rule applied to explicit *child* ids in
+/// [`crate::OrchestrationContext::schedule_sub_orchestration_with_id`], which rejects only
+/// the leading `sub::`: child names contain `::sub::` anywhere in the string (a grandchild
+/// of `root` is `root::sub::2::sub::2`), so the infix cannot be reserved for them.
 fn validate_instance_id(instance: &str) -> Result<(), ClientError> {
-    if instance.starts_with(crate::SUB_ORCH_AUTO_PREFIX) || instance.contains("::sub::") {
+    if crate::uses_reserved_root_marker(instance) {
         return Err(ClientError::InvalidInput {
-            message: format!(
-                "instance id '{instance}' uses the reserved sub-orchestration marker 'sub::'"
-            ),
+            message: format!("instance id '{instance}' uses the reserved sub-orchestration marker 'sub::'"),
         });
     }
     Ok(())

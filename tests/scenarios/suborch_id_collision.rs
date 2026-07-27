@@ -28,10 +28,10 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 
+use duroxide::providers::ExecutionMetadata;
 use duroxide::providers::Provider;
 use duroxide::providers::WorkItem;
 use duroxide::providers::sqlite::SqliteProvider;
-use duroxide::providers::ExecutionMetadata;
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{self};
 use duroxide::{Client, Event, EventKind, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
@@ -126,17 +126,156 @@ async fn legacy_provider_bypass_terminal_collision_does_not_hang_parent() {
     rt.shutdown(None).await;
 }
 
-/// Genuine at-least-once redelivery of a completed child's own `StartOrchestration`
-/// must not spuriously fail the parent. The child id already names a terminal instance,
-/// but the incoming work item's parent matches that instance's recorded parent, so the
-/// dispatcher must skip the collision notification and leave the parent completed.
+/// Upgrade safety: an instance already in flight when the execution-scoped id scheme
+/// landed must keep replaying against the id recorded in its history.
+///
+/// A parent that reached execution 2 under the old scheme recorded its child as `sub::2`.
+/// The new scheme would generate `sub::2_2` at that same position. Replay must bind the id
+/// from history rather than regenerating it, otherwise every in-flight sub-orchestration
+/// would break on upgrade.
+///
+/// This is the property the whole id change rests on: `action_matches_event_kind` compares
+/// name and input for `StartSubOrchestration` but deliberately ignores `instance`, and
+/// `apply_history_event` binds the history value. Pinned here so it cannot regress silently.
 #[tokio::test]
-async fn redelivered_child_start_does_not_fail_parent() {
+async fn in_flight_instance_keeps_pre_upgrade_child_id_on_replay() {
+    let store: Arc<dyn Provider> = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+
+    let parent_id = "pre-upgrade-parent";
+    // Old scheme: execution 2 recorded the bare `sub::{event_id}` suffix. The current
+    // scheme would produce `sub::2_2` here.
+    let recorded_child_suffix = "sub::2";
+
+    // Seed execution 2 mid-flight: started, scheduled a child, awaiting its completion.
+    common::seed_history_turn(
+        store.as_ref(),
+        WorkItem::StartOrchestration {
+            instance: parent_id.to_string(),
+            orchestration: "Parent".to_string(),
+            input: "1".to_string(),
+            version: Some("1.0.0".to_string()),
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
+            execution_id: 2,
+        },
+        2,
+        vec![
+            Event::with_event_id(
+                1,
+                parent_id,
+                2,
+                None,
+                EventKind::OrchestrationStarted {
+                    name: "Parent".to_string(),
+                    version: "1.0.0".to_string(),
+                    input: "1".to_string(),
+                    parent_instance: None,
+                    parent_id: None,
+                    // Old runtimes did not stamp this.
+                    parent_execution_id: None,
+                    carry_forward_events: None,
+                    initial_custom_status: None,
+                },
+            ),
+            Event::with_event_id(
+                2,
+                parent_id,
+                2,
+                None,
+                EventKind::SubOrchestrationScheduled {
+                    name: "Child".to_string(),
+                    instance: recorded_child_suffix.to_string(),
+                    input: "x".to_string(),
+                },
+            ),
+        ],
+        vec![],
+        ExecutionMetadata {
+            orchestration_name: Some("Parent".to_string()),
+            orchestration_version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let parent = |ctx: OrchestrationContext, input: String| async move {
+        let n: u32 = input.parse().unwrap_or(0);
+        if n == 0 {
+            return ctx.continue_as_new("1").await;
+        }
+        let r = ctx.schedule_sub_orchestration("Child", "x").await?;
+        Ok(format!("parent-got:{r}"))
+    };
+    let child = |_ctx: OrchestrationContext, _input: String| async move { Ok("child-done".to_string()) };
+
+    let orchs = OrchestrationRegistry::builder()
+        .register("Parent", parent)
+        .register("Child", child)
+        .build();
+    let acts = ActivityRegistry::builder().build();
+    let rt = runtime::Runtime::start_with_store(store.clone(), acts, orchs).await;
+    let client = Client::new(store.clone());
+
+    // Deliver the pre-upgrade child's completion, addressed to execution 2.
+    store
+        .enqueue_for_orchestrator(
+            WorkItem::SubOrchCompleted {
+                parent_instance: parent_id.to_string(),
+                parent_execution_id: 2,
+                parent_id: 2,
+                result: "child-done".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let status = client
+        .wait_for_orchestration(parent_id, Duration::from_secs(10))
+        .await
+        .expect("in-flight instance must replay without nondeterminism after the id-scheme change");
+
+    assert!(
+        matches!(&status, OrchestrationStatus::Completed { output, .. } if output == "parent-got:child-done"),
+        "parent should resume and complete using the id recorded in history; got {status:?}"
+    );
+
+    // The recorded id must be untouched — replay must not rewrite history to the new scheme.
+    let history = store.read_with_execution(parent_id, 2).await.unwrap();
+    let suffix = history
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::SubOrchestrationScheduled { instance, .. } => Some(instance.clone()),
+            _ => None,
+        })
+        .expect("execution 2 must still record a scheduled sub-orchestration");
+    assert_eq!(
+        suffix, recorded_child_suffix,
+        "replay must preserve the pre-upgrade child id, not regenerate it"
+    );
+
+    rt.shutdown(None).await;
+}
+
+/// The collision class that is reachable through the public API alone: two parents pick the
+/// same explicit child id via `schedule_sub_orchestration_with_id`. No reserved marker, no
+/// provider bypass — the second parent simply names a child that already ran to completion.
+///
+/// Its start is discarded by the terminal fast-ack path, so without the notification the
+/// second parent would await a completion that never arrives. It must fail fast instead.
+#[tokio::test]
+async fn explicit_child_id_reused_by_another_parent_fails_fast() {
     let store: Arc<dyn Provider> = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
 
     let parent = |ctx: OrchestrationContext, _input: String| async move {
-        let r = ctx.schedule_sub_orchestration("Child", "child-input").await?;
-        Ok(format!("parent-got:{r}"))
+        match ctx
+            .schedule_sub_orchestration_with_id("Child", "shared-child", "child-input")
+            .await
+        {
+            Ok(r) => Ok(format!("parent-got:{r}")),
+            Err(e) => Err(format!("child-failed:{e}")),
+        }
     };
     let child = |_ctx: OrchestrationContext, input: String| async move { Ok(format!("child-done:{input}")) };
 
@@ -148,76 +287,34 @@ async fn redelivered_child_start_does_not_fail_parent() {
     let rt = runtime::Runtime::start_with_store(store.clone(), acts, orchs).await;
     let client = Client::new(store.clone());
 
-    client.start_orchestration("job-2", "Parent", "").await.unwrap();
-    let status = client
-        .wait_for_orchestration("job-2", Duration::from_secs(10))
+    // First parent creates "shared-child", which runs to completion.
+    client.start_orchestration("job-2a", "Parent", "").await.unwrap();
+    let first = client
+        .wait_for_orchestration("job-2a", Duration::from_secs(10))
         .await
         .unwrap();
     assert!(
-        matches!(&status, OrchestrationStatus::Completed { output, .. } if output == "parent-got:child-done:child-input"),
-        "parent should complete normally first; got {status:?}"
+        matches!(&first, OrchestrationStatus::Completed { output, .. } if output == "parent-got:child-done:child-input"),
+        "first parent should complete normally; got {first:?}"
     );
 
-    // Snapshot the parent's history before redelivery so we can prove nothing was appended.
-    let parent_history_before = store.read("job-2").await.unwrap();
-
-    // Redeliver the completed child's own StartOrchestration (same parent linkage).
-    // The child id "job-2::sub::2" is now terminal; the dispatcher must treat this as
-    // redelivery and not enqueue a SubOrchFailed for the parent.
-    store
-        .enqueue_for_orchestrator(
-            WorkItem::StartOrchestration {
-                instance: "job-2::sub::2".to_string(),
-                orchestration: "Child".to_string(),
-                input: "child-input".to_string(),
-                version: None,
-                parent_instance: Some("job-2".to_string()),
-                parent_id: Some(2),
-                parent_execution_id: None,
-                execution_id: 1,
-            },
-            None,
-        )
+    // Second parent asks for the same explicit child id, now terminal.
+    client.start_orchestration("job-2b", "Parent", "").await.unwrap();
+    let second = client
+        .wait_for_orchestration("job-2b", Duration::from_secs(10))
         .await
-        .unwrap();
+        .expect("second parent must reach a terminal state, not hang");
 
-    // Wait deterministically until the redelivered child start has drained from the
-    // orchestrator queue (and the queue has settled), rather than sleeping a fixed time.
-    wait_for_orchestrator_queue_drained(&store, Duration::from_secs(10)).await;
-
-    // A spurious notification would be a parent-targeted SubOrchFailed. Assert none is
-    // queued and none was appended to the parent's history. (Checking only that the parent
-    // still reports Completed is insufficient: a SubOrchFailed delivered to an already
-    // terminal parent is discarded by the terminal fast-ack path without a trace.)
-    let depths = store
-        .as_management_capability()
-        .unwrap()
-        .get_queue_depths()
-        .await
-        .unwrap();
-    assert_eq!(
-        depths.orchestrator_queue, 0,
-        "no parent-targeted SubOrchFailed should remain queued after redelivery"
-    );
-
-    let parent_history_after = store.read("job-2").await.unwrap();
-    assert_eq!(
-        parent_history_after.len(),
-        parent_history_before.len(),
-        "redelivery must not append any event (e.g. SubOrchestrationFailed) to the parent"
-    );
-    assert!(
-        !parent_history_after
-            .iter()
-            .any(|e| matches!(e.kind, duroxide::EventKind::OrchestrationFailed { .. })),
-        "parent history must not contain an OrchestrationFailed event after redelivery"
-    );
-
-    let after = client.get_orchestration_status("job-2").await.unwrap();
-    assert!(
-        matches!(after, OrchestrationStatus::Completed { .. }),
-        "redelivery must not fail the parent; got {after:?}"
-    );
+    match second {
+        OrchestrationStatus::Failed { details, .. } => {
+            let msg = details.display_message();
+            assert!(
+                msg.contains("already exists") && msg.contains("shared-child"),
+                "failure should name the colliding child id; got {msg:?}"
+            );
+        }
+        other => panic!("second parent should fail fast on the id collision; got {other:?}"),
+    }
 
     rt.shutdown(None).await;
 }
@@ -701,7 +798,13 @@ async fn legacy_provider_bypass_terminal_collision_routes_via_fallback_on_fresh_
 
     // Sanity: durable state reports the parent on execution 2.
     assert_eq!(
-        store.read(parent_id).await.unwrap().iter().map(|e| e.execution_id).max(),
+        store
+            .read(parent_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.execution_id)
+            .max(),
         Some(2),
         "seeded parent must be on execution 2"
     );
@@ -775,11 +878,16 @@ async fn legacy_provider_bypass_terminal_collision_routes_via_fallback_on_fresh_
 
     rt.shutdown(None).await;
 }
-/// `sub::` marker validation that `Client::start_orchestration` enforces. An orchestration
-/// may therefore use an id that a top-level client start would reject, and it is used as
-/// the exact child instance id.
+
+/// Explicit child ids are validated by a narrower rule than the one
+/// `Client::start_orchestration` enforces: only a *leading* `sub::` is rejected, while the
+/// `::sub::` infix stays legal. An orchestration may therefore use an id that a top-level
+/// client start would reject, and it is used as the exact child instance id.
+///
+/// The infix must stay legal for child ids because the runtime generates it itself: a
+/// grandchild of `root` is named `root::sub::2::sub::2`.
 #[tokio::test]
-async fn explicit_sub_orchestration_id_bypasses_reserved_marker_validation() {
+async fn explicit_sub_orchestration_id_allows_reserved_marker_infix() {
     let store: Arc<dyn Provider> = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
 
     // An id a top-level client start would reject (contains the reserved `::sub::` infix),
