@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reserved the `sub::` marker for runtime-generated sub-orchestration instance ids.
+  `Client::start_orchestration` and `Client::start_orchestration_versioned` now
+  return `ClientError::InvalidInput` for root instance ids that start with `sub::`
+  or contain `::sub::`; other uses of `::` remain supported. Applications that used
+  the reserved marker in root instance ids must rename those ids before upgrading.
+  See [docs/migration-guide.md](docs/migration-guide.md) for guidance.
+- `ctx.schedule_orchestration()` and `ctx.schedule_orchestration_versioned()` now enforce the
+  same reserved-marker rule. These start a **root** instance with a caller-supplied id used
+  verbatim, so they could previously squat an id the runtime would later generate for a
+  sub-orchestration. They return `()`, so a violation panics, surfacing as a deterministic
+  orchestration failure on the first execution.
+- `ctx.schedule_sub_orchestration_with_id()` and
+  `ctx.schedule_sub_orchestration_versioned_with_id()` now reject explicit child ids that
+  **start with** `sub::`. The returned future resolves immediately to an `Err` and nothing
+  is scheduled or written to history. That prefix is a control signal the runtime reads to
+  mean "auto-generated suffix", so such an id was previously rewritten rather than used
+  verbatim (`sub::my-child` became `{parent}::sub::my-child`, and the internal
+  `sub::pending_` placeholder shape was discarded outright). The `::sub::` infix remains
+  valid for explicit child ids — the runtime generates it itself, e.g. a grandchild of
+  `root` is `root::sub::2::sub::2`.
 - **`ctx.new_guid()` now returns a standard UUID v4.** The previous
   implementation derived the value from `SystemTime::now()` nanoseconds plus a
   thread-local counter, which produced low-entropy, structured values (the
@@ -18,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQLite provider lock tokens now use a random UUID** instead of
   `nanos + process id`, removing a predictable-token pattern in work-item
   ownership checks.
+
+### Fixed
+
+- **Parent hang on sub-orchestration instance-id collision** — When an auto-generated
+  child instance id already named a terminal instance, the scheduling parent could await
+  a completion that never arrived. The runtime now notifies the parent with a
+  sub-orchestration failure so it fails fast. The parent execution that scheduled the child
+  is stamped onto the child start at schedule time and persisted in the child's
+  `OrchestrationStarted` event, so the failure (and all sub-orchestration completion/failure
+  notifications) is routed to exactly that parent execution. This is correct across runtime
+  restarts and multiple dispatcher nodes, and avoids a TOCTOU window where the parent's
+  *current* execution at completion time could differ from the execution that scheduled the
+  child. When the stamp is absent (children started by an older runtime, or work items from
+  before this change), routing falls back to a durable provider read, keeping mixed-version
+  clusters correct during rolling upgrades.
+- **Sub-orchestration id reuse across continue-as-new** — Child instance ids generated
+  after a parent `continue_as_new` now include the parent execution id
+  (`{parent}::sub::{execution_id}_{event_id}`), preventing collisions with the terminal
+  child of a previous iteration that schedules at the same position.
 
 ## [0.1.29] - 2026-05-08
 

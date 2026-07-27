@@ -25,6 +25,7 @@ fn start_item(instance: &str) -> WorkItem {
         version: Some("1.0.0".to_string()),
         parent_instance: None,
         parent_id: None,
+        parent_execution_id: None,
         execution_id: INITIAL_EXECUTION_ID,
     }
 }
@@ -42,6 +43,7 @@ fn orchestration_started_event(instance: &str, duroxide_version: &str) -> Event 
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             carry_forward_events: None,
             initial_custom_status: None,
         },

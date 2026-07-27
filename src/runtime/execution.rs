@@ -66,6 +66,7 @@ impl Runtime {
                         version: version.clone(),
                         parent_instance: None,
                         parent_id: None,
+                        parent_execution_id: None,
                         execution_id: crate::INITIAL_EXECUTION_ID,
                     });
                 }
@@ -79,7 +80,7 @@ impl Runtime {
         // (works for both existing history and newly appended OrchestrationStarted in delta)
         let (input, parent_link) = history_mgr.extract_context();
 
-        if let Some((ref pinst, pid)) = parent_link {
+        if let Some((ref pinst, _pexec, pid)) = parent_link {
             tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, parent_instance=%pinst, parent_id=%pid, "Detected parent link for orchestration");
         } else {
             tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, "No parent link for orchestration");
@@ -154,7 +155,6 @@ impl Runtime {
                             session_id,
                             tag,
                         } => {
-                            let execution_id = self.get_execution_id_for_instance(instance, Some(execution_id)).await;
                             worker_items.push(WorkItem::ActivityExecute {
                                 instance: instance.to_string(),
                                 execution_id,
@@ -169,8 +169,6 @@ impl Runtime {
                             scheduling_event_id,
                             fire_at_ms,
                         } => {
-                            let execution_id = self.get_execution_id_for_instance(instance, Some(execution_id)).await;
-
                             // Enqueue TimerFired to orchestrator queue with delayed visibility
                             // Provider will use fire_at_ms for the visible_at timestamp
                             // Note: fire_at_ms is computed at scheduling time (wall-clock),
@@ -197,6 +195,10 @@ impl Runtime {
                                 version: version.clone(),
                                 parent_instance: Some(instance.to_string()),
                                 parent_id: Some(*scheduling_event_id),
+                                // Stamp the scheduling parent execution so the child's
+                                // completion/failure routes back to this exact execution,
+                                // even across continue-as-new, restarts, or other nodes.
+                                parent_execution_id: Some(execution_id),
                                 execution_id: crate::INITIAL_EXECUTION_ID,
                             });
                         }
@@ -214,6 +216,7 @@ impl Runtime {
                                 version: version.clone(),
                                 parent_instance: None,
                                 parent_id: None,
+                                parent_execution_id: None,
                                 execution_id: crate::INITIAL_EXECUTION_ID,
                             });
                         }
@@ -243,11 +246,14 @@ impl Runtime {
                 ));
 
                 // Notify parent if this is a sub-orchestration
-                if let Some((parent_instance, parent_id)) = parent_link {
+                if let Some((parent_instance, parent_execution_id, parent_id)) = parent_link {
                     tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, parent_instance=%parent_instance, parent_id=%parent_id, "Enqueue SubOrchCompleted to parent");
+                    let parent_execution_id = self
+                        .resolve_parent_execution_id(&parent_instance, parent_execution_id)
+                        .await;
                     orchestrator_items.push(WorkItem::SubOrchCompleted {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.get_execution_id_for_instance(&parent_instance, None).await,
+                        parent_execution_id,
                         parent_id,
                         result: output.clone(),
                     });
@@ -276,11 +282,14 @@ impl Runtime {
                 history_mgr.append_failed(instance, execution_id, details.clone());
 
                 // Notify parent if this is a sub-orchestration
-                if let Some((parent_instance, parent_id)) = parent_link {
+                if let Some((parent_instance, parent_execution_id, parent_id)) = parent_link {
                     tracing::debug!(target = "duroxide::runtime::execution", instance=%instance, parent_instance=%parent_instance, parent_id=%parent_id, "Enqueue SubOrchFailed to parent");
+                    let parent_execution_id = self
+                        .resolve_parent_execution_id(&parent_instance, parent_execution_id)
+                        .await;
                     orchestrator_items.push(WorkItem::SubOrchFailed {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.get_execution_id_for_instance(&parent_instance, None).await,
+                        parent_execution_id,
                         parent_id,
                         details: details.clone(),
                     });
@@ -364,10 +373,13 @@ impl Runtime {
                 }
 
                 // Notify parent if this is a sub-orchestration
-                if let Some((parent_instance, parent_id)) = parent_link {
+                if let Some((parent_instance, parent_execution_id, parent_id)) = parent_link {
+                    let parent_execution_id = self
+                        .resolve_parent_execution_id(&parent_instance, parent_execution_id)
+                        .await;
                     orchestrator_items.push(WorkItem::SubOrchFailed {
                         parent_instance: parent_instance.clone(),
-                        parent_execution_id: self.get_execution_id_for_instance(&parent_instance, None).await,
+                        parent_execution_id,
                         parent_id,
                         details: details.clone(),
                     });

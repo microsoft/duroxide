@@ -1082,7 +1082,7 @@ impl ReplayEngine {
 
             ctx.bind_token(token, event_id);
 
-            let updated_action = update_action_event_id(action, event_id);
+            let updated_action = update_action_event_id(action, self.execution_id, event_id);
 
             if let crate::Action::StartSubOrchestration { instance, .. } = &updated_action {
                 ctx.bind_sub_orchestration_instance(token, instance.clone());
@@ -1750,7 +1750,7 @@ fn action_to_event(action: &Action, instance: &str, execution_id: u64, event_id:
 /// Update an action's scheduling_event_id to the correct event_id.
 /// Also generates the actual sub-orchestration instance ID from the event_id
 /// (unless an explicit instance ID was provided, indicated by not starting with SUB_ORCH_PENDING_PREFIX).
-fn update_action_event_id(action: Action, event_id: u64) -> Action {
+fn update_action_event_id(action: Action, execution_id: u64, event_id: u64) -> Action {
     match action {
         Action::CallActivity {
             name,
@@ -1793,7 +1793,7 @@ fn update_action_event_id(action: Action, event_id: u64) -> Action {
             // If instance starts with the pending prefix, it's a placeholder that needs to be replaced.
             // Otherwise, it's an explicit instance ID provided by the user.
             let final_instance = if instance.starts_with(crate::SUB_ORCH_PENDING_PREFIX) {
-                format!("{}{event_id}", crate::SUB_ORCH_AUTO_PREFIX)
+                crate::auto_sub_orch_suffix(execution_id, event_id)
             } else {
                 instance
             };
@@ -1924,6 +1924,7 @@ mod tests {
                     input: "test-input".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },

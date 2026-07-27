@@ -1471,6 +1471,7 @@ pub async fn test_kv_delete_instance_with_children<F: ProviderFactory>(factory: 
         input: "{}".to_string(),
         parent_instance: Some("kv-parent".to_string()),
         parent_id: Some(1),
+        parent_execution_id: None,
         execution_id: crate::INITIAL_EXECUTION_ID,
     };
     provider.enqueue_for_orchestrator(child_start, None).await.unwrap();
@@ -1496,6 +1497,7 @@ pub async fn test_kv_delete_instance_with_children<F: ProviderFactory>(factory: 
                     input: "{}".to_string(),
                     parent_instance: Some("kv-parent".to_string()),
                     parent_id: Some(1),
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
@@ -2408,6 +2410,7 @@ async fn continue_as_new(provider: &dyn crate::providers::Provider, instance: &s
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },

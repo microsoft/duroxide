@@ -443,6 +443,13 @@ pub enum WorkItem {
         version: Option<String>,
         parent_instance: Option<String>,
         parent_id: Option<u64>,
+        /// Execution id of the parent that scheduled this sub-orchestration, stamped at
+        /// schedule time so completion/failure notifications route back to the exact
+        /// parent execution that awaited the child (rather than the parent's current
+        /// execution at completion time). `None` for top-level starts and for work items
+        /// produced by older runtimes; routing then falls back to a durable provider read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_execution_id: Option<u64>,
         execution_id: u64,
     },
 

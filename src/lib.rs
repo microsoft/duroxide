@@ -876,6 +876,46 @@ pub fn is_auto_generated_sub_orch_id(instance: &str) -> bool {
     instance.starts_with(SUB_ORCH_AUTO_PREFIX)
 }
 
+/// Build the auto-generated sub-orchestration suffix for a given parent execution
+/// and scheduling event id.
+///
+/// The first execution uses `sub::{event_id}` for backward compatibility. Later
+/// executions (after `continue_as_new`) include the execution id as
+/// `sub::{execution_id}_{event_id}`: event ids reset on continue-as-new, so a parent
+/// that schedules a sub-orchestration at the same position on each iteration would
+/// otherwise regenerate an identical child id and collide with the now-terminal
+/// child from the previous iteration.
+#[inline]
+pub(crate) fn auto_sub_orch_suffix(execution_id: u64, event_id: u64) -> String {
+    if execution_id == INITIAL_EXECUTION_ID {
+        format!("{SUB_ORCH_AUTO_PREFIX}{event_id}")
+    } else {
+        format!("{SUB_ORCH_AUTO_PREFIX}{execution_id}_{event_id}")
+    }
+}
+
+/// Determine if a **root** instance id uses the reserved sub-orchestration marker.
+///
+/// Root ids (top-level client starts and detached orchestrations) must avoid both forms,
+/// because either could pre-occupy an id the runtime will later generate for a child:
+///
+/// - a leading `sub::`, the marker [`build_child_instance_id`] reads to mean
+///   "auto-generated suffix, add the parent prefix";
+/// - the `::sub::` infix, which is the shape of a full child id
+///   (`{parent}::sub::{event_id}`, or `{parent}::sub::{execution_id}_{event_id}` after
+///   `continue_as_new` — see [`auto_sub_orch_suffix`]).
+///
+/// Explicit *child* ids use a deliberately narrower rule that rejects only the leading
+/// marker — see [`OrchestrationContext::schedule_sub_orchestration_with_id`]. The infix
+/// must stay legal there because the runtime generates it itself: a grandchild of `root`
+/// is named `root::sub::2::sub::2`.
+///
+/// Other uses of `::` (e.g. `tenant-7::order-42`) are unaffected.
+#[inline]
+pub(crate) fn uses_reserved_root_marker(instance: &str) -> bool {
+    instance.starts_with(SUB_ORCH_AUTO_PREFIX) || instance.contains("::sub::")
+}
+
 /// Build the full child instance ID, adding parent prefix only for auto-generated IDs.
 ///
 /// - Auto-generated IDs (starting with "sub::"): `{parent}::{child}` (e.g., `parent-1::sub::5`)
@@ -1102,6 +1142,13 @@ pub enum EventKind {
         input: String,
         parent_instance: Option<String>,
         parent_id: Option<u64>,
+        /// Execution id of the parent that scheduled this sub-orchestration, persisted at
+        /// child-start time. Used to route this child's completion/failure back to the
+        /// exact parent execution that awaited it. `None` for root orchestrations and for
+        /// children started by older runtimes (routing then falls back to a provider read).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        parent_execution_id: Option<u64>,
         /// Persistent events carried forward from the previous execution during continue-as-new.
         /// Present only on CAN-initiated executions for audit trail. Each tuple is (event_name, data).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -3105,7 +3152,18 @@ impl OrchestrationContext {
     }
 
     /// Schedule a detached orchestration with an explicit instance id.
-    /// The runtime will prefix this with the parent instance to ensure global uniqueness.
+    ///
+    /// The id is used **verbatim** as a root instance id — no parent prefix is added — so the
+    /// caller owns global uniqueness. Fire-and-forget: no result is routed back.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `instance` uses the reserved sub-orchestration marker (a leading `sub::`
+    /// or the `::sub::` infix), matching the rule
+    /// [`crate::Client::start_orchestration`] enforces for root ids. Such an id could
+    /// pre-occupy an id the runtime will later generate for a sub-orchestration. This method
+    /// returns `()`, so there is no error channel — the panic surfaces as a deterministic
+    /// orchestration failure on the first execution.
     pub fn schedule_orchestration(
         &self,
         name: impl Into<String>,
@@ -3115,6 +3173,11 @@ impl OrchestrationContext {
         let name: String = name.into();
         let instance: String = instance.into();
         let input: String = input.into();
+        assert!(
+            !uses_reserved_root_marker(&instance),
+            "detached orchestration instance id '{instance}' uses the reserved sub-orchestration marker \
+             '{SUB_ORCH_AUTO_PREFIX}'; root instance ids must not start with it or contain '::sub::'"
+        );
         let mut inner = self.inner.lock().unwrap();
 
         let _ = inner.emit_action(Action::StartOrchestrationDetached {
@@ -3137,6 +3200,11 @@ impl OrchestrationContext {
     }
 
     /// Versioned detached orchestration start (string I/O). If `version` is None, registry policy is used for the child.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `instance` uses the reserved sub-orchestration marker; see
+    /// [`schedule_orchestration`](Self::schedule_orchestration).
     pub fn schedule_orchestration_versioned(
         &self,
         name: impl Into<String>,
@@ -3147,6 +3215,11 @@ impl OrchestrationContext {
         let name: String = name.into();
         let instance: String = instance.into();
         let input: String = input.into();
+        assert!(
+            !uses_reserved_root_marker(&instance),
+            "detached orchestration instance id '{instance}' uses the reserved sub-orchestration marker \
+             '{SUB_ORCH_AUTO_PREFIX}'; root instance ids must not start with it or contain '::sub::'"
+        );
         let mut inner = self.inner.lock().unwrap();
 
         let _ = inner.emit_action(Action::StartOrchestrationDetached {
@@ -3735,7 +3808,27 @@ impl OrchestrationContext {
     /// without any parent prefix. Use this when you need to control the exact
     /// instance ID for the sub-orchestration.
     ///
-    /// For auto-generated instance IDs, use [`schedule_sub_orchestration`] instead.
+    /// For auto-generated instance IDs, use [`schedule_sub_orchestration`](Self::schedule_sub_orchestration)
+    /// instead.
+    ///
+    /// # Reserved marker
+    ///
+    /// A leading `sub::` is **rejected**: the returned future resolves immediately to an
+    /// `Err` and no sub-orchestration is scheduled. The runtime uses that prefix as a
+    /// control signal — [`crate::build_child_instance_id`] reads it to mean "this is an
+    /// auto-generated suffix, add the parent prefix", and `sub::pending_` is an internal
+    /// placeholder that gets replaced outright. An explicit id starting with `sub::` would
+    /// therefore be silently rewritten rather than used verbatim, so it is refused instead.
+    ///
+    /// `sub::` *elsewhere* in the id is fine and is used verbatim (e.g. `tenant::sub::99`).
+    /// This is narrower than [`crate::Client::start_orchestration`], which also rejects the
+    /// `::sub::` infix: child ids legitimately contain it, since a grandchild of `root` is
+    /// named `root::sub::2::sub::2`.
+    ///
+    /// Note that an explicit id of the runtime-generated shape (e.g. `parent::sub::2`) is
+    /// still allowed and may therefore collide with an auto-generated child id. The runtime
+    /// defends against the resulting collision: if the id already names a terminal instance
+    /// the scheduling parent receives a sub-orchestration failure instead of hanging.
     pub fn schedule_sub_orchestration_with_id(
         &self,
         name: impl Into<String>,
@@ -3762,6 +3855,10 @@ impl OrchestrationContext {
     ///
     /// The provided `instance` value is used exactly as the child instance ID,
     /// without any parent prefix.
+    ///
+    /// Like [`schedule_sub_orchestration_with_id`](Self::schedule_sub_orchestration_with_id),
+    /// an explicit id with a leading `sub::` is rejected; see that method for the reserved
+    /// marker rules.
     ///
     /// Returns a [`DurableFuture`] that supports cancellation on drop. If the future
     /// is dropped without completing, a `CancelInstance` work item will be enqueued
@@ -3791,6 +3888,32 @@ impl OrchestrationContext {
         let input: String = input.into();
 
         let mut inner = self.inner.lock().expect("Mutex should not be poisoned");
+
+        // Reject explicit ids that begin with the reserved marker. `SUB_ORCH_AUTO_PREFIX`
+        // and `SUB_ORCH_PENDING_PREFIX` are control signals read further down the pipeline
+        // (`build_child_instance_id` adds the parent prefix; `update_action_event_id`
+        // replaces pending placeholders outright), so such an id would be silently rewritten
+        // instead of used verbatim. Fail at schedule time rather than surprise the caller.
+        //
+        // Deterministic on replay: the decision depends only on the caller-supplied id.
+        // No action is emitted, so nothing is written to history.
+        if let Some(explicit_id) = instance.as_ref().filter(|id| id.starts_with(SUB_ORCH_AUTO_PREFIX)) {
+            let message = format!(
+                "sub-orchestration instance id '{explicit_id}' starts with the reserved marker \
+                 '{SUB_ORCH_AUTO_PREFIX}', which the runtime uses to mark auto-generated child ids; \
+                 use an id that does not begin with it"
+            );
+            // Reserve a token so token numbering matches the emitting path.
+            inner.next_token += 1;
+            let token = inner.next_token;
+            drop(inner);
+            return DurableFuture::new(
+                token,
+                ScheduleKind::SubOrchestration { token },
+                self.clone(),
+                std::future::ready(Err(message)),
+            );
+        }
 
         // For explicit instance IDs, use them as-is (no parent prefix will be added).
         // For auto-generated, use placeholder that will be replaced with SUB_ORCH_AUTO_PREFIX + event_id
