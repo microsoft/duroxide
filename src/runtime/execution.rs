@@ -345,6 +345,9 @@ impl Runtime {
                     orchestration: orchestration_name.to_string(),
                     input: input.clone(),
                     version: version.clone(),
+                    parent_instance: history_mgr.parent_instance.clone(),
+                    parent_id: history_mgr.parent_id,
+                    parent_execution_id: history_mgr.parent_execution_id,
                     carry_forward_events: unmatched,
                     initial_custom_status,
                 });

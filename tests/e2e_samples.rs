@@ -583,6 +583,56 @@ async fn sample_sub_orchestration_basic_fs() {
     rt.shutdown(None).await;
 }
 
+/// Sub-orchestrations: child uses ContinueAsNew before completing.
+///
+/// Highlights:
+/// - Parent awaits a child orchestration across multiple child executions
+/// - Child preserves its parent link when rolling over with ContinueAsNew
+#[tokio::test]
+async fn sample_sub_orchestration_continue_as_new_fs() {
+    let (store, _temp_dir) = common::create_sqlite_store_disk().await;
+
+    let activity_registry = ActivityRegistry::builder().build();
+
+    let loop_child = |ctx: OrchestrationContext, input: String| async move {
+        let n: u32 = input.parse().unwrap_or(0);
+        if n < 3 {
+            return ctx.continue_as_new((n + 1).to_string()).await;
+        }
+
+        Ok(format!("child-final:{n}"))
+    };
+    let parent = |ctx: OrchestrationContext, input: String| async move {
+        let r = ctx.schedule_sub_orchestration("LoopChild", input).await.unwrap();
+        Ok(format!("parent:{r}"))
+    };
+
+    let orchestration_registry = OrchestrationRegistry::builder()
+        .register("LoopChild", loop_child)
+        .register("ParentCan", parent)
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
+    let client = Client::new(store.clone());
+    client
+        .start_orchestration("inst-sub-can", "ParentCan", "0")
+        .await
+        .unwrap();
+
+    match client
+        .wait_for_orchestration("inst-sub-can", std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+    {
+        runtime::OrchestrationStatus::Completed { output, .. } => assert_eq!(output, "parent:child-final:3"),
+        runtime::OrchestrationStatus::Failed { details, .. } => {
+            panic!("orchestration failed: {}", details.display_message())
+        }
+        _ => panic!("unexpected orchestration status"),
+    }
+    rt.shutdown(None).await;
+}
+
 /// Sub-orchestrations: fan-out to multiple children and join.
 ///
 /// Highlights:

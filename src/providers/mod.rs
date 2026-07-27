@@ -546,6 +546,28 @@ pub enum WorkItem {
         orchestration: String,
         input: String,
         version: Option<String>,
+        /// Parent instance ID, preserved across continue-as-new so a logical
+        /// sub-orchestration can still notify its parent when a later execution
+        /// completes or fails.
+        ///
+        /// Optional for backward compatibility: messages enqueued by older
+        /// runtimes won't carry this, in which case the runtime falls back to
+        /// deriving the parent link from the previous execution's history.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        parent_instance: Option<String>,
+        /// Parent's `SubOrchestrationScheduled` event id, preserved across
+        /// continue-as-new alongside `parent_instance`. Optional for the same
+        /// backward-compatibility reason described above.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        parent_id: Option<u64>,
+        /// Parent's execution id, preserved across continue-as-new so completion
+        /// notifications route to the exact parent execution that scheduled this
+        /// child. Optional for the same backward-compatibility reason described above.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        parent_execution_id: Option<u64>,
         /// Persistent events carried forward from the previous execution.
         /// These are seeded into the new execution's history before any new
         /// externally-raised events, preserving FIFO order across CAN boundaries.

@@ -303,6 +303,9 @@ async fn create_running_multi_execution_instance(
                 orchestration: "LongRunning".to_string(),
                 input: "{}".to_string(),
                 version: Some("1.0.0".to_string()),
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: vec![],
                 initial_custom_status: None,
             }
@@ -369,6 +372,9 @@ async fn create_multi_execution_instance(
                 orchestration: "TestOrch".to_string(),
                 input: "{}".to_string(),
                 version: Some("1.0.0".to_string()),
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: vec![],
                 initial_custom_status: None,
             }

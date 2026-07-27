@@ -469,6 +469,9 @@ impl WorkItemReader {
                         orchestration,
                         input,
                         version,
+                        parent_instance,
+                        parent_id,
+                        parent_execution_id,
                         carry_forward_events,
                         ..
                     } => {
@@ -486,13 +489,16 @@ impl WorkItemReader {
                         carried.append(&mut completion_messages);
                         completion_messages = carried;
 
+                        // Prefer the parent link carried on the work item. Fall back to
+                        // the previous execution's history for messages enqueued by older
+                        // runtimes that didn't stamp these fields (rolling-upgrade compat).
                         (
                             orchestration.clone(),
                             input.clone(),
                             version.clone(),
-                            None,
-                            None,
-                            None,
+                            parent_instance.clone().or_else(|| history_mgr.parent_instance.clone()),
+                            parent_id.or(history_mgr.parent_id),
+                            parent_execution_id.or(history_mgr.parent_execution_id),
                             true,
                         )
                     }
@@ -782,6 +788,9 @@ mod tests {
             orchestration: "test-orch".to_string(),
             input: "new-input".to_string(),
             version: Some("2.0.0".to_string()),
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
             carry_forward_events: vec![],
             initial_custom_status: None,
         }];
@@ -795,6 +804,71 @@ mod tests {
         assert!(reader.is_continue_as_new);
         assert_eq!(reader.parent_instance, None);
         assert_eq!(reader.parent_id, None);
+    }
+
+    #[test]
+    fn test_workitem_reader_can_preserves_parent_link_from_work_item() {
+        // New runtimes stamp the parent link directly onto the ContinueAsNew work item.
+        let messages = vec![WorkItem::ContinueAsNew {
+            instance: "child-inst".to_string(),
+            orchestration: "test-orch".to_string(),
+            input: "new-input".to_string(),
+            version: Some("2.0.0".to_string()),
+            parent_instance: Some("parent-inst".to_string()),
+            parent_id: Some(42),
+            parent_execution_id: Some(7),
+            carry_forward_events: vec![],
+            initial_custom_status: None,
+        }];
+
+        let history_mgr = HistoryManager::from_history(&[]);
+        let reader = WorkItemReader::from_messages(&messages, &history_mgr, "child-inst");
+
+        assert!(reader.is_continue_as_new);
+        assert_eq!(reader.parent_instance, Some("parent-inst".to_string()));
+        assert_eq!(reader.parent_id, Some(42));
+        assert_eq!(reader.parent_execution_id, Some(7));
+    }
+
+    #[test]
+    fn test_workitem_reader_can_preserves_parent_link_from_history() {
+        // Backcompat: a ContinueAsNew work item enqueued by an older runtime carries no
+        // parent fields, so the link must be recovered from the previous execution's history.
+        let messages = vec![WorkItem::ContinueAsNew {
+            instance: "child-inst".to_string(),
+            orchestration: "test-orch".to_string(),
+            input: "new-input".to_string(),
+            version: Some("2.0.0".to_string()),
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
+            carry_forward_events: vec![],
+            initial_custom_status: None,
+        }];
+        let history = vec![Event::with_event_id(
+            1,
+            "child-inst",
+            1,
+            None,
+            EventKind::OrchestrationStarted {
+                name: "test-orch".to_string(),
+                version: "1.0.0".to_string(),
+                input: "old-input".to_string(),
+                parent_instance: Some("parent-inst".to_string()),
+                parent_id: Some(42),
+                parent_execution_id: Some(7),
+                carry_forward_events: None,
+                initial_custom_status: None,
+            },
+        )];
+
+        let history_mgr = HistoryManager::from_history(&history);
+        let reader = WorkItemReader::from_messages(&messages, &history_mgr, "child-inst");
+
+        assert!(reader.is_continue_as_new);
+        assert_eq!(reader.parent_instance, Some("parent-inst".to_string()));
+        assert_eq!(reader.parent_id, Some(42));
+        assert_eq!(reader.parent_execution_id, Some(7));
     }
 
     #[test]
@@ -1028,6 +1102,9 @@ mod tests {
                 orchestration: "orch".to_string(),
                 input: "new".to_string(),
                 version: None,
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
                 carry_forward_events: vec![
                     ("X".to_string(), "old-x".to_string()),
                     ("Y".to_string(), "old-y".to_string()),

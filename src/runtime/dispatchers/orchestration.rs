@@ -1317,14 +1317,19 @@ impl Runtime {
                         WorkItem::ContinueAsNew {
                             orchestration,
                             input,
+                            parent_instance,
+                            parent_id,
+                            parent_execution_id,
                             carry_forward_events,
                             ..
                         } => Some((
                             orchestration.clone(),
                             input.clone(),
-                            None,
-                            None,
-                            None,
+                            // Prefer the parent link carried on the work item; fall back to the
+                            // previous execution's history for messages enqueued by older runtimes.
+                            parent_instance.clone().or_else(|| history_mgr.parent_instance.clone()),
+                            parent_id.or(history_mgr.parent_id),
+                            parent_execution_id.or(history_mgr.parent_execution_id),
                             Some(carry_forward_events.clone()),
                         )),
                         _ => None,
