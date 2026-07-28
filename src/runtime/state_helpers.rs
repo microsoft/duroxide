@@ -489,16 +489,17 @@ impl WorkItemReader {
                         carried.append(&mut completion_messages);
                         completion_messages = carried;
 
-                        // Prefer the parent link carried on the work item. Fall back to
-                        // the previous execution's history for messages enqueued by older
-                        // runtimes that didn't stamp these fields (rolling-upgrade compat).
+                        // The work item is the single source of truth for the parent link.
+                        // Messages enqueued by older runtimes don't carry it, and `None` is
+                        // the honest answer there — the link stays unpreserved for that
+                        // execution, exactly as it was before this field existed.
                         (
                             orchestration.clone(),
                             input.clone(),
                             version.clone(),
-                            parent_instance.clone().or_else(|| history_mgr.parent_instance.clone()),
-                            parent_id.or(history_mgr.parent_id),
-                            parent_execution_id.or(history_mgr.parent_execution_id),
+                            parent_instance.clone(),
+                            *parent_id,
+                            *parent_execution_id,
                             true,
                         )
                     }
@@ -831,9 +832,10 @@ mod tests {
     }
 
     #[test]
-    fn test_workitem_reader_can_preserves_parent_link_from_history() {
-        // Backcompat: a ContinueAsNew work item enqueued by an older runtime carries no
-        // parent fields, so the link must be recovered from the previous execution's history.
+    fn test_workitem_reader_can_without_parent_link_does_not_infer_from_history() {
+        // A ContinueAsNew enqueued by an older runtime carries no parent fields. The work
+        // item is the only source of truth, so the link stays unset for that execution
+        // rather than being inferred from the previous execution's history.
         let messages = vec![WorkItem::ContinueAsNew {
             instance: "child-inst".to_string(),
             orchestration: "test-orch".to_string(),
@@ -866,9 +868,9 @@ mod tests {
         let reader = WorkItemReader::from_messages(&messages, &history_mgr, "child-inst");
 
         assert!(reader.is_continue_as_new);
-        assert_eq!(reader.parent_instance, Some("parent-inst".to_string()));
-        assert_eq!(reader.parent_id, Some(42));
-        assert_eq!(reader.parent_execution_id, Some(7));
+        assert_eq!(reader.parent_instance, None);
+        assert_eq!(reader.parent_id, None);
+        assert_eq!(reader.parent_execution_id, None);
     }
 
     #[test]

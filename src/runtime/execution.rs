@@ -340,14 +340,25 @@ impl Runtime {
                 // Enqueue continue as new work item with carry-forward events embedded.
                 // The orchestration dispatcher will seed these into the new execution's
                 // history before any new externally-raised events, preserving FIFO.
+                //
+                // The parent link comes from `parent_link`, not the cached history metadata:
+                // the metadata is only populated from persisted history, so it is still empty
+                // when an execution starts and continues-as-new within the same turn. The
+                // dispatcher appends OrchestrationStarted to the delta, which `extract_context`
+                // accounts for and the cached fields do not.
+                let (can_parent_instance, can_parent_execution_id, can_parent_id) = match &parent_link {
+                    Some((pinst, pexec, pid)) => (Some(pinst.clone()), *pexec, Some(*pid)),
+                    None => (None, None, None),
+                };
+
                 orchestrator_items.push(WorkItem::ContinueAsNew {
                     instance: instance.to_string(),
                     orchestration: orchestration_name.to_string(),
                     input: input.clone(),
                     version: version.clone(),
-                    parent_instance: history_mgr.parent_instance.clone(),
-                    parent_id: history_mgr.parent_id,
-                    parent_execution_id: history_mgr.parent_execution_id,
+                    parent_instance: can_parent_instance,
+                    parent_id: can_parent_id,
+                    parent_execution_id: can_parent_execution_id,
                     carry_forward_events: unmatched,
                     initial_custom_status,
                 });

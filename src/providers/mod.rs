@@ -550,21 +550,21 @@ pub enum WorkItem {
         /// sub-orchestration can still notify its parent when a later execution
         /// completes or fails.
         ///
-        /// Optional for backward compatibility: messages enqueued by older
-        /// runtimes won't carry this, in which case the runtime falls back to
-        /// deriving the parent link from the previous execution's history.
+        /// Absent on messages enqueued by older runtimes, in which case the parent
+        /// link is not preserved for that execution.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         parent_instance: Option<String>,
         /// Parent's `SubOrchestrationScheduled` event id, preserved across
-        /// continue-as-new alongside `parent_instance`. Optional for the same
-        /// backward-compatibility reason described above.
+        /// continue-as-new alongside `parent_instance`. Absent on messages enqueued
+        /// by older runtimes, with the same consequence described above.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         parent_id: Option<u64>,
         /// Parent's execution id, preserved across continue-as-new so completion
         /// notifications route to the exact parent execution that scheduled this
-        /// child. Optional for the same backward-compatibility reason described above.
+        /// child. Absent on messages enqueued by older runtimes, with the same
+        /// consequence described above.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         parent_execution_id: Option<u64>,

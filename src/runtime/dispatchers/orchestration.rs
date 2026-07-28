@@ -1325,11 +1325,12 @@ impl Runtime {
                         } => Some((
                             orchestration.clone(),
                             input.clone(),
-                            // Prefer the parent link carried on the work item; fall back to the
-                            // previous execution's history for messages enqueued by older runtimes.
-                            parent_instance.clone().or_else(|| history_mgr.parent_instance.clone()),
-                            parent_id.or(history_mgr.parent_id),
-                            parent_execution_id.or(history_mgr.parent_execution_id),
+                            // The work item is the single source of truth for the parent link.
+                            // Messages enqueued by older runtimes don't carry it; `None` leaves
+                            // the link unpreserved for that execution rather than guessing.
+                            parent_instance.clone(),
+                            *parent_id,
+                            *parent_execution_id,
                             Some(carry_forward_events.clone()),
                         )),
                         _ => None,
