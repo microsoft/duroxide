@@ -472,6 +472,8 @@ impl Provider for FilterBypassProvider {
 pub struct FailingProvider {
     inner: Arc<SqliteProvider>,
     fail_next_ack_work_item: AtomicBool,
+    /// Number of remaining `ack_work_item` calls to fail with a *retryable* error
+    retryable_ack_work_item_failures: AtomicU32,
     fail_next_ack_orchestration_item: AtomicBool,
     fail_next_fetch_orchestration_item: AtomicBool,
     fail_next_fetch_work_item: AtomicBool,
@@ -486,6 +488,7 @@ impl FailingProvider {
         Self {
             inner,
             fail_next_ack_work_item: AtomicBool::new(false),
+            retryable_ack_work_item_failures: AtomicU32::new(0),
             fail_next_ack_orchestration_item: AtomicBool::new(false),
             fail_next_fetch_orchestration_item: AtomicBool::new(false),
             fail_next_fetch_work_item: AtomicBool::new(false),
@@ -496,6 +499,19 @@ impl FailingProvider {
 
     pub fn fail_next_ack_work_item(&self) {
         self.fail_next_ack_work_item.store(true, Ordering::SeqCst);
+    }
+
+    /// Fail the next `count` `ack_work_item` calls with a *retryable* error.
+    ///
+    /// Unlike `fail_next_ack_work_item`, the underlying ack is not performed, so the
+    /// work item stays locked and the caller is expected to retry in place.
+    pub fn fail_next_ack_work_item_retryable(&self, count: u32) {
+        self.retryable_ack_work_item_failures.store(count, Ordering::SeqCst);
+    }
+
+    /// Number of injected retryable ack failures that have not been consumed yet.
+    pub fn remaining_retryable_ack_failures(&self) -> u32 {
+        self.retryable_ack_work_item_failures.load(Ordering::SeqCst)
     }
 
     pub fn fail_next_ack_orchestration_item(&self) {
@@ -624,6 +640,17 @@ impl Provider for FailingProvider {
     }
 
     async fn ack_work_item(&self, token: &str, completion: Option<WorkItem>) -> Result<(), ProviderError> {
+        if self
+            .retryable_ack_work_item_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1).filter(|_| n > 0))
+            .is_ok()
+        {
+            return Err(ProviderError::retryable(
+                "ack_work_item",
+                "simulated transient lock contention",
+            ));
+        }
+
         if self.fail_next_ack_work_item.swap(false, Ordering::SeqCst) {
             // If ack_then_fail is set, do the actual ack first
             if self.ack_then_fail.load(Ordering::SeqCst) {
