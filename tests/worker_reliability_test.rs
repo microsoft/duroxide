@@ -411,3 +411,87 @@ async fn worker_abandon_on_ack_failure_enables_retry() {
 
     rt.shutdown(None).await;
 }
+
+/// Test that transient (retryable) ack failures are retried in place instead of
+/// abandoning the work item.
+///
+/// Abandoning on a retryable ack failure redelivers the work item and re-executes the
+/// activity handler. Activities are only guaranteed at-least-once, but re-running a
+/// handler because the database was briefly contended is wasteful and surprising, so the
+/// worker retries the ack before falling back to abandon.
+#[tokio::test]
+async fn worker_retries_retryable_ack_failure_without_reexecuting_activity() {
+    use common::fault_injection::FailingProvider;
+    use duroxide::providers::sqlite::SqliteProvider;
+    use duroxide::runtime::RuntimeOptions;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let failing_provider = Arc::new(FailingProvider::new(sqlite));
+
+    let execution_count = Arc::new(AtomicU32::new(0));
+    let exec_count_clone = execution_count.clone();
+
+    let activities = runtime::registry::ActivityRegistry::builder()
+        .register("CountingActivity", move |_ctx: ActivityContext, _input: String| {
+            let count = exec_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok("done".to_string())
+            }
+        })
+        .build();
+
+    let orchestrations = runtime::registry::OrchestrationRegistry::builder()
+        .register("RetryAckOrch", |ctx: OrchestrationContext, _input: String| async move {
+            ctx.schedule_activity("CountingActivity", "{}").await
+        })
+        .build();
+
+    let options = RuntimeOptions {
+        // Long lock timeout so any retry must come from the in-place ack retry,
+        // not from lock expiry redelivery.
+        worker_lock_timeout: Duration::from_secs(30),
+        ..Default::default()
+    };
+
+    let provider: Arc<dyn duroxide::providers::Provider> = failing_provider.clone();
+    let rt = runtime::Runtime::start_with_options(provider.clone(), activities, orchestrations, options).await;
+    let client = Client::new(provider.clone());
+
+    // Fail the first 3 acks with a retryable error. The worker allows 5 attempts,
+    // so the 4th attempt should succeed.
+    failing_provider.fail_next_ack_work_item_retryable(3);
+
+    client
+        .start_orchestration("retry-ack-test", "RetryAckOrch", "")
+        .await
+        .unwrap();
+
+    let status = client
+        .wait_for_orchestration("retry-ack-test", Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    match status {
+        runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "done");
+        }
+        other => panic!("Unexpected status: {other:?}"),
+    }
+
+    assert_eq!(
+        failing_provider.remaining_retryable_ack_failures(),
+        0,
+        "All injected retryable ack failures should have been exercised"
+    );
+
+    assert_eq!(
+        execution_count.load(Ordering::SeqCst),
+        1,
+        "Activity must not be re-executed when the ack failure was retryable"
+    );
+
+    rt.shutdown(None).await;
+}
