@@ -3608,10 +3608,44 @@ impl OrchestrationContext {
     pub fn schedule_timer(&self, delay: std::time::Duration) -> DurableFuture<()> {
         let delay_ms = delay.as_millis() as u64;
 
+        let now = {
+            let inner = self.inner.lock().expect("Mutex should not be poisoned");
+            inner.now_ms()
+        };
+        let fire_at_ms = now.saturating_add(delay_ms);
+        self.schedule_timer_at_ms(fire_at_ms)
+    }
+
+    /// Schedule a timer that fires at an absolute wall-clock deadline.
+    ///
+    /// Equivalent to [`schedule_timer`](Self::schedule_timer) but anchored to an
+    /// absolute point in time rather than a delay from "now". A deadline already in
+    /// the past fires immediately (next turn). The deadline is recorded durably and
+    /// replayed verbatim, exactly like the existing relative timer.
+    ///
+    /// This is useful when the caller already has an absolute target time (a cron
+    /// tick, an SLA, a scheduled-at timestamp) and wants to avoid the manual
+    /// `deadline - now` clamp and the extra recorded `utc_now` reading that the
+    /// relative form would require.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::time::{Duration, SystemTime};
+    /// let deadline = SystemTime::now() + Duration::from_secs(30);
+    /// ctx.schedule_timer_until(deadline).await;
+    /// ```
+    pub fn schedule_timer_until(&self, deadline: std::time::SystemTime) -> DurableFuture<()> {
+        let fire_at_ms = deadline
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.schedule_timer_at_ms(fire_at_ms)
+    }
+
+    /// Shared timer constructor over an absolute ms-since-epoch fire time.
+    fn schedule_timer_at_ms(&self, fire_at_ms: u64) -> DurableFuture<()> {
         let mut inner = self.inner.lock().expect("Mutex should not be poisoned");
 
-        let now = inner.now_ms();
-        let fire_at_ms = now.saturating_add(delay_ms);
         let token = inner.emit_action(Action::CreateTimer {
             scheduling_event_id: 0,
             fire_at_ms,

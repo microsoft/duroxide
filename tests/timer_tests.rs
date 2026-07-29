@@ -603,3 +603,90 @@ async fn timer_fires_at_correct_time_after_previous_timer() {
         _ => panic!("Unexpected status: {status:?}"),
     }
 }
+
+// ============================================================================
+// ABSOLUTE-DEADLINE TIMER TESTS (schedule_timer_until)
+// ============================================================================
+
+#[tokio::test]
+async fn schedule_timer_until_fires_at_deadline() {
+    let (store, _td) = create_sqlite_store().await;
+
+    const DELAY_MS: u64 = 50;
+    let orch = |ctx: OrchestrationContext, _input: String| async move {
+        let deadline = std::time::SystemTime::now() + Duration::from_millis(DELAY_MS);
+        ctx.schedule_timer_until(deadline).await;
+        Ok("done".to_string())
+    };
+
+    let reg = OrchestrationRegistry::builder()
+        .register("TimerUntil", orch)
+        .build();
+    let acts = ActivityRegistry::builder().build();
+    let rt = runtime::Runtime::start_with_store(store.clone(), acts, reg).await;
+    let client = duroxide::Client::new(store.clone());
+
+    let start = std::time::Instant::now();
+    client
+        .start_orchestration("inst-until", "TimerUntil", "")
+        .await
+        .unwrap();
+
+    let status = client
+        .wait_for_orchestration("inst-until", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let elapsed = start.elapsed().as_millis() as u64;
+
+    assert!(
+        elapsed >= DELAY_MS,
+        "Timer fired too early: expected >={DELAY_MS}ms, got {elapsed}ms"
+    );
+
+    match status {
+        duroxide::runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "done");
+        }
+        other => panic!("Unexpected status: {other:?}"),
+    }
+
+    drop(rt);
+}
+
+#[tokio::test]
+async fn schedule_timer_until_past_deadline_fires_immediately() {
+    let (store, _td) = create_sqlite_store().await;
+
+    // A deadline well in the past should fire immediately (next turn).
+    let orch = |ctx: OrchestrationContext, _input: String| async move {
+        let deadline = std::time::UNIX_EPOCH; // far in the past
+        ctx.schedule_timer_until(deadline).await;
+        Ok("done".to_string())
+    };
+
+    let reg = OrchestrationRegistry::builder()
+        .register("TimerUntilPast", orch)
+        .build();
+    let acts = ActivityRegistry::builder().build();
+    let rt = runtime::Runtime::start_with_store(store.clone(), acts, reg).await;
+    let client = duroxide::Client::new(store.clone());
+
+    client
+        .start_orchestration("inst-until-past", "TimerUntilPast", "")
+        .await
+        .unwrap();
+
+    let status = client
+        .wait_for_orchestration("inst-until-past", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    match status {
+        duroxide::runtime::OrchestrationStatus::Completed { output, .. } => {
+            assert_eq!(output, "done");
+        }
+        other => panic!("Unexpected status: {other:?}"),
+    }
+
+    drop(rt);
+}

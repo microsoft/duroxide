@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ctx.schedule_timer_until(deadline)`** — A new absolute-deadline timer
+  variant that fires at a wall-clock `SystemTime` instead of a relative
+  `Duration`. A deadline already in the past fires immediately. It is a thin
+  constructor over the existing timer machinery (the durable record is already
+  an absolute `fire_at_ms`), so there are no changes to the action/event schema
+  or replay semantics. `schedule_timer` now shares the same internal code path.
+
 ### Changed
 
 - Reserved the `sub::` marker for runtime-generated sub-orchestration instance ids.
