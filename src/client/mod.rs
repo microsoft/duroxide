@@ -167,6 +167,7 @@ const POLL_DELAY_MULTIPLIER: u64 = 2;
 ///     _ => {}
 /// }
 /// ```
+#[derive(Clone)]
 pub struct Client {
     store: Arc<dyn Provider>,
 }

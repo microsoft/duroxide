@@ -26,6 +26,13 @@ async fn create_test_runtime(activity_registry: ActivityRegistry) -> Arc<runtime
     runtime::Runtime::start(activity_registry, orchestration_registry).await
 }
 
+#[test]
+fn client_is_cloneable_and_thread_safe() {
+    fn assert_traits<T: Clone + Send + Sync>() {}
+
+    assert_traits::<duroxide::Client>();
+}
+
 // 3) Deterministic replay on a tiny flow (activity only)
 #[tokio::test]
 async fn deterministic_replay_activity_only() {
