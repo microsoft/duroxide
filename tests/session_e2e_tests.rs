@@ -1583,9 +1583,13 @@ async fn test_multi_worker_heterogeneous_config() {
     // A should hold at most 1 session concurrently. Worker B picks up the rest
     // while A is busy. A may process more than 1 *total* (serially), but B
     // should handle at least 1.
+    //
+    // Activities have at-least-once semantics: an ack failure or lock expiry
+    // redelivers the work item, so the counters can exceed the number of
+    // scheduled activities. Assert a lower bound, not equality.
     let a = worker_a_sessions.load(Ordering::SeqCst);
     let b = worker_b_sessions.load(Ordering::SeqCst);
-    assert_eq!(a + b, 3, "Total should be 3, got A={a} B={b}");
+    assert!(a + b >= 3, "All 3 activities should have run, got A={a} B={b}");
     assert!(
         b >= 1,
         "Worker B should handle at least 1 session (overflow from A's max_sessions=1), got A={a} B={b}"

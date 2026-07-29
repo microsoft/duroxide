@@ -590,7 +590,7 @@ async fn run_activity_with_cancellation(
             let duration_seconds = start_time.elapsed().as_secs_f64();
             rt.record_activity_execution(&ctx.activity_name, "cancelled", duration_seconds, 0, ctx.tag.as_deref());
 
-            let result = rt.history_store.ack_work_item(&ctx.lock_token, None).await;
+            let result = ack_work_item_with_retry(rt, ctx, None).await;
             if let Err(e) = &result {
                 tracing::warn!(
                     target: "duroxide::runtime",
@@ -608,6 +608,47 @@ async fn run_activity_with_cancellation(
 // ============================================================================
 // Activity Completion Handlers
 // ============================================================================
+
+/// Maximum number of attempts when acking an activity completion.
+const MAX_ACK_ATTEMPTS: u32 = 5;
+
+/// Ack a work item, retrying transient provider failures with exponential backoff.
+///
+/// Activities have at-least-once semantics, so an ack failure is not a correctness
+/// violation — but it is expensive: the caller abandons the work item, the activity is
+/// redelivered, and the handler runs again. Retryable provider errors (database lock
+/// contention, transient connection failures) usually clear within milliseconds, so
+/// retrying here avoids most redundant re-executions. This mirrors the retry handling
+/// the dispatcher loop already applies to `fetch_work_item`.
+async fn ack_work_item_with_retry(
+    rt: &Arc<Runtime>,
+    ctx: &ActivityWorkContext,
+    item: Option<WorkItem>,
+) -> Result<(), crate::providers::ProviderError> {
+    let mut attempt = 1;
+    loop {
+        match rt.history_store.ack_work_item(&ctx.lock_token, item.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.is_retryable() && attempt < MAX_ACK_ATTEMPTS => {
+                let backoff_ms = (50 * 2_u64.pow(attempt)).min(1000);
+                warn!(
+                    instance = %ctx.instance,
+                    execution_id = ctx.execution_id,
+                    activity_id = ctx.activity_id,
+                    worker_id = %ctx.worker_id,
+                    attempt = attempt,
+                    max_attempts = MAX_ACK_ATTEMPTS,
+                    error = %e,
+                    "worker: ack failed (retryable), backing off {}ms",
+                    backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// Handle successful activity completion.
 async fn handle_activity_success(
@@ -635,18 +676,17 @@ async fn handle_activity_success(
 
     rt.record_activity_execution(&ctx.activity_name, "success", duration_seconds, 0, ctx.tag.as_deref());
 
-    let ack_result = rt
-        .history_store
-        .ack_work_item(
-            &ctx.lock_token,
-            Some(WorkItem::ActivityCompleted {
-                instance: ctx.instance.clone(),
-                execution_id: ctx.execution_id,
-                id: ctx.activity_id,
-                result,
-            }),
-        )
-        .await;
+    let ack_result = ack_work_item_with_retry(
+        rt,
+        ctx,
+        Some(WorkItem::ActivityCompleted {
+            instance: ctx.instance.clone(),
+            execution_id: ctx.execution_id,
+            id: ctx.activity_id,
+            result,
+        }),
+    )
+    .await;
 
     (ack_result, ActivityOutcome::Success)
 }
@@ -677,22 +717,21 @@ async fn handle_activity_error(
 
     rt.record_activity_execution(&ctx.activity_name, "app_error", duration_seconds, 0, ctx.tag.as_deref());
 
-    let ack_result = rt
-        .history_store
-        .ack_work_item(
-            &ctx.lock_token,
-            Some(WorkItem::ActivityFailed {
-                instance: ctx.instance.clone(),
-                execution_id: ctx.execution_id,
-                id: ctx.activity_id,
-                details: crate::ErrorDetails::Application {
-                    kind: crate::AppErrorKind::ActivityFailed,
-                    message: error,
-                    retryable: false,
-                },
-            }),
-        )
-        .await;
+    let ack_result = ack_work_item_with_retry(
+        rt,
+        ctx,
+        Some(WorkItem::ActivityFailed {
+            instance: ctx.instance.clone(),
+            execution_id: ctx.execution_id,
+            id: ctx.activity_id,
+            details: crate::ErrorDetails::Application {
+                kind: crate::AppErrorKind::ActivityFailed,
+                message: error,
+                retryable: false,
+            },
+        }),
+    )
+    .await;
 
     (ack_result, ActivityOutcome::AppError)
 }
