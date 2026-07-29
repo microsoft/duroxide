@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-07-29
+
+**Release:** <https://crates.io/crates/duroxide/0.1.30>
+
 ### Changed
 
 - Reserved the `sub::` marker for runtime-generated sub-orchestration instance ids.
@@ -41,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Parent link lost when a sub-orchestration continued as new** — A child that called
+  `continue_as_new` dropped its parent instance, scheduling event, and execution ids. When
+  the child later completed or failed, the replacement execution could not notify the
+  parent, leaving the parent waiting indefinitely. Continue-as-new work items now preserve
+  the full parent link across child executions, including when the child continues as new
+  in its first turn. The new fields are optional for wire compatibility with work items
+  created by older runtimes. (#31)
 - **Parent hang on sub-orchestration instance-id collision** — When an auto-generated
   child instance id already named a terminal instance, the scheduling parent could await
   a completion that never arrived. The runtime now notifies the parent with a

@@ -406,7 +406,7 @@ async fn orchestration_fails_before_activity_finishes() {
         .await
         .unwrap()
     {
-        runtime::OrchestrationStatus::Failed { details: _, .. } => {} // Expected failure
+        runtime::OrchestrationStatus::Failed { .. } => {} // Expected failure
         runtime::OrchestrationStatus::Completed { output, .. } => panic!("expected failure, got: {output}"),
         _ => panic!("unexpected orchestration status"),
     }

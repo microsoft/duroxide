@@ -1420,13 +1420,11 @@ async fn sample_cancellation_parent_cascades_to_children_fs() {
         .find(|e| matches!(&e.kind, EventKind::OrchestrationFailed { .. }))
         .expect("parent history should contain OrchestrationFailed");
     assert_eq!(
-        failed.instance_id,
-        "inst-sample-cancel",
+        failed.instance_id, "inst-sample-cancel",
         "OrchestrationFailed must carry the instance_id"
     );
     assert_ne!(
-        failed.execution_id,
-        0,
+        failed.execution_id, 0,
         "OrchestrationFailed must carry a non-placeholder execution_id"
     );
 

@@ -446,7 +446,7 @@ async fn history_cap_exceeded_with(store: StdArc<dyn Provider>) {
         .wait_for_orchestration("inst-cap-exceed", std::time::Duration::from_secs(10))
         .await
     {
-        Ok(duroxide::OrchestrationStatus::Failed { details: _, .. }) => {} // Expected failure due to history capacity
+        Ok(duroxide::OrchestrationStatus::Failed { .. }) => {} // Expected failure due to history capacity
         Ok(duroxide::OrchestrationStatus::Completed { output, .. }) => {
             panic!("expected failure due to history capacity, got: {output}")
         }
@@ -497,7 +497,7 @@ async fn orchestration_immediate_fail_fs() {
         .await
         .unwrap()
     {
-        duroxide::OrchestrationStatus::Failed { details: _, .. } => {} // Expected failure
+        duroxide::OrchestrationStatus::Failed { .. } => {} // Expected failure
         duroxide::OrchestrationStatus::Completed { output, .. } => panic!("expected failure, got: {output}"),
         _ => panic!("unexpected orchestration status"),
     }
