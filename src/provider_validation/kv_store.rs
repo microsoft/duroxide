@@ -2383,6 +2383,9 @@ async fn continue_as_new(provider: &dyn crate::providers::Provider, instance: &s
         orchestration: "TestOrch".to_string(),
         input: "{}".to_string(),
         version: Some("1.0.0".to_string()),
+        parent_instance: None,
+        parent_id: None,
+        parent_execution_id: None,
         carry_forward_events: vec![],
         initial_custom_status: None,
     };

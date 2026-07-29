@@ -1317,14 +1317,20 @@ impl Runtime {
                         WorkItem::ContinueAsNew {
                             orchestration,
                             input,
+                            parent_instance,
+                            parent_id,
+                            parent_execution_id,
                             carry_forward_events,
                             ..
                         } => Some((
                             orchestration.clone(),
                             input.clone(),
-                            None,
-                            None,
-                            None,
+                            // The work item is the single source of truth for the parent link.
+                            // Messages enqueued by older runtimes don't carry it; `None` leaves
+                            // the link unpreserved for that execution rather than guessing.
+                            parent_instance.clone(),
+                            *parent_id,
+                            *parent_execution_id,
                             Some(carry_forward_events.clone()),
                         )),
                         _ => None,
