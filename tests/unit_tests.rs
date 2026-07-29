@@ -252,7 +252,7 @@ async fn orchestration_status_apis() {
         .await
         .unwrap()
     {
-        duroxide::OrchestrationStatus::Failed { details: _, .. } => {} // Expected failure
+        duroxide::OrchestrationStatus::Failed { .. } => {} // Expected failure
         duroxide::OrchestrationStatus::Completed { output, .. } => panic!("expected failure, got: {output}"),
         _ => panic!("unexpected orchestration status"),
     }
