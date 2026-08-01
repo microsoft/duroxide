@@ -248,6 +248,12 @@ async fn continue_as_new_event_drop_then_process() {
             }
             "wait" => {
                 ctx.trace_info("second exec -> subscribe and wait".to_string());
+                // Deliberate delay before subscribing. It gives the test a wide,
+                // deterministic window in which execution 2 exists but has no
+                // subscription yet — exactly the state whose event-drop behavior
+                // is under test. Without it the test would depend on wall-clock
+                // guesses about how fast the first turn commits.
+                ctx.schedule_timer(std::time::Duration::from_millis(300)).await;
                 let v = ctx.schedule_wait("Go").await;
                 Ok(v)
             }
@@ -263,11 +269,25 @@ async fn continue_as_new_event_drop_then_process() {
     let client = duroxide::Client::new(store.clone());
 
     // Start orchestrator
+    let store_for_early = store.clone();
     let client_c1 = duroxide::Client::new(store.clone());
     tokio::spawn(async move {
-        // Intentionally send too early to new execution (before subscription)
-        // We wait a bit to ensure CAN happens but before subscription is recorded.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Send too early: after continue-as-new created execution 2, but before it
+        // subscribes. Wait for execution 2 to actually exist rather than guessing.
+        let mgmt = store_for_early
+            .as_management_capability()
+            .expect("ProviderAdmin required");
+        for _ in 0..200 {
+            if mgmt
+                .list_executions("inst-can-evt-drop")
+                .await
+                .unwrap_or_default()
+                .contains(&2)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let _ = client_c1.raise_event("inst-can-evt-drop", "Go", "early").await;
     });
 

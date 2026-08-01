@@ -2,6 +2,46 @@
 
 This guide helps you migrate between Duroxide versions and handle orchestration versioning.
 
+## `Runtime::shutdown` returns `ShutdownOutcome` (Unreleased)
+
+`Runtime::shutdown` previously returned `()`. It now returns
+[`ShutdownOutcome`](../src/runtime/mod.rs), which is either `Drained` (every task stopped
+cooperatively) or `Aborted { tasks }` (the deadline expired, or `Some(0)` was passed, and
+`tasks` handles were aborted).
+
+The common call site is unaffected:
+
+```rust
+rt.shutdown(None).await;              // still compiles
+```
+
+You only need to change code that bound the result with an explicit unit annotation:
+
+```rust
+// Before
+let _: () = rt.shutdown(None).await;
+
+// After
+let outcome = rt.shutdown(None).await;
+if let ShutdownOutcome::Aborted { tasks } = outcome {
+    tracing::warn!(tasks, "runtime did not drain before the deadline");
+}
+```
+
+The type is intentionally **not** `#[must_use]`, so ignoring it produces no warning.
+
+### `timeout_ms` is now a deadline
+
+`shutdown` used to sleep for the whole `timeout_ms` regardless of how quickly the runtime
+went quiet. It now returns as soon as all tasks have drained, so an idle runtime shuts down
+in milliseconds instead of the default one second. If you relied on `shutdown` as a fixed
+delay — for example to let background work settle before asserting in a test — insert an
+explicit `tokio::time::sleep` before the call.
+
+Because the timeout is now a real deadline you can safely raise it. A value longer than your
+`worker_lock_timeout` is now a reasonable choice for draining in-flight activities, where
+previously it would simply have added dead time to every shutdown.
+
 ## Reserved `sub::` instance-id marker (Unreleased)
 
 The `sub::` marker is now reserved for runtime-generated sub-orchestration instance ids.
