@@ -55,14 +55,16 @@ Use this prompt when preparing a crates.io release. Run it end-to-end and paste 
    - `cargo package --locked` (verifies package can be built)
    - Inspect `cargo package --list` for unwanted files.
 
-7) **Tag & publish**
+7) **Tag for release**
    - Tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
-   - Publish: `cargo publish --locked`
-   - If publish fails, yank tag or release as needed.
+   - ⚠️ **IMPORTANT**: Do NOT run `cargo publish --locked` yourself.
+   - Microsoft's internal OSS release pipeline will automatically detect the tag and handle publishing to crates.io.
+   - See [RELEASE_POLICY.md](../RELEASE_POLICY.md) for how the publishing infrastructure works.
 
-8) **Post-publish**
-   - Create GitHub release notes (link to changelog).
-   - Announce or update docs/examples if needed.
+8) **Post-release**
+   - Monitor for the automatic GitHub Release creation (should appear within ~30 minutes).
+   - If the release pipeline does not complete, contact the duroxide team.
+   - No manual announcement needed; GitHub Release is created automatically.
 
 ## Release Validation Prompt (for Copilot / reviewers)
 Use this condensed prompt to validate a release PR:
