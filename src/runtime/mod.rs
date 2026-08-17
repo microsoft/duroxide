@@ -652,6 +652,13 @@ impl Runtime {
     }
 
     #[inline]
+    fn record_orchestration_poison_failed(&self) {
+        if let Some(provider) = self.metrics_provider() {
+            provider.record_orchestration_poison_failed();
+        }
+    }
+
+    #[inline]
     fn record_activity_poison(&self) {
         if let Some(provider) = self.metrics_provider() {
             provider.record_activity_poison();
