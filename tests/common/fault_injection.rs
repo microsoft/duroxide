@@ -48,6 +48,9 @@ pub struct PoisonInjectingProvider {
     successful_ignored_abandons: AtomicU32,
     counted_abandon_delays: std::sync::Mutex<Vec<Duration>>,
     orchestration_fetches: std::sync::Mutex<Vec<(String, String, u32)>>,
+    /// If true, every orchestration ack fails as if the lock lease had already
+    /// expired when the item was handed out.
+    expire_orchestration_lease: AtomicBool,
 }
 
 impl PoisonInjectingProvider {
@@ -68,7 +71,18 @@ impl PoisonInjectingProvider {
             successful_ignored_abandons: AtomicU32::new(0),
             counted_abandon_delays: std::sync::Mutex::new(Vec::new()),
             orchestration_fetches: std::sync::Mutex::new(Vec::new()),
+            expire_orchestration_lease: AtomicBool::new(false),
         }
+    }
+
+    /// Make every orchestration ack fail with a non-retryable "Invalid lock token".
+    ///
+    /// This is what a provider does when the lock lease it handed out had already
+    /// expired -- the condition behind microsoft/duroxide#46. It is set on the
+    /// provider rather than per-call because the real defect is persistent: the
+    /// lease is dead on arrival on *every* delivery, so no retry ever succeeds.
+    pub fn expire_orchestration_lease(&self, expired: bool) {
+        self.expire_orchestration_lease.store(expired, Ordering::SeqCst);
     }
 
     /// Next orchestration fetch will return this attempt_count instead of real one.
@@ -253,6 +267,9 @@ impl Provider for PoisonInjectingProvider {
         metadata: ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
+        if self.expire_orchestration_lease.load(Ordering::SeqCst) {
+            return Err(ProviderError::permanent("ack_orchestration_item", "Invalid lock token"));
+        }
         if self.fail_next_orchestration_ack.swap(false, Ordering::SeqCst) {
             return Err(ProviderError::permanent(
                 "ack_orchestration_item",
