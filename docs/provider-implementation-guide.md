@@ -333,6 +333,25 @@ async fn fetch_work_item(
 - Add **long-polling** if your storage backend supports blocking reads (BLPOP, LISTEN/NOTIFY, change streams)
 - The runtime works correctly with either approach
 
+#### Fetch futures must be cancellation-safe
+
+The runtime races `fetch_orchestration_item()` and `fetch_work_item()` against its shutdown
+signal, so **the future returned by a fetch method may be dropped at any await point**. This
+matters most for long-polling providers, which can sit inside a fetch for tens of seconds.
+
+Your implementation must therefore:
+
+- Release any connection, transaction, or listener it holds when the future is dropped. In
+  practice this means relying on RAII guards rather than explicit cleanup after the final
+  `await`, since code after a drop point never runs.
+- Never leave an item locked as a side effect of a partially completed fetch. Either acquire
+  the lock and return it, or leave the item untouched. If a lock can be acquired before the
+  future completes, its `lock_timeout` must be short enough that an abandoned lock is
+  reclaimed rather than stranded.
+
+A provider that leaks a pooled connection on drop will make `shutdown` appear to succeed
+while the underlying pool can never be closed.
+
 ---
 
 ## The Provider Trait at a Glance

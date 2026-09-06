@@ -17,9 +17,9 @@
 use crate::providers::{ExecutionMetadata, ProviderError, ScheduledActivityIdentifier, WorkItem};
 use crate::{Event, EventKind};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
 use super::super::{HistoryManager, Runtime, WorkItemReader};
@@ -278,8 +278,7 @@ fn spawn_orchestration_lock_renewal_task(
     token: String,
     lock_timeout: Duration,
     buffer: Duration,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) -> JoinHandle<()> {
+) -> AbortOnDropHandle<()> {
     let renewal_interval = calculate_renewal_interval(lock_timeout, buffer);
 
     tracing::debug!(
@@ -291,42 +290,34 @@ fn spawn_orchestration_lock_renewal_task(
         "Spawning orchestration lock renewal task"
     );
 
-    tokio::spawn(async move {
+    // Deliberately does not observe the shutdown signal: the turn it is renewing may
+    // still be running, and releasing the lock early would let another node steal the
+    // item and execute it twice. The owning poller stops this task instead.
+    AbortOnDropHandle::new(tokio::spawn(async move {
         let mut interval = tokio::time::interval(renewal_interval);
         interval.tick().await; // Skip first immediate tick
 
         loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    if shutdown.load(Ordering::Relaxed) {
-                        tracing::debug!(
-                            target: "duroxide::runtime::dispatchers::orchestration",
-                            lock_token = %token,
-                            "Lock renewal task stopping due to shutdown"
-                        );
-                        break;
-                    }
+            interval.tick().await;
 
-                    match store.renew_orchestration_item_lock(&token, lock_timeout).await {
-                        Ok(()) => {
-                            tracing::trace!(
-                                target: "duroxide::runtime::dispatchers::orchestration",
-                                lock_token = %token,
-                                extend_secs = %lock_timeout.as_secs(),
-                                "Orchestration lock renewed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                target: "duroxide::runtime::dispatchers::orchestration",
-                                lock_token = %token,
-                                error = %e,
-                                "Failed to renew orchestration lock (may have been acked/abandoned)"
-                            );
-                            // Stop renewal - lock is gone or expired
-                            break;
-                        }
-                    }
+            match store.renew_orchestration_item_lock(&token, lock_timeout).await {
+                Ok(()) => {
+                    tracing::trace!(
+                        target: "duroxide::runtime::dispatchers::orchestration",
+                        lock_token = %token,
+                        extend_secs = %lock_timeout.as_secs(),
+                        "Orchestration lock renewed"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "duroxide::runtime::dispatchers::orchestration",
+                        lock_token = %token,
+                        error = %e,
+                        "Failed to renew orchestration lock (may have been acked/abandoned)"
+                    );
+                    // Stop renewal - lock is gone or expired
+                    break;
                 }
             }
         }
@@ -336,16 +327,19 @@ fn spawn_orchestration_lock_renewal_task(
             lock_token = %token,
             "Orchestration lock renewal task stopped"
         );
-    })
+    }))
 }
 
 impl Runtime {
-    /// Start the orchestration dispatcher with N concurrent workers
-    pub(in crate::runtime) fn start_orchestration_dispatcher(self: Arc<Self>) -> JoinHandle<()> {
+    /// Start the orchestration dispatcher with N concurrent workers.
+    ///
+    /// Returns one handle per spawned worker. The caller must track them all: there is
+    /// no supervisor task, because aborting a supervisor would only detach its children.
+    pub(in crate::runtime) fn start_orchestration_dispatcher(self: Arc<Self>) -> Vec<JoinHandle<()>> {
         // EXECUTION: spawns N concurrent orchestration workers
         // Instance-level locking in provider prevents concurrent processing of same instance
         let concurrency = self.options.orchestration_concurrency;
-        let shutdown = self.shutdown_flag.clone();
+        let cancel = self.cancel.clone();
 
         // Build the capability filter once for all workers (immutable for this runtime's lifetime).
         let capability_filter = if let Some(ref custom_range) = self.options.supported_replay_versions {
@@ -372,162 +366,167 @@ impl Runtime {
             crate::providers::SemverRange::default_for_current_build()
         };
 
-        tokio::spawn(async move {
-            let mut worker_handles = Vec::new();
+        let mut worker_handles = Vec::with_capacity(concurrency);
 
-            for worker_idx in 0..concurrency {
-                let rt = Arc::clone(&self);
-                let shutdown = Arc::clone(&shutdown);
-                let cap_filter = Some(capability_filter.clone());
-                let supported_range = runtime_supported_range.clone();
-                // Generate unique worker ID: orch-{index}-{runtime_id}
-                let worker_id = format!("orch-{worker_idx}-{}", rt.runtime_id);
-                let handle = tokio::spawn(async move {
-                    // debug!("Orchestration worker {} started", worker_id);
-                    let mut consecutive_retryable_errors = 0u32;
-                    loop {
-                        // Check shutdown flag before fetching
-                        if shutdown.load(Ordering::Relaxed) {
-                            // debug!("Orchestration worker {} exiting", worker_id);
-                            break;
-                        }
+        for worker_idx in 0..concurrency {
+            let rt = Arc::clone(&self);
+            let cancel = cancel.clone();
+            let cap_filter = Some(capability_filter.clone());
+            let supported_range = runtime_supported_range.clone();
+            // Generate unique worker ID: orch-{index}-{runtime_id}
+            let worker_id = format!("orch-{worker_idx}-{}", rt.runtime_id);
+            let handle = tokio::spawn(async move {
+                // debug!("Orchestration worker {} started", worker_id);
+                let mut consecutive_retryable_errors = 0u32;
+                loop {
+                    if cancel.is_cancelled() {
+                        // debug!("Orchestration worker {} exiting", worker_id);
+                        break;
+                    }
 
-                        let min_interval = rt.options.dispatcher_min_poll_interval;
-                        let poll_timeout = rt.options.dispatcher_long_poll_timeout;
-                        let start_time = std::time::Instant::now();
-                        let mut work_found = false;
+                    let min_interval = rt.options.dispatcher_min_poll_interval;
+                    let poll_timeout = rt.options.dispatcher_long_poll_timeout;
+                    let start_time = std::time::Instant::now();
+                    let mut work_found = false;
 
-                        match rt
-                            .history_store
-                            .fetch_orchestration_item(
-                                rt.options.orchestrator_lock_timeout,
-                                poll_timeout,
-                                cap_filter.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(Some((item, lock_token, attempt_count))) => {
-                                // Reset error counter on success
-                                consecutive_retryable_errors = 0;
+                    // Only the fetch is raced against cancellation. Once an item is
+                    // locked, the turn runs to completion so it can be acked.
+                    let fetch = rt.history_store.fetch_orchestration_item(
+                        rt.options.orchestrator_lock_timeout,
+                        poll_timeout,
+                        cap_filter.as_ref(),
+                    );
 
-                                // Runtime-side compatibility check (defense-in-depth).
-                                // Even if the provider filter missed this item (bug, provider ignoring filter),
-                                // we validate the pinned version before attempting replay.
-                                // The pinned version is extracted from the OrchestrationStarted event
-                                // (always event_id=1, always a known event type on any version).
-                                let pinned_version = item.history.iter().find_map(|e| {
-                                    if matches!(&e.kind, crate::EventKind::OrchestrationStarted { .. }) {
-                                        semver::Version::parse(&e.duroxide_version).ok()
-                                    } else {
-                                        None
-                                    }
-                                });
+                    let fetched = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        result = fetch => result,
+                    };
 
-                                if let Some(pinned) = pinned_version
-                                    && !supported_range.contains(&pinned)
-                                {
-                                    tracing::warn!(
-                                        target: "duroxide::runtime",
-                                        instance = %item.instance,
-                                        pinned_version = %pinned,
-                                        supported_range = %format!(">={}, <={}", supported_range.min, supported_range.max),
-                                        attempt_count = attempt_count,
-                                        "Execution pinned at incompatible version, abandoning (runtime-side check)"
-                                    );
-                                    // Abandon with a short delay to prevent tight spin loops when
-                                    // a single runtime encounters incompatible items. The item still
-                                    // reaches max_attempts quickly (e.g., 10 × 1s = 10s) while
-                                    // avoiding CPU burn and starvation of compatible work items.
-                                    let _ = rt
-                                        .history_store
-                                        .abandon_orchestration_item(&lock_token, Some(Duration::from_secs(1)), false)
-                                        .await;
-                                    continue;
-                                }
-                                // pinned_version == None means no history yet (brand new instance)
-                                // — always compatible, proceed normally.
+                    match fetched {
+                        Ok(Some((item, lock_token, attempt_count))) => {
+                            // Reset error counter on success
+                            consecutive_retryable_errors = 0;
 
-                                // Spawn lock renewal task for this orchestration
-                                let renewal_handle = spawn_orchestration_lock_renewal_task(
-                                    Arc::clone(&rt.history_store),
-                                    lock_token.clone(),
-                                    rt.options.orchestrator_lock_timeout,
-                                    rt.options.orchestrator_lock_renewal_buffer,
-                                    Arc::clone(&shutdown),
-                                );
-
-                                // TEST HOOK: Inject delay after spawning renewal task
-                                // This simulates slow processing to test lock renewal
-                                #[cfg(feature = "test-hooks")]
-                                if let Some(delay) =
-                                    crate::runtime::test_hooks::get_orch_processing_delay(&item.instance)
-                                {
-                                    tracing::debug!(
-                                        instance = %item.instance,
-                                        delay_ms = delay.as_millis(),
-                                        "Test hook: injecting orchestration processing delay"
-                                    );
-                                    tokio::time::sleep(delay).await;
-                                }
-
-                                // Process orchestration item atomically
-                                // Provider ensures no other worker has this instance locked
-                                rt.process_orchestration_item(item, &lock_token, attempt_count, &worker_id)
-                                    .await;
-
-                                // Stop lock renewal task now that orchestration turn is complete
-                                renewal_handle.abort();
-
-                                work_found = true;
-                            }
-                            Ok(None) => {
-                                // No work available - reset error counter
-                                consecutive_retryable_errors = 0;
-                            }
-                            Err(e) => {
-                                if e.is_retryable() {
-                                    // Exponential backoff for retryable errors (database locks, etc.)
-                                    consecutive_retryable_errors += 1;
-                                    let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors)).min(3000);
-                                    warn!(
-                                        "Error fetching orchestration item (retryable, attempt {}): {:?}, backing off {}ms",
-                                        consecutive_retryable_errors, e, backoff_ms
-                                    );
-                                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            // Runtime-side compatibility check (defense-in-depth).
+                            // Even if the provider filter missed this item (bug, provider ignoring filter),
+                            // we validate the pinned version before attempting replay.
+                            // The pinned version is extracted from the OrchestrationStarted event
+                            // (always event_id=1, always a known event type on any version).
+                            let pinned_version = item.history.iter().find_map(|e| {
+                                if matches!(&e.kind, crate::EventKind::OrchestrationStarted { .. }) {
+                                    semver::Version::parse(&e.duroxide_version).ok()
                                 } else {
-                                    // Permanent errors - log and continue with normal polling
-                                    warn!("Error fetching orchestration item (permanent): {:?}", e);
-                                    consecutive_retryable_errors = 0;
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    None
                                 }
+                            });
+
+                            if let Some(pinned) = pinned_version
+                                && !supported_range.contains(&pinned)
+                            {
+                                tracing::warn!(
+                                    target: "duroxide::runtime",
+                                    instance = %item.instance,
+                                    pinned_version = %pinned,
+                                    supported_range = %format!(">={}, <={}", supported_range.min, supported_range.max),
+                                    attempt_count = attempt_count,
+                                    "Execution pinned at incompatible version, abandoning (runtime-side check)"
+                                );
+                                // Abandon with a short delay to prevent tight spin loops when
+                                // a single runtime encounters incompatible items. The item still
+                                // reaches max_attempts quickly (e.g., 10 × 1s = 10s) while
+                                // avoiding CPU burn and starvation of compatible work items.
+                                let _ = rt
+                                    .history_store
+                                    .abandon_orchestration_item(&lock_token, Some(Duration::from_secs(1)), false)
+                                    .await;
                                 continue;
                             }
-                        }
+                            // pinned_version == None means no history yet (brand new instance)
+                            // — always compatible, proceed normally.
 
-                        // Enforce minimum polling interval to prevent hot loops
-                        if !work_found {
-                            let elapsed = start_time.elapsed();
-                            if elapsed < min_interval {
-                                let sleep_duration = min_interval - elapsed;
-                                if !shutdown.load(Ordering::Relaxed) {
-                                    tokio::time::sleep(sleep_duration).await;
-                                }
-                            } else {
-                                // Waited long enough (e.g. long poll timeout expired), yield to prevent starvation
-                                tokio::task::yield_now().await;
+                            // Spawn lock renewal task for this orchestration. Held as an
+                            // abort-on-drop guard so it cannot outlive this task if the
+                            // poller is aborted mid-turn.
+                            let _renewal_guard = spawn_orchestration_lock_renewal_task(
+                                Arc::clone(&rt.history_store),
+                                lock_token.clone(),
+                                rt.options.orchestrator_lock_timeout,
+                                rt.options.orchestrator_lock_renewal_buffer,
+                            );
+
+                            // TEST HOOK: Inject delay after spawning renewal task
+                            // This simulates slow processing to test lock renewal
+                            #[cfg(feature = "test-hooks")]
+                            if let Some(delay) = crate::runtime::test_hooks::get_orch_processing_delay(&item.instance) {
+                                tracing::debug!(
+                                    instance = %item.instance,
+                                    delay_ms = delay.as_millis(),
+                                    "Test hook: injecting orchestration processing delay"
+                                );
+                                tokio::time::sleep(delay).await;
                             }
+
+                            // Process orchestration item atomically
+                            // Provider ensures no other worker has this instance locked
+                            rt.process_orchestration_item(item, &lock_token, attempt_count, &worker_id)
+                                .await;
+
+                            // Stop lock renewal now that the orchestration turn is complete.
+                            drop(_renewal_guard);
+
+                            work_found = true;
+                        }
+                        Ok(None) => {
+                            // No work available - reset error counter
+                            consecutive_retryable_errors = 0;
+                        }
+                        Err(e) => {
+                            let backoff = if e.is_retryable() {
+                                // Exponential backoff for retryable errors (database locks, etc.)
+                                consecutive_retryable_errors += 1;
+                                let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors)).min(3000);
+                                warn!(
+                                    "Error fetching orchestration item (retryable, attempt {}): {:?}, backing off {}ms",
+                                    consecutive_retryable_errors, e, backoff_ms
+                                );
+                                Duration::from_millis(backoff_ms)
+                            } else {
+                                // Permanent errors - log and continue with normal polling
+                                warn!("Error fetching orchestration item (permanent): {:?}", e);
+                                consecutive_retryable_errors = 0;
+                                Duration::from_millis(100)
+                            };
+
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
+                            continue;
                         }
                     }
-                });
-                worker_handles.push(handle);
-            }
 
-            // Wait for all workers to complete
-            for handle in worker_handles {
-                let _ = handle.await;
-            }
-            // debug!("Orchestration dispatcher exited");
-        })
+                    // Enforce minimum polling interval to prevent hot loops
+                    if !work_found {
+                        let elapsed = start_time.elapsed();
+                        if elapsed < min_interval {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(min_interval - elapsed) => {}
+                            }
+                        } else {
+                            // Waited long enough (e.g. long poll timeout expired), yield to prevent starvation
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+            });
+            worker_handles.push(handle);
+        }
+
+        worker_handles
     }
 
     /// Process a single orchestration item atomically

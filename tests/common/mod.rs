@@ -7,6 +7,8 @@
 
 pub mod fault_injection;
 #[allow(dead_code)]
+pub mod long_polling;
+#[allow(dead_code)]
 pub mod tracing_capture;
 
 use duroxide::providers::sqlite::SqliteProvider;

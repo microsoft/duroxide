@@ -33,10 +33,10 @@
 
 use crate::providers::WorkItem;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
 use super::super::{Runtime, registry};
@@ -162,73 +162,77 @@ impl Runtime {
     /// Start the worker dispatcher with N concurrent workers for executing activities.
     ///
     /// Each worker runs in a loop, fetching and processing activity work items.
-    /// Workers share the same activity registry and shutdown flag.
+    /// Workers share the same activity registry and cancellation token.
+    ///
+    /// Returns one handle per spawned task (workers plus the session manager). The caller
+    /// must track them all: there is no supervisor task, because aborting a supervisor
+    /// would only detach its children.
     pub(in crate::runtime) fn start_work_dispatcher(
         self: Arc<Self>,
         activities: Arc<registry::ActivityRegistry>,
-    ) -> JoinHandle<()> {
+    ) -> Vec<JoinHandle<()>> {
         let concurrency = self.options.worker_concurrency;
-        let shutdown = self.shutdown_flag.clone();
+        let cancel = self.cancel.clone();
 
-        tokio::spawn(async move {
-            let mut worker_handles = Vec::with_capacity(concurrency);
-            let mut session_owner_ids: Vec<String> = Vec::new();
+        let mut worker_handles = Vec::with_capacity(concurrency + 1);
+        let mut session_owner_ids: Vec<String> = Vec::new();
 
-            // Tracks distinct active sessions across all worker slots in this
-            // runtime. When distinct_count() reaches max_sessions_per_runtime,
-            // ALL slots stop claiming new sessions by switching to non-session mode.
-            let session_tracker = Arc::new(SessionTracker::new());
+        // Tracks distinct active sessions across all worker slots in this
+        // runtime. When distinct_count() reaches max_sessions_per_runtime,
+        // ALL slots stop claiming new sessions by switching to non-session mode.
+        let session_tracker = Arc::new(SessionTracker::new());
 
-            // Derive per-slot identities:
-            //   worker_id      – unique per slot, used for logging/tracing
-            //   session_owner  – identity used for session lock claims
-            //
-            // With a stable worker_node_id all slots share the same session
-            // owner so any idle slot can serve any owned session.
-            // Without one, each slot gets an ephemeral identity.
-            let stable_node_id = self.options.worker_node_id.clone();
+        // Derive per-slot identities:
+        //   worker_id      – unique per slot, used for logging/tracing
+        //   session_owner  – identity used for session lock claims
+        //
+        // With a stable worker_node_id all slots share the same session
+        // owner so any idle slot can serve any owned session.
+        // Without one, each slot gets an ephemeral identity.
+        let stable_node_id = self.options.worker_node_id.clone();
 
-            for worker_idx in 0..concurrency {
-                let rt = Arc::clone(&self);
-                let activities = Arc::clone(&activities);
-                let shutdown = Arc::clone(&shutdown);
-                let session_tracker_clone = Arc::clone(&session_tracker);
+        for worker_idx in 0..concurrency {
+            let rt = Arc::clone(&self);
+            let activities = Arc::clone(&activities);
+            let cancel = cancel.clone();
+            let session_tracker_clone = Arc::clone(&session_tracker);
 
-                let suffix = stable_node_id.as_deref().unwrap_or(&self.runtime_id);
-                let worker_id = format!("work-{worker_idx}-{suffix}");
-                let session_owner = stable_node_id.clone().unwrap_or_else(|| worker_id.clone());
+            let suffix = stable_node_id.as_deref().unwrap_or(&self.runtime_id);
+            let worker_id = format!("work-{worker_idx}-{suffix}");
+            let session_owner = stable_node_id.clone().unwrap_or_else(|| worker_id.clone());
 
-                // Collect unique session owner IDs for the session manager
-                if !session_owner_ids.contains(&session_owner) {
-                    session_owner_ids.push(session_owner.clone());
-                }
+            // Collect unique session owner IDs for the session manager
+            if !session_owner_ids.contains(&session_owner) {
+                session_owner_ids.push(session_owner.clone());
+            }
 
-                let handle = tokio::spawn(async move {
-                    let mut consecutive_retryable_errors: u32 = 0;
+            let handle = tokio::spawn(async move {
+                let mut consecutive_retryable_errors: u32 = 0;
 
-                    loop {
-                        if shutdown.load(Ordering::Relaxed) {
-                            break;
+                loop {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+
+                    let min_interval = rt.options.dispatcher_min_poll_interval;
+                    let start_time = std::time::Instant::now();
+
+                    let work_found = match process_next_work_item(
+                        &rt,
+                        &activities,
+                        &cancel,
+                        &worker_id,
+                        &session_owner,
+                        &session_tracker_clone,
+                    )
+                    .await
+                    {
+                        Ok(found) => {
+                            consecutive_retryable_errors = 0;
+                            found
                         }
-
-                        let min_interval = rt.options.dispatcher_min_poll_interval;
-                        let start_time = std::time::Instant::now();
-
-                        let work_found = match process_next_work_item(
-                            &rt,
-                            &activities,
-                            &shutdown,
-                            &worker_id,
-                            &session_owner,
-                            &session_tracker_clone,
-                        )
-                        .await
-                        {
-                            Ok(found) => {
-                                consecutive_retryable_errors = 0;
-                                found
-                            }
-                            Err(e) if e.is_retryable() => {
+                        Err(e) => {
+                            let backoff = if e.is_retryable() {
                                 // Exponential backoff for retryable errors (database locks, etc.)
                                 consecutive_retryable_errors += 1;
                                 let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors)).min(3000);
@@ -236,39 +240,41 @@ impl Runtime {
                                     "Error fetching work item (retryable, attempt {}): {:?}, backing off {}ms",
                                     consecutive_retryable_errors, e, backoff_ms
                                 );
-                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                continue;
-                            }
-                            Err(e) => {
+                                Duration::from_millis(backoff_ms)
+                            } else {
                                 // Permanent errors - log and continue with normal polling
                                 warn!("Error fetching work item (permanent): {:?}", e);
                                 consecutive_retryable_errors = 0;
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                continue;
+                                Duration::from_millis(100)
+                            };
+
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(backoff) => {}
                             }
-                        };
-
-                        // Enforce minimum polling interval to prevent hot loops
-                        if !work_found {
-                            enforce_min_poll_interval(start_time, min_interval, &shutdown).await;
+                            continue;
                         }
+                    };
+
+                    // Enforce minimum polling interval to prevent hot loops
+                    if !work_found && !enforce_min_poll_interval(start_time, min_interval, &cancel).await {
+                        break;
                     }
-                });
-                worker_handles.push(handle);
-            }
-
-            // Spawn a single session manager background task for heartbeat + cleanup
-            let session_rt = Arc::clone(&self);
-            let session_shutdown = Arc::clone(&shutdown);
-            let session_handle = tokio::spawn(async move {
-                run_session_manager(session_rt, session_shutdown, session_owner_ids).await;
+                }
             });
-            worker_handles.push(session_handle);
+            worker_handles.push(handle);
+        }
 
-            for handle in worker_handles {
-                let _ = handle.await;
-            }
-        })
+        // Spawn a single session manager background task for heartbeat + cleanup
+        let session_rt = Arc::clone(&self);
+        let session_cancel = cancel.clone();
+        let session_handle = tokio::spawn(async move {
+            run_session_manager(session_rt, session_cancel, session_owner_ids).await;
+        });
+        worker_handles.push(session_handle);
+
+        worker_handles
     }
 }
 
@@ -281,7 +287,7 @@ impl Runtime {
 async fn process_next_work_item(
     rt: &Arc<Runtime>,
     activities: &Arc<registry::ActivityRegistry>,
-    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+    cancel: &CancellationToken,
     worker_id: &str,
     session_worker_id: &str,
     session_tracker: &Arc<SessionTracker>,
@@ -298,16 +304,22 @@ async fn process_next_work_item(
         })
     };
 
-    let (item, token, attempt_count) = match rt
-        .history_store
-        .fetch_work_item(
-            rt.options.worker_lock_timeout,
-            rt.options.dispatcher_long_poll_timeout,
-            session_config.as_ref(),
-            &rt.options.worker_tag_filter,
-        )
-        .await?
-    {
+    // Only the fetch is raced against cancellation. Once an item is locked, the
+    // activity runs to completion so it can be acked.
+    let fetch = rt.history_store.fetch_work_item(
+        rt.options.worker_lock_timeout,
+        rt.options.dispatcher_long_poll_timeout,
+        session_config.as_ref(),
+        &rt.options.worker_tag_filter,
+    );
+
+    let fetched = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(false),
+        result = fetch => result?,
+    };
+
+    let (item, token, attempt_count) = match fetched {
         Some(result) => result,
         None => return Ok(false),
     };
@@ -372,7 +384,7 @@ async fn process_next_work_item(
                 handle_poison_message(rt, &ctx).await;
             } else {
                 // Execute activity with cancellation support
-                execute_activity(rt, activities, shutdown, ctx).await;
+                execute_activity(rt, activities, ctx).await;
             }
         }
         other => {
@@ -385,20 +397,25 @@ async fn process_next_work_item(
 }
 
 /// Enforce minimum polling interval to prevent hot loops.
+///
+/// Returns `false` if cancellation was signalled while waiting, meaning the caller
+/// should stop polling.
 async fn enforce_min_poll_interval(
     start_time: std::time::Instant,
     min_interval: Duration,
-    shutdown: &Arc<std::sync::atomic::AtomicBool>,
-) {
+    cancel: &CancellationToken,
+) -> bool {
     let elapsed = start_time.elapsed();
     if elapsed < min_interval {
-        let sleep_duration = min_interval - elapsed;
-        if !shutdown.load(Ordering::Relaxed) {
-            tokio::time::sleep(sleep_duration).await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(min_interval - elapsed) => {}
         }
     } else {
         tokio::task::yield_now().await;
     }
+    true
 }
 
 // ============================================================================
@@ -449,12 +466,10 @@ async fn handle_poison_message(rt: &Arc<Runtime>, ctx: &ActivityWorkContext) {
 // ============================================================================
 
 /// Execute an activity with full cancellation support.
-async fn execute_activity(
-    rt: &Arc<Runtime>,
-    activities: &Arc<registry::ActivityRegistry>,
-    shutdown: &Arc<std::sync::atomic::AtomicBool>,
-    ctx: ActivityWorkContext,
-) {
+async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::ActivityRegistry>, ctx: ActivityWorkContext) {
+    // Distinct from the runtime shutdown signal: cancelling this token means
+    // "the orchestration is terminal, discard the result", which is not what a
+    // runtime shutdown implies.
     let cancellation_token = CancellationToken::new();
 
     let manager_handle = spawn_activity_manager(
@@ -463,7 +478,6 @@ async fn execute_activity(
         rt.options.worker_lock_timeout,
         rt.options.worker_lock_renewal_buffer,
         rt.options.activity_cancellation_grace_period,
-        Arc::clone(shutdown),
         cancellation_token.clone(),
     );
 
@@ -496,7 +510,7 @@ async fn execute_activity(
             .await
         }
         None => {
-            manager_handle.abort();
+            drop(manager_handle);
             abandon_unregistered_activity(rt, &ctx).await;
             // Early return after abandonment - no ack_result needed since we abandoned
             return;
@@ -539,15 +553,18 @@ async fn run_activity_with_cancellation(
     handler: Arc<dyn crate::runtime::ActivityHandler>,
     activity_ctx: crate::ActivityContext,
     cancellation_token: CancellationToken,
-    manager_handle: JoinHandle<()>,
+    manager_handle: AbortOnDropHandle<()>,
     start_time: std::time::Instant,
 ) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
     let input = ctx.input.clone();
-    let mut activity_handle = tokio::spawn(async move { handler.invoke(activity_ctx, input).await });
+    // Abort-on-drop so the invocation cannot outlive this task if the worker is
+    // aborted mid-activity during shutdown.
+    let mut activity_handle =
+        AbortOnDropHandle::new(tokio::spawn(async move { handler.invoke(activity_ctx, input).await }));
 
     tokio::select! {
         joined = &mut activity_handle => {
-            manager_handle.abort();
+            drop(manager_handle);
             // Handle normal activity completion (success, error, or panic)
             match joined {
                 Ok(Ok(result)) => handle_activity_success(rt, ctx, result, start_time).await,
@@ -556,7 +573,7 @@ async fn run_activity_with_cancellation(
             }
         }
         _ = cancellation_token.cancelled() => {
-            manager_handle.abort();
+            drop(manager_handle);
             // Handle cancellation: wait grace period, then drop result
             let grace = rt.options.activity_cancellation_grace_period;
 
@@ -793,9 +810,8 @@ fn spawn_activity_manager(
     lock_timeout: Duration,
     buffer: Duration,
     grace_period: Duration,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
     cancellation_token: CancellationToken,
-) -> JoinHandle<()> {
+) -> AbortOnDropHandle<()> {
     let renewal_interval = calculate_renewal_interval(lock_timeout, buffer);
 
     tracing::debug!(
@@ -812,21 +828,16 @@ fn spawn_activity_manager(
     // This task's only jobs are: (1) renew locks, (2) detect terminal state and signal.
     let _ = grace_period;
 
-    tokio::spawn(async move {
+    // Deliberately does not observe the runtime shutdown signal: the activity it is
+    // renewing may still be running, and releasing the lock early would let another
+    // node steal the work item and execute it twice. The owning worker stops this
+    // task instead (this handle aborts on drop).
+    AbortOnDropHandle::new(tokio::spawn(async move {
         let mut interval = tokio::time::interval(renewal_interval);
         interval.tick().await; // Skip first immediate tick
 
         loop {
             interval.tick().await;
-
-            if shutdown.load(Ordering::Relaxed) {
-                tracing::debug!(
-                    target: "duroxide::runtime::worker",
-                    lock_token = %token,
-                    "Activity manager stopping due to shutdown"
-                );
-                break;
-            }
 
             match store.renew_work_item_lock(&token, lock_timeout).await {
                 Ok(()) => {
@@ -857,7 +868,7 @@ fn spawn_activity_manager(
             lock_token = %token,
             "Activity manager stopped"
         );
-    })
+    }))
 }
 
 // ============================================================================
@@ -867,7 +878,7 @@ fn spawn_activity_manager(
 /// Background task that periodically:
 /// 1. Renews session locks for all non-idle sessions owned by this runtime's workers
 /// 2. Cleans up orphaned session rows (expired locks, no pending work items)
-async fn run_session_manager(rt: Arc<Runtime>, shutdown: Arc<std::sync::atomic::AtomicBool>, worker_ids: Vec<String>) {
+async fn run_session_manager(rt: Arc<Runtime>, cancel: CancellationToken, worker_ids: Vec<String>) {
     let renewal_interval =
         calculate_renewal_interval(rt.options.session_lock_timeout, rt.options.session_lock_renewal_buffer);
     let cleanup_interval = rt.options.session_cleanup_interval;
@@ -877,11 +888,6 @@ async fn run_session_manager(rt: Arc<Runtime>, shutdown: Arc<std::sync::atomic::
 
     let mut cleanup_ticker = tokio::time::interval(cleanup_interval);
     cleanup_ticker.tick().await; // Skip immediate first tick
-
-    // Short-interval ticker to detect shutdown promptly even when
-    // renewal/cleanup intervals are long (e.g. 5 minutes).
-    let mut shutdown_ticker = tokio::time::interval(Duration::from_secs(5));
-    shutdown_ticker.tick().await;
 
     // Pre-compute the &str slice for the batched provider call
     let owner_refs: Vec<&str> = worker_ids.iter().map(|s| s.as_str()).collect();
@@ -896,10 +902,11 @@ async fn run_session_manager(rt: Arc<Runtime>, shutdown: Arc<std::sync::atomic::
 
     loop {
         tokio::select! {
+            biased;
+            // Cancellation is observed directly rather than via a polling ticker, so
+            // shutdown is prompt even when renewal/cleanup intervals are minutes long.
+            _ = cancel.cancelled() => break,
             _ = renewal_ticker.tick() => {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
                 // Single batched call for all worker IDs
                 match rt.history_store.renew_session_lock(
                     &owner_refs,
@@ -925,9 +932,6 @@ async fn run_session_manager(rt: Arc<Runtime>, shutdown: Arc<std::sync::atomic::
                 }
             }
             _ = cleanup_ticker.tick() => {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
                 match rt.history_store.cleanup_orphaned_sessions(
                     rt.options.session_idle_timeout,
                 ).await {
@@ -947,11 +951,6 @@ async fn run_session_manager(rt: Arc<Runtime>, shutdown: Arc<std::sync::atomic::
                             "Session cleanup failed"
                         );
                     }
-                }
-            }
-            _ = shutdown_ticker.tick() => {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
                 }
             }
         }
