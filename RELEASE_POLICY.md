@@ -8,8 +8,7 @@ internal pipeline instructions.
 
 ## Public Release Handoff
 
-GitHub Actions in this repository are limited to validation such as building,
-testing, and linting changes.
+GitHub Actions in this repository are limited to building and testing changes.
 
 1. Prepare a release pull request that updates the package version, changelog,
    and README release notice.

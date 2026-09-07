@@ -72,7 +72,7 @@ Run the repository's existing checks:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings -A clippy::uninlined_format_args
 ./run-tests.sh
 cargo test --doc --all-features
 cargo package --allow-dirty
