@@ -1,10 +1,6 @@
 ---
-name: duroxide-release-preparation
+name: release-preparation
 description: Prepare and open a Duroxide release pull request, then create its version tag after merge and explicit approval. Use when asked to prepare a release, bump the crate version, draft release notes, validate a release candidate, or complete the public release handoff.
-license: Apache-2.0
-metadata:
-  author: duroxide
-  version: "1.1"
 ---
 
 # Duroxide Release Preparation
