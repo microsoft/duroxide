@@ -6,6 +6,10 @@
 
 > **[Latest Release: v0.1.30](https://crates.io/crates/duroxide/0.1.30)** — Sub-orchestration parent-link and collision fixes, safer IDs, and UUID generation.
 > See [CHANGELOG.md](CHANGELOG.md#0130---2026-07-29) for release notes.
+>
+> **Release policy:** Official packages are published through Microsoft-managed
+> internal pipelines. Repository GitHub Actions are validation-only. See
+> [RELEASE_POLICY.md](RELEASE_POLICY.md).
 
 > **Preview:** This project is currently in preview.
 

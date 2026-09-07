@@ -148,7 +148,6 @@ Consider creating these prompts for specialized tasks:
 - **duroxide-add-provider.md** - Implementing new storage backends (PostgreSQL, DynamoDB, Redis)
 - **duroxide-add-example.md** - Creating comprehensive runnable examples
 - **duroxide-review-pr.md** - Guidelines for reviewing pull requests
-- **duroxide-release.md** - Steps for cutting a new release
 - **duroxide-benchmark.md** - Adding and running benchmarks
 - **duroxide-security-review.md** - Security considerations and review checklist
 
@@ -175,4 +174,3 @@ If a prompt is frequently insufficient:
 - When making breaking changes to duroxide, update affected prompts
 - Keep prompts in sync with ORCHESTRATION-GUIDE.md and other docs
 - Version prompts if we ever publish them separately
-
