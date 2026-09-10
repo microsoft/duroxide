@@ -5,9 +5,10 @@ description: Prepare and open a Duroxide release pull request, then create its v
 
 # Duroxide Release Preparation
 
-Prepare a release pull request and, after it is merged and separately approved,
-create the version tag that hands the release to Microsoft-managed internal
-pipelines. Follow [RELEASE_POLICY.md](../../../RELEASE_POLICY.md).
+This source-owned skill prepares a release pull request and, after it is merged
+and separately approved, creates the version tag that hands the release to
+Microsoft-managed internal pipelines. Follow
+[RELEASE_POLICY.md](../../../RELEASE_POLICY.md).
 
 ## Boundaries
 

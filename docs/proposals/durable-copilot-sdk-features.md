@@ -221,6 +221,12 @@ while let Some(event) = stream.next().await {
 
 ## 9. Cross-platform CI Publishing (npm)
 
+> [!WARNING]
+> This publishing approach is historical and must not be implemented. Official
+> packages are published through Microsoft-managed internal pipelines; see
+> [RELEASE_POLICY.md](../../RELEASE_POLICY.md). The cross-platform build and
+> validation requirements remain applicable.
+
 **Problem:** `duroxide-node` uses napi-rs with separate platform packages (`duroxide-darwin-arm64`, `duroxide-linux-x64-gnu`, etc.). Publishing requires building the native binary on each target platform and uploading to npm individually. We forgot to publish the linux binary for v0.1.5, causing Docker builds to fail. We had to manually extract the binary from a Docker image and publish it.
 
 **Proposal:** GitHub Actions workflow that builds all platform binaries and publishes them on release tag push.
@@ -252,7 +258,8 @@ jobs:
       - run: npm publish  # main package
 ```
 
-**Status:** napi-rs has a built-in `napi ci` GitHub Action template that handles this. Should adopt it.
+**Status:** Superseded by [RELEASE_POLICY.md](../../RELEASE_POLICY.md). The
+workflow above is retained as historical context only and must not be adopted.
 
 ---
 
