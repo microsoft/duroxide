@@ -1114,6 +1114,15 @@ pub trait Provider: Any + Send + Sync {
         "0.0.0"
     }
 
+    /// Whether this provider has an atomic, provider-native batched worker fetch implementation.
+    ///
+    /// The runtime only requests more than one worker item at a time when this returns `true`.
+    /// This keeps external providers on legacy single-item fetch semantics until they explicitly
+    /// audit batching, session claiming, tag filtering, and attempt-count behavior.
+    fn supports_batched_work_item_fetch(&self) -> bool {
+        false
+    }
+
     // ===== Core Atomic Orchestration Methods (REQUIRED) =====
     // These three methods form the heart of reliable orchestration execution.
     //
@@ -1770,6 +1779,50 @@ pub trait Provider: Any + Send + Sync {
         session: Option<&SessionFetchConfig>,
         tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError>;
+
+    /// Fetch and peek-lock up to `max_items` worker queue items in one provider call.
+    ///
+    /// `max_new_sessions` is a transaction-scoped cap for how many previously-unowned
+    /// sessions may be claimed by this fetch. Items for already-owned sessions and
+    /// non-session items do not consume this quota.
+    ///
+    /// The default implementation preserves compatibility. It does not provide true
+    /// atomic batching and intentionally falls back to a single fetch when session
+    /// routing is enabled, so unaudited providers cannot claim multiple sessions in
+    /// separate transactions.
+    async fn fetch_work_items(
+        &self,
+        lock_timeout: Duration,
+        poll_timeout: Duration,
+        session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
+        max_items: usize,
+        _max_new_sessions: usize,
+    ) -> Result<Vec<(WorkItem, String, u32)>, ProviderError> {
+        if max_items == 0 || matches!(tag_filter, TagFilter::None) {
+            return Ok(Vec::new());
+        }
+
+        if max_items > 1 && session.is_some() {
+            return Ok(self
+                .fetch_work_item(lock_timeout, poll_timeout, session, tag_filter)
+                .await?
+                .into_iter()
+                .collect());
+        }
+
+        let mut items = Vec::with_capacity(max_items.min(16));
+        for _ in 0..max_items {
+            match self
+                .fetch_work_item(lock_timeout, poll_timeout, session, tag_filter)
+                .await?
+            {
+                Some(item) => items.push(item),
+                None => break,
+            }
+        }
+        Ok(items)
+    }
 
     /// Acknowledge successful processing of a work item.
     ///

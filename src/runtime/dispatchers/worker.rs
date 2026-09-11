@@ -35,6 +35,7 @@ use crate::providers::WorkItem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
@@ -173,6 +174,8 @@ impl Runtime {
         tokio::spawn(async move {
             let mut worker_handles = Vec::with_capacity(concurrency);
             let mut session_owner_ids: Vec<String> = Vec::new();
+            let activity_permits = Arc::new(Semaphore::new(self.options.worker_max_inflight.max(1)));
+            let activity_handles = Arc::new(Mutex::new(Vec::new()));
 
             // Tracks distinct active sessions across all worker slots in this
             // runtime. When distinct_count() reaches max_sessions_per_runtime,
@@ -193,6 +196,8 @@ impl Runtime {
                 let activities = Arc::clone(&activities);
                 let shutdown = Arc::clone(&shutdown);
                 let session_tracker_clone = Arc::clone(&session_tracker);
+                let activity_permits_clone = Arc::clone(&activity_permits);
+                let activity_handles_clone = Arc::clone(&activity_handles);
 
                 let suffix = stable_node_id.as_deref().unwrap_or(&self.runtime_id);
                 let worker_id = format!("work-{worker_idx}-{suffix}");
@@ -214,13 +219,15 @@ impl Runtime {
                         let min_interval = rt.options.dispatcher_min_poll_interval;
                         let start_time = std::time::Instant::now();
 
-                        let work_found = match process_next_work_item(
+                        let work_found = match process_next_work_batch(
                             &rt,
                             &activities,
                             &shutdown,
                             &worker_id,
                             &session_owner,
                             &session_tracker_clone,
+                            &activity_permits_clone,
+                            &activity_handles_clone,
                         )
                         .await
                         {
@@ -268,26 +275,37 @@ impl Runtime {
             for handle in worker_handles {
                 let _ = handle.await;
             }
+
+            let mut handles = activity_handles.lock().await;
+            let pending: Vec<_> = handles.drain(..).collect();
+            drop(handles);
+            for handle in pending {
+                let _ = handle.await;
+            }
         })
     }
 }
 
-/// Process the next available work item from the queue.
+/// Process the next available batch of worker items from the queue.
 ///
 /// Returns:
-/// - `Ok(true)` if work was found and processed
+/// - `Ok(true)` if work was found and scheduled
 /// - `Ok(false)` if no work was available
 /// - `Err(e)` if fetch failed (caller handles backoff)
-async fn process_next_work_item(
+async fn process_next_work_batch(
     rt: &Arc<Runtime>,
     activities: &Arc<registry::ActivityRegistry>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
     worker_id: &str,
     session_worker_id: &str,
     session_tracker: &Arc<SessionTracker>,
+    activity_permits: &Arc<Semaphore>,
+    activity_handles: &Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) -> Result<bool, crate::providers::ProviderError> {
     // Check session capacity: if at limit, only fetch non-session items
-    let at_session_capacity = session_tracker.distinct_count() >= rt.options.max_sessions_per_runtime;
+    let distinct_sessions = session_tracker.distinct_count();
+    let remaining_session_capacity = rt.options.max_sessions_per_runtime.saturating_sub(distinct_sessions);
+    let at_session_capacity = remaining_session_capacity == 0;
 
     let session_config = if at_session_capacity {
         None
@@ -298,20 +316,92 @@ async fn process_next_work_item(
         })
     };
 
-    let (item, token, attempt_count) = match rt
+    let session_batch_allowed = session_config.is_none() || rt.options.worker_node_id.is_some();
+    let provider_batch_size = if rt.history_store.supports_batched_work_item_fetch() && session_batch_allowed {
+        rt.options.worker_fetch_batch_size.max(1)
+    } else {
+        1
+    };
+    let fetch_limit = provider_batch_size.min(activity_permits.available_permits()).max(1);
+    let mut permits = acquire_activity_permits(activity_permits, fetch_limit);
+    if permits.is_empty() {
+        return Ok(false);
+    }
+
+    activity_handles.lock().await.retain(|handle| !handle.is_finished());
+
+    let items = rt
         .history_store
-        .fetch_work_item(
+        .fetch_work_items(
             rt.options.worker_lock_timeout,
             rt.options.dispatcher_long_poll_timeout,
             session_config.as_ref(),
             &rt.options.worker_tag_filter,
+            permits.len(),
+            remaining_session_capacity,
         )
-        .await?
-    {
-        Some(result) => result,
-        None => return Ok(false),
-    };
+        .await?;
 
+    if items.is_empty() {
+        return Ok(false);
+    }
+
+    if session_config.is_some() && rt.options.worker_node_id.is_none() {
+        let permit = permits
+            .pop()
+            .expect("fetch_work_items returned an item without an acquired permit");
+        process_fetched_work_item(
+            Arc::clone(rt),
+            Arc::clone(activities),
+            Arc::clone(shutdown),
+            worker_id.to_string(),
+            Arc::clone(session_tracker),
+            items.into_iter().next().expect("items was checked non-empty above"),
+            permit,
+        )
+        .await;
+        return Ok(true);
+    }
+
+    let found = items.len();
+    for item in items {
+        let permit = permits
+            .pop()
+            .expect("fetch_work_items returned more items than acquired permits");
+        let rt = Arc::clone(rt);
+        let activities = Arc::clone(activities);
+        let shutdown = Arc::clone(shutdown);
+        let session_tracker = Arc::clone(session_tracker);
+        let worker_id = worker_id.to_string();
+        tokio::spawn(async move {
+            process_fetched_work_item(rt, activities, shutdown, worker_id, session_tracker, item, permit).await;
+        });
+    }
+
+    Ok(found > 0)
+}
+
+fn acquire_activity_permits(activity_permits: &Arc<Semaphore>, max_items: usize) -> Vec<OwnedSemaphorePermit> {
+    let mut permits = Vec::with_capacity(max_items);
+    for _ in 0..max_items {
+        match Arc::clone(activity_permits).try_acquire_owned() {
+            Ok(permit) => permits.push(permit),
+            Err(_) => break,
+        }
+    }
+    permits
+}
+
+async fn process_fetched_work_item(
+    rt: Arc<Runtime>,
+    activities: Arc<registry::ActivityRegistry>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    worker_id: String,
+    session_tracker: Arc<SessionTracker>,
+    item: (WorkItem, String, u32),
+    _permit: OwnedSemaphorePermit,
+) {
+    let (item, token, attempt_count) = item;
     let item_serialized = serde_json::to_string(&item).unwrap_or_default();
 
     match item {
@@ -328,7 +418,7 @@ async fn process_next_work_item(
             // The guard releases the slot on drop (when activity processing completes).
             // Multiple activities on the same session share one slot.
             let _session_guard = if let Some(ref sid) = session_id {
-                let guard = SessionGuard::new(session_tracker, sid);
+                let guard = SessionGuard::new(&session_tracker, sid);
                 // Re-check capacity after acquiring. The pre-fetch check is a hint
                 // to avoid unnecessary fetches, but two workers can race past it.
                 // If we're now over capacity (another worker won the race for a
@@ -345,7 +435,7 @@ async fn process_next_work_item(
                         .history_store
                         .abandon_work_item(&token, Some(Duration::from_millis(100)), true)
                         .await;
-                    return Ok(true);
+                    return;
                 }
                 Some(guard)
             } else {
@@ -361,7 +451,7 @@ async fn process_next_work_item(
                 lock_token: token,
                 attempt_count,
                 item_serialized,
-                worker_id: worker_id.to_string(),
+                worker_id,
                 session_id,
                 tag,
             };
@@ -369,10 +459,10 @@ async fn process_next_work_item(
             // Cancellation is detected during lock renewal (lock stealing).
             if ctx.attempt_count > rt.options.max_attempts {
                 // Handle poison messages
-                handle_poison_message(rt, &ctx).await;
+                handle_poison_message(&rt, &ctx).await;
             } else {
                 // Execute activity with cancellation support
-                execute_activity(rt, activities, shutdown, ctx).await;
+                execute_activity(&rt, &activities, &shutdown, ctx).await;
             }
         }
         other => {
@@ -380,8 +470,6 @@ async fn process_next_work_item(
             panic!("unexpected WorkItem in Worker dispatcher");
         }
     }
-
-    Ok(true)
 }
 
 /// Enforce minimum polling interval to prevent hot loops.
