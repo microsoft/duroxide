@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Owned, bounded runtime lifecycle** — Add fallible `Runtime::prepare` /
+  `start_execution`, typed bounded shutdown, prompt absolute-deadline acceptance,
+  and explicit actual-completion observation. The first stop fixes grace/total;
+  default total is grace plus five seconds. Runtime task trees, entered provider
+  I/O, startup rollback, and registered foreign invocation cleanup remain owned
+  after timeout or a dropped waiter. Successful shutdown certifies retirement,
+  while incomplete shutdown requires application/supervisor process termination,
+  even after later cleanup; the runtime never terminates the process itself.
+  Replay finalization prevents teardown cancellation from changing durable
+  history. Legacy startup remains panic-shaped with retained rollback, and
+  legacy unit-returning shutdown is finite logged best effort, not a quiescence
+  certificate or timeout-panic policy. Provider polling arguments are unchanged;
+  this does not impose a new cancellation-safety contract on providers.
+- **Correlated lifecycle diagnostics** — Lifecycle records carry a process-local,
+  opaque `lifecycle_id`, including detached startup/cleanup failures. Stop records
+  preserve the remaining grace/total at first acceptance, elapsed time, and
+  whether a core observer timed out. Late completion does not clear an earlier
+  termination obligation; a false core timeout flag says nothing about a foreign
+  caller's cancellation or timeout.
+
 ## [0.1.30] - 2026-07-29
 
 **Release:** <https://crates.io/crates/duroxide/0.1.30>
@@ -1237,4 +1259,3 @@ return ctx.continue_as_new(input).await;
 - OpenTelemetry metrics and structured logging
 - Provider validation test suite
 - Comprehensive documentation
-

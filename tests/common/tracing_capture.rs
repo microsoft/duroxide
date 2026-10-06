@@ -68,7 +68,7 @@ pub fn install_tracing_capture() -> (Arc<Mutex<Vec<CapturedEvent>>>, dispatcher:
     let captured = Arc::new(Mutex::new(Vec::new()));
     let collector = tracing_subscriber::registry()
         .with(CaptureLayer {
-            events: captured.clone(),
+            events: Arc::clone(&captured),
         })
         .with(LevelFilter::TRACE);
     let guard = dispatcher::set_default(&Dispatch::new(collector));

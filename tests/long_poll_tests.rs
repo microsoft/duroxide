@@ -23,11 +23,15 @@ mod common;
 /// work is found or the timeout expires.
 struct LongPollingSqliteProvider {
     inner: Arc<dyn Provider>,
+    entered: [tokio_util::sync::CancellationToken; 2],
 }
 
 impl LongPollingSqliteProvider {
     fn new(inner: Arc<dyn Provider>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            entered: std::array::from_fn(|_| tokio_util::sync::CancellationToken::new()),
+        }
     }
 
     /// Helper to poll inner provider until timeout
@@ -63,6 +67,7 @@ impl Provider for LongPollingSqliteProvider {
         poll_timeout: Duration,
         _filter: Option<&DispatcherCapabilityFilter>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
+        self.entered[0].cancel();
         self.poll_until(poll_timeout, || {
             self.inner.fetch_orchestration_item(lock_timeout, Duration::ZERO, None)
         })
@@ -76,6 +81,7 @@ impl Provider for LongPollingSqliteProvider {
         session: Option<&SessionFetchConfig>,
         tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
+        self.entered[1].cancel();
         // Clone session config for use in closure iterations
         let session_owned = session.cloned();
         let tag_filter = tag_filter.clone();
@@ -208,6 +214,49 @@ impl Provider for LongPollingSqliteProvider {
 }
 
 // --- Tests ---
+
+#[tokio::test]
+async fn bounded_shutdown_retains_an_uncapped_two_second_provider_poll() {
+    use duroxide::runtime::{RuntimeShutdownError, ShutdownOutcome};
+    let (store, _tmp) = common::create_sqlite_store_disk().await;
+    let provider = Arc::new(LongPollingSqliteProvider::new(store));
+    let options = RuntimeOptions {
+        orchestration_concurrency: 1,
+        worker_concurrency: 1,
+        dispatcher_long_poll_timeout: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let rt = runtime::Runtime::start_with_options(
+        provider.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder().build(),
+        options,
+    )
+    .await;
+    for entered in &provider.entered {
+        tokio::time::timeout(Duration::from_secs(1), entered.cancelled())
+            .await
+            .unwrap();
+    }
+    let start = Instant::now();
+    assert_eq!(
+        Arc::clone(&rt)
+            .shutdown_with_timeouts(Duration::from_millis(100), Duration::from_millis(300))
+            .await,
+        Err(RuntimeShutdownError::TimedOut)
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), rt.wait_for_shutdown_completion())
+            .await
+            .unwrap(),
+        Ok(ShutdownOutcome::Forced)
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(1800),
+        "provider poll was silently shortened"
+    );
+}
 
 /// Test 1: Verify fetch waits for the full duration if no work exists
 #[tokio::test]

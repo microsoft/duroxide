@@ -333,6 +333,28 @@ async fn fetch_work_item(
 - Add **long-polling** if your storage backend supports blocking reads (BLPOP, LISTEN/NOTIFY, change streams)
 - The runtime works correctly with either approach
 
+### Shutdown and in-flight provider work (unreleased)
+
+The owned lifecycle does **not** change `fetch_*` polling arguments, cap configured
+long polls, or require a new provider cancellation-safety contract. Runtime-owned
+idle/retry sleeps can be interrupted at stop without changing normal polling.
+Once provider I/O has begun, its owner retains and awaits it instead of dropping
+the future at an unknown transaction/acknowledgment boundary.
+
+Consequently an unresponsive provider can keep startup rollback or forced cleanup
+alive after an ordinary shutdown wait reaches its finite total deadline.
+`TimedOut` means the wait ended, not that the I/O was canceled or the provider was
+freed. The application/supervisor owns process termination; the runtime keeps
+cleanup ownership and never terminates the process itself. A later completion
+can release resources without making the timed-out worker reusable.
+
+Runtime `Drained`/`Forced` certifies retirement of its owned execution tree and
+registered foreign cleanup. It does not dispose all external provider/Client Arcs
+or independent provider tasks, such as token-refresh loops. Those retain their
+own lifetime policy. Provider authors should keep their existing cancellation
+and transaction guarantees explicit rather than treating a caller's finite wait
+as permission to discard an operation.
+
 ---
 
 ## The Provider Trait at a Glance

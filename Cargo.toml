@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing = { version = "0.1", features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 semver = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # used by provider-tests
 futures = { version = "0.3", optional = true }
