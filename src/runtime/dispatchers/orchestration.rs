@@ -1270,7 +1270,7 @@ impl Runtime {
                 pinned_duroxide_version: None,
             };
 
-            let _ = self
+            let ack_result = self
                 .ack_orchestration_with_changes(
                     lock_token,
                     item.execution_id,
@@ -1282,7 +1282,7 @@ impl Runtime {
                 )
                 .await;
 
-            self.record_orchestration_poison();
+            self.record_poison_disposition(&item.instance, attempt_count, ack_result);
             return;
         }
 
@@ -1407,7 +1407,7 @@ impl Runtime {
             vec![]
         };
 
-        let _ = self
+        let ack_result = self
             .ack_orchestration_with_changes(
                 lock_token,
                 item.execution_id,
@@ -1419,8 +1419,49 @@ impl Runtime {
             )
             .await;
 
-        // Record metrics for poison detection
-        self.record_orchestration_poison();
+        self.record_poison_disposition(&item.instance, attempt_count, ack_result);
+    }
+
+    /// Record the outcome of a poison disposition.
+    ///
+    /// Poisoning is only complete once the ack commits. The ack is keyed on the
+    /// message's current lock token, so it fails when that lease has expired --
+    /// and then the poison marking, the backoff, and the attempt-count increment
+    /// are all lost together, because they ride the same ack.
+    ///
+    /// When that happens the message is *not* terminated: its lock expires, it
+    /// becomes visible again, and it is redelivered. Reporting it as poisoned
+    /// would be wrong twice over -- the operator sees a poison count for a
+    /// message that is still circulating, and the log gives no hint that the
+    /// disposition failed.
+    ///
+    /// So the metric is recorded only on success, and failure is surfaced
+    /// explicitly at ERROR with the context needed to connect it to the
+    /// "exceeded max attempts" warning that immediately precedes it.
+    fn record_poison_disposition(
+        self: &Arc<Self>,
+        instance: &str,
+        attempt_count: u32,
+        ack_result: Result<(), ProviderError>,
+    ) {
+        match ack_result {
+            Ok(()) => self.record_orchestration_poison(),
+            Err(error) => {
+                tracing::error!(
+                    instance = %instance,
+                    attempt_count = attempt_count,
+                    max_attempts = self.options.max_attempts,
+                    error = %error,
+                    "Poison disposition FAILED to commit: the orchestration was NOT terminated \
+                     and this message will be redelivered. The poison marking, the backoff, and \
+                     the attempt-count increment all commit through this ack, so all three were \
+                     lost. If the lock lease was already expired when the item was fetched, this \
+                     will repeat on every delivery and the message can never leave the queue -- \
+                     check the provider's fetch path for leases that are expired on arrival."
+                );
+                self.record_orchestration_poison_failed();
+            }
+        }
     }
 
     /// Build `SubOrchFailed` notifications for a terminal instance that received a

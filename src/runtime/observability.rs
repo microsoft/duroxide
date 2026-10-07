@@ -128,6 +128,9 @@ pub struct MetricsSnapshot {
     pub orch_infrastructure_errors: u64,
     pub orch_configuration_errors: u64,
     pub orch_poison: u64,
+    /// Poison dispositions that could NOT be committed (the ack failed), so the
+    /// orchestration was not terminated and its message will be redelivered.
+    pub orch_poison_failed: u64,
     pub activity_success: u64,
     pub activity_app_errors: u64,
     pub activity_infra_errors: u64,
@@ -154,6 +157,7 @@ pub struct MetricsProvider {
     orch_infrastructure_errors_atomic: AtomicU64,
     orch_configuration_errors_atomic: AtomicU64,
     orch_poison_atomic: AtomicU64,
+    orch_poison_failed_atomic: AtomicU64,
     activity_success_atomic: AtomicU64,
     activity_app_errors_atomic: AtomicU64,
     activity_infra_errors_atomic: AtomicU64,
@@ -192,6 +196,7 @@ impl MetricsProvider {
             orch_infrastructure_errors_atomic: AtomicU64::new(0),
             orch_configuration_errors_atomic: AtomicU64::new(0),
             orch_poison_atomic: AtomicU64::new(0),
+            orch_poison_failed_atomic: AtomicU64::new(0),
             activity_success_atomic: AtomicU64::new(0),
             activity_app_errors_atomic: AtomicU64::new(0),
             activity_infra_errors_atomic: AtomicU64::new(0),
@@ -464,6 +469,18 @@ impl MetricsProvider {
         counter!("duroxide_orchestration_poison_total").increment(1);
     }
 
+    /// A poison disposition failed to commit.
+    ///
+    /// The orchestration was NOT terminated: the ack carrying the poison marking,
+    /// the backoff, and the attempt-count increment did not commit, so the message
+    /// will be redelivered. Distinct from `record_orchestration_poison`, which
+    /// counts messages actually taken out of circulation.
+    #[inline]
+    pub fn record_orchestration_poison_failed(&self) {
+        self.orch_poison_failed_atomic.fetch_add(1, Ordering::Relaxed);
+        counter!("duroxide_orchestration_poison_failed_total").increment(1);
+    }
+
     #[inline]
     pub fn record_activity_poison(&self) {
         self.activity_poison_atomic.fetch_add(1, Ordering::Relaxed);
@@ -620,6 +637,7 @@ impl MetricsProvider {
             orch_infrastructure_errors: self.orch_infrastructure_errors_atomic.load(Ordering::Relaxed),
             orch_configuration_errors: self.orch_configuration_errors_atomic.load(Ordering::Relaxed),
             orch_poison: self.orch_poison_atomic.load(Ordering::Relaxed),
+            orch_poison_failed: self.orch_poison_failed_atomic.load(Ordering::Relaxed),
             activity_success: self.activity_success_atomic.load(Ordering::Relaxed),
             activity_app_errors: self.activity_app_errors_atomic.load(Ordering::Relaxed),
             activity_infra_errors: self.activity_infra_errors_atomic.load(Ordering::Relaxed),
