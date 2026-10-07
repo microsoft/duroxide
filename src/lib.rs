@@ -3391,7 +3391,7 @@ impl OrchestrationContext {
     }
 
     /// Clear all keys from the KV store.
-    ///
+    /// 
     /// Emits a `KeyValuesCleared` history event. After this call,
     /// `get_kv_value(key)` returns `None` for all keys.
     pub fn clear_all_kv_values(&self) {
@@ -3408,8 +3408,13 @@ impl OrchestrationContext {
     /// turn are never prunable (they haven't been acked yet).
     ///
     /// Returns the number of keys cleared.
+        ///
+        /// The keys are cleared in sorted order so that the emitted `ClearKeyValue`
+    /// actions are deterministic: `kv_metadata` is a `HashMap`, whose iteration
+    /// order differs between runs, and replay compares actions against recorded
+    /// events in order (fixes microsoft/duroxide#57).
     pub fn prune_kv_values_updated_before(&self, updated_before_ms: u64) -> usize {
-        let keys_to_clear: Vec<String> = {
+        let mut keys_to_clear: Vec<String> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .kv_metadata
@@ -3419,6 +3424,8 @@ impl OrchestrationContext {
                 .map(|(key, _)| key.clone())
                 .collect()
         };
+        // Deterministic emission order across replays (see doc comment above).
+        keys_to_clear.sort();
         let count = keys_to_clear.len();
         for key in keys_to_clear {
             self.clear_kv_value(key);

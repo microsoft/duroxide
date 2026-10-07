@@ -13,6 +13,7 @@
 mod common;
 
 use duroxide::runtime::{self, OrchestrationStatus, registry::ActivityRegistry};
+use duroxide::providers::Provider;
 use duroxide::{ActivityContext, OrchestrationContext, OrchestrationRegistry};
 use std::sync::Arc;
 use std::time::Duration;
@@ -2569,6 +2570,80 @@ async fn kv_prune_old_values_by_timestamp() {
         client.get_kv_value("kv-prune-ts", "fresh").await.unwrap(),
         Some("v3".to_string())
     );
+
+    rt.shutdown(None).await;
+}
+
+/// Regression test for https://github.com/microsoft/duroxide/issues/57:
+/// prune_kv_values_updated_before must emit ClearKeyValue actions in a
+/// deterministic (sorted) key order. kv_metadata is a HashMap whose iteration
+/// order varies between runs, and the replay engine compares emitted actions
+/// against recorded events in order — unsorted emission fails replays with
+/// `nondeterministic: kv clear mismatch`.
+///
+/// Strategy: exec 1 sets four keys in deliberately unsorted insertion order,
+/// then ContinueAsNew to exec 2, which prunes them all. The KeyValueCleared
+/// events recorded in exec 2's history must appear in sorted key order.
+#[tokio::test]
+async fn kv_prune_emits_clears_in_sorted_key_order() {
+    let store = Arc::new(
+        duroxide::providers::sqlite::SqliteProvider::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    let activities = ActivityRegistry::builder().build();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register("PruneOrder", |ctx: OrchestrationContext, input: String| async move {
+            let n: u32 = input.parse().unwrap_or(0);
+            if n == 0 {
+                // Exec 1: set keys in unsorted insertion order, then CAN.
+                for key in ["zeta", "alpha", "mike", "beta"] {
+                    ctx.set_kv_value(key, "v");
+                }
+                ctx.continue_as_new("1".to_string()).await
+            } else {
+                // Exec 2: snapshot has the four keys with their exec-1 timestamps.
+                // Sleep briefly so that "now" is definitely after those timestamps.
+                ctx.schedule_timer(Duration::from_millis(50)).await;
+                let now = ctx
+                    .utc_now()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let removed = ctx.prune_kv_values_updated_before(now);
+                Ok(format!("removed:{removed}"))
+            }
+        })
+        .build();
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+    let client = duroxide::Client::new(store.clone());
+    client.start_orchestration("kv-prune-order", "PruneOrder", "0").await.unwrap();
+
+    let status = client
+        .wait_for_orchestration("kv-prune-order", Duration::from_secs(10))
+        .await
+        .unwrap();
+    match status {
+        OrchestrationStatus::Completed { output, .. } => assert_eq!(output, "removed:4"),
+        OrchestrationStatus::Failed { details, .. } => panic!("failed: {}", details.display_message()),
+        _ => panic!("unexpected status"),
+    }
+
+    // The recorded KeyValueCleared events must be in sorted key order so that a
+    // later replay of the same turn observes the same action sequence.
+    let mgmt = store.as_management_capability().expect("ProviderAdmin required");
+    let history = mgmt.read_history("kv-prune-order").await.unwrap();
+    let cleared: Vec<String> = history
+        .iter()
+        .filter_map(|e| match &e.kind {
+            duroxide::EventKind::KeyValueCleared { key } => Some(key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cleared, vec!["alpha", "beta", "mike", "zeta"]);
 
     rt.shutdown(None).await;
 }
