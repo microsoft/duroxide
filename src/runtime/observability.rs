@@ -670,7 +670,11 @@ pub fn init_logging(config: &ObservabilityConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Observability handle that manages metrics and logging lifecycle
+/// Observability handle for metrics and logging.
+///
+/// Runtime-owned gauge polling is stopped and joined with the execution tree.
+/// An in-flight provider query is retained, even when a caller's shutdown wait
+/// times out. The application's global metrics recorder is not shut down here.
 pub struct ObservabilityHandle {
     metrics_provider: Arc<MetricsProvider>,
 }
@@ -686,8 +690,10 @@ impl ObservabilityHandle {
     /// Returns an error if metrics initialization fails.
     pub fn init(config: &ObservabilityConfig) -> Result<Self, String> {
         // Initialize logging first, but tolerate failures (e.g., global subscriber already set)
-        if let Err(_err) = init_logging(config) {
-            // Silently ignore — this happens when multiple runtimes share a process
+        if init_logging(config).is_err() {
+            tracing::debug!(target: "duroxide::runtime::lifecycle",
+                category = "logging_initialization_skipped",
+                "Optional logging initialization was unavailable; retaining the application's subscriber");
         }
 
         // Always create metrics provider (facade is zero-cost if no recorder installed)

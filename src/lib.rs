@@ -431,7 +431,8 @@ pub mod provider_stress_test;
 // Re-export key runtime types for convenience
 pub use client::{Client, ClientError};
 pub use runtime::{
-    OrchestrationHandler, OrchestrationRegistry, OrchestrationRegistryBuilder, OrchestrationStatus, RuntimeOptions,
+    InvocationCleanupError, OrchestrationHandler, OrchestrationRegistry, OrchestrationRegistryBuilder,
+    OrchestrationStatus, RuntimeOptions, RuntimeShutdownError, RuntimeStartError, ShutdownOutcome,
 };
 
 // Re-export management types for convenience
@@ -2379,6 +2380,7 @@ impl std::fmt::Debug for ActivityContext {
 #[derive(Clone)]
 pub struct OrchestrationContext {
     inner: Arc<Mutex<CtxInner>>,
+    invocation_cleanup: runtime::invocation_scope::CleanupAttachment,
 }
 
 /// A future that never resolves, used by `continue_as_new()` to prevent further execution.
@@ -2425,7 +2427,58 @@ impl OrchestrationContext {
                 orchestration_version,
                 worker_id,
             ))),
+            invocation_cleanup: Default::default(),
         }
+    }
+
+    /// Attach the foreign invocation's completion before starting foreign work.
+    ///
+    /// The runtime retains this single-use completion independently of the replay
+    /// future. It is awaited after the durable turn decision and driver destruction.
+    /// Cleanup errors become lifecycle failures; their arbitrary text is not logged.
+    /// A returned result, including `Err`, must certify that foreign work has ended.
+    /// A panicking completion cannot certify that fact: it is logged and retained
+    /// without publishing completion. Ordinary shutdown waits can still time out;
+    /// the application or supervisor then owns process termination.
+    /// Ordinary replay retirement is not by itself forced runtime shutdown.
+    /// Teardown occurs after the durable decision; cleanup cancellation must not
+    /// be reported as a new persisted orchestration result by a language adapter.
+    ///
+    /// # Errors
+    /// Rejects standalone/synchronous replay, duplicate attachment, and a closed turn.
+    /// Propagate attachment failure before activating any foreign work.
+    pub fn register_invocation_cleanup(
+        &self,
+        completion: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) -> Result<(), runtime::InvocationCleanupError> {
+        self.invocation_cleanup.register(completion)
+    }
+
+    /// Attach foreign completion and a synchronous turn-finalization notification.
+    ///
+    /// `finalization` closes foreign scheduling/mutation admission before the final
+    /// durable snapshot. It must return promptly without joining foreign work or
+    /// performing I/O. Already-admitted foreign execution remains owned by `completion`,
+    /// which has the same retirement contract as [`Self::register_invocation_cleanup`].
+    /// A panic in the notification is contained and reported as a lifecycle failure;
+    /// it never substitutes for actual foreign completion.
+    ///
+    /// Existing handlers need not opt into this notification.
+    ///
+    /// # Errors
+    /// Rejects standalone/synchronous replay, duplicate attachment, and a finalized turn.
+    pub fn register_invocation_cleanup_with_finalization(
+        &self,
+        completion: impl Future<Output = Result<(), String>> + Send + 'static,
+        finalization: impl FnMut() + Send + 'static,
+    ) -> Result<(), runtime::InvocationCleanupError> {
+        self.invocation_cleanup
+            .register_with_finalization(completion, finalization)
+    }
+
+    pub(crate) fn with_invocation_cleanup(mut self, cleanup: runtime::invocation_scope::CleanupAttachment) -> Self {
+        self.invocation_cleanup = cleanup;
+        self
     }
 
     /// Check if the orchestration is currently replaying history.

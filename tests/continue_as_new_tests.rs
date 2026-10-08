@@ -11,6 +11,8 @@ use duroxide::runtime::{self};
 use duroxide::{ActivityContext, Either2, Event, OrchestrationContext, OrchestrationRegistry};
 use std::time::Duration;
 mod common;
+#[path = "common/controlled_provider.rs"]
+mod lifecycle_provider;
 
 // Basic ContinueAsNew loop: rolls input across executions and finally completes.
 #[tokio::test]
@@ -237,9 +239,22 @@ async fn continue_as_new_event_routes_to_latest() {
 // External events sent before the new execution's subscription are dropped; after subscribing, events are delivered.
 #[tokio::test]
 async fn continue_as_new_event_drop_then_process() {
-    let (store, _td) = common::create_sqlite_store_disk().await;
+    use duroxide::providers::Provider;
+    use duroxide::runtime::test_hooks::{LifecycleHooks, LifecyclePoint, ProviderOperation};
+    use lifecycle_provider::{ControlledProvider, PollBehavior};
+    use std::sync::Arc;
+    let (inner, _td) = common::create_sqlite_store_disk().await;
+    let hooks = LifecycleHooks::default();
+    let can_committed = hooks
+        .hold(LifecyclePoint::ProviderCommit(
+            ProviderOperation::AcknowledgeOrchestration,
+        ))
+        .unwrap();
+    let provider = Arc::new(ControlledProvider::new(inner, PollBehavior::Ignore, hooks));
+    provider.begin_window(Duration::from_secs(30));
+    let store: Arc<dyn Provider> = provider;
 
-    // Orchestrator: first execution continues; second waits for Go twice (second send expected to deliver)
+    // First execution continues; execution two receives only the post-subscription event.
     let orch = |ctx: OrchestrationContext, input: String| async move {
         match input.as_str() {
             "start" => {
@@ -259,30 +274,30 @@ async fn continue_as_new_event_drop_then_process() {
         .register("EvtDropThenProcess", orch)
         .build();
     let activity_registry = ActivityRegistry::builder().build();
-    let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
+    let rt = runtime::Runtime::start_with_options(
+        store.clone(),
+        activity_registry,
+        orchestration_registry,
+        runtime::RuntimeOptions {
+            orchestration_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await;
     let client = duroxide::Client::new(store.clone());
-
-    // Start orchestrator
-    let client_c1 = duroxide::Client::new(store.clone());
-    tokio::spawn(async move {
-        // Intentionally send too early to new execution (before subscription)
-        // We wait a bit to ensure CAN happens but before subscription is recorded.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = client_c1.raise_event("inst-can-evt-drop", "Go", "early").await;
-    });
-
-    // After subscription exists, send again
-    let store_for_wait = store.clone();
-    let client_c2 = duroxide::Client::new(store.clone());
-    tokio::spawn(async move {
-        let _ = common::wait_for_subscription(store_for_wait, "inst-can-evt-drop", "Go", 2_000).await;
-        let _ = client_c2.raise_event("inst-can-evt-drop", "Go", "late").await;
-    });
 
     client
         .start_orchestration("inst-can-evt-drop", "EvtDropThenProcess", "start")
         .await
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), can_committed.entered())
+        .await
+        .unwrap();
+    // The only slot is held after CAN commits, before execution two can subscribe.
+    client.raise_event("inst-can-evt-drop", "Go", "early").await.unwrap();
+    can_committed.release();
+    assert!(common::wait_for_subscription(store.clone(), "inst-can-evt-drop", "Go", 2_000).await);
+    client.raise_event("inst-can-evt-drop", "Go", "late").await.unwrap();
 
     match client
         .wait_for_orchestration("inst-can-evt-drop", std::time::Duration::from_secs(5))
@@ -322,7 +337,12 @@ async fn continue_as_new_event_drop_then_process() {
     );
     assert!(
         e2.iter()
-            .any(|e| matches!(&e.kind, EventKind::ExternalEvent { name, .. } if name == "Go"))
+            .any(|e| matches!(&e.kind, EventKind::ExternalEvent { name, data } if name == "Go" && data == "late"))
+    );
+    assert!(
+        e2.iter()
+            .any(|e| matches!(&e.kind, EventKind::ExternalEvent { name, data } if name == "Go" && data == "early")),
+        "the undeliverable early event remains in execution two's audit history"
     );
 
     // Exec1 must not have ExternalEvent

@@ -24,6 +24,9 @@
 
 ### Minimum Viable Orchestration
 
+The fallible lifecycle in this example is **unreleased**, requiring a matching
+source build rather than published 0.1.30.
+
 ```rust
 use duroxide::{ActivityContext, OrchestrationContext, OrchestrationRegistry, Client};
 use duroxide::runtime::{self, registry::ActivityRegistry};
@@ -53,11 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register("HelloWorld", orchestration)
         .build();
     
-    let rt = runtime::Runtime::start_with_store(
+    let rt = runtime::Runtime::prepare(
         store.clone(), 
         activities, 
-        orchestrations
-    ).await;
+        orchestrations,
+        runtime::RuntimeOptions::default(),
+    )?;
+    Arc::clone(&rt).start_execution().await?;
     
     // 5. Start an instance
     let client = Client::new(store);
@@ -71,10 +76,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("Result: {:?}", status);
     
-    rt.shutdown(None).await;
+    rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await?;
     Ok(())
 }
 ```
+
+### Worker lifecycle (unreleased)
+
+`Runtime::prepare` validates configuration and returns a non-executing `Arc`.
+`start_execution` requires a Tokio executor and returns after activation, not
+after worker shutdown. Retain an Arc before awaiting it: failed or dropped
+startup observers do not discard partially started work, and accepted stop
+prevents later startup admission. There is no restart of the same runtime.
+The legacy `start`, `start_with_store`, and `start_with_options` factories still
+panic on their startup failures, with rollback retained independently.
+
+Prefer typed shutdown over the legacy unit return:
+
+```rust
+# async fn stop(runtime: std::sync::Arc<duroxide::runtime::Runtime>)
+#     -> Result<(), duroxide::runtime::RuntimeShutdownError> {
+use std::time::Duration;
+use duroxide::runtime::ShutdownOutcome;
+
+let outcome = runtime.shutdown_with_timeouts(
+    Duration::from_secs(30), Duration::from_secs(35),
+).await?;
+match outcome {
+    ShutdownOutcome::Drained => println!("Execution drained"),
+    ShutdownOutcome::Forced => println!("Forced execution and registered cleanup retired"),
+}
+# Ok(())
+# }
+```
+
+This is execution quiescence, not disposal of independently retained provider or
+Client Arcs. Runtime-owned dispatcher/slot children and registered foreign cleanup
+must all retire before success. Independent provider token-refresh tasks and
+arbitrary application-detached tasks are outside that barrier.
+
+The first accepted stop owns both deadlines, including already-entered startup.
+Repeated calls validate arguments but cannot renew them. Total must be at least
+grace; durations must fit an unsigned 64-bit nanosecond interval and checked
+monotonic deadlines, including timer rounding headroom. Positive sub-millisecond
+precision is retained. These checks also apply to unused/repeated paths.
+`shutdown_with_grace` derives total as grace plus five seconds with checked
+addition. A never-started runtime can prove immediate `Drained` even with zero
+total; a published actual completion/error wins over expired waiting.
+
+During grace, new work admission stops and admitted work may finish. On expiry,
+force is requested and **joined**, not assumed to finish synchronously. Provider
+I/O already entered may not be safely cancellable, so it remains retained. Normal
+configured polling timeouts are not capped to implement shutdown.
+
+At total expiry, `RuntimeShutdownError::TimedOut` ends ordinary waiting but
+preserves all cleanup ownership. The application/supervisor must terminate the
+worker process; the runtime does not. Genuine late completion does not erase
+that obligation. `Failed { quiescent }` is an operational failure, not a timeout
+or manufactured success; `is_quiescent()` reports whether retirement was proven.
+
+`request_shutdown_until(grace_deadline, total_deadline)` only accepts stop and
+returns promptly. It performs no provider call or join and never renews expired
+inherited deadlines. To intentionally wait beyond the first total, call
+`wait_for_shutdown_completion()` on an already-stopping runtime. It can wait
+indefinitely; dropping that observer affects neither cleanup nor other waiters.
+
+Legacy `shutdown(None)` is bounded, logged best effort: omitted grace is one
+second (six seconds total), and `Some(0)` is zero grace (five seconds total).
+It does **not** panic solely because the bounded wait failed. Because it returns
+`()`, ordinary return cannot tell success from incomplete cleanup. New control
+code should use the typed methods and surface the termination requirement.
+
+### Foreign invocations and replay retirement
+
+An adapter must register one `OrchestrationContext::register_invocation_cleanup`
+completion **before starting foreign work**, and propagate attachment failure
+before foreign activation. Runtime-owned asynchronous replay supports this;
+standalone/synchronous replay rejects unsupported attachment rather than
+accepting cleanup that it cannot await.
+
+The optional `register_invocation_cleanup_with_finalization` notification closes
+foreign scheduling/mutation admission before the durable turn snapshot. The
+runtime destroys the driver and awaits foreign retirement only after capturing
+the durable decision, so teardown-induced cancellation does not become persisted
+orchestration failure. Finalization must be prompt: no I/O or waiting for foreign
+work in the notification. Ordinary replay completion, dehydration, failure, and
+continue-as-new retire a turn; they are not automatically forced runtime shutdown.
+
+A cleanup `Ok` **or** `Err` must mean foreign work has actually ended; a cleanup
+error is still a lifecycle failure. A panicking completion cannot certify that
+work ended and remains retained. Unregistered continuations cannot be covered by
+this contract. The .NET adapter registers its root/SDK continuation lifetime;
+the narrow Node/Python adapters do not provide that additional guarantee.
 
 ---
 
@@ -2284,11 +2377,13 @@ async fn test_full_workflow() {
         .register("TestOrch", orch)
         .build();
     
-    let rt = runtime::Runtime::start_with_store(
+    let rt = runtime::Runtime::prepare(
         store.clone(),
         activities,
         orchestrations,
-    ).await;
+        runtime::RuntimeOptions::default(),
+    ).unwrap();
+    Arc::clone(&rt).start_execution().await.unwrap();
     
     let client = Client::new(store);
     client.start_orchestration("test-1", "TestOrch", "input").await.unwrap();
@@ -2304,7 +2399,7 @@ async fn test_full_workflow() {
         _ => panic!("Expected completion"),
     }
     
-    rt.shutdown(None).await;
+    rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await.unwrap();
 }
 ```
 
@@ -2693,4 +2788,3 @@ async fn fast_updates(ctx: OrchestrationContext, items_json: String) -> Result<(
 ---
 
 **You now have everything needed to build production-grade durable workflows!** 🎉
-

@@ -22,6 +22,68 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "common/runtime_lifecycle.rs"]
+mod lifecycle_support;
+
+#[tokio::test]
+async fn runtime_force_interrupts_instance_cancellation_grace_without_acknowledging_unfinished_work() {
+    use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
+    use duroxide::runtime::{RuntimeShutdownError, ShutdownOutcome};
+    use lifecycle_support::{Fixture, bounded, options};
+    use tokio_util::sync::CancellationToken;
+    let f = Fixture::new().await;
+    let started = CancellationToken::new();
+    let cancelled = CancellationToken::new();
+    let handler_started = started.clone();
+    let handler_cancelled = cancelled.clone();
+    let activities = ActivityRegistry::builder()
+        .register("work", move |ctx: ActivityContext, _: String| {
+            let started = handler_started.clone();
+            let cancelled = handler_cancelled.clone();
+            async move {
+                started.cancel();
+                ctx.cancelled().await;
+                cancelled.cancel();
+                std::future::pending::<Result<String, String>>().await
+            }
+        })
+        .build();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register("cancel", |ctx: OrchestrationContext, _: String| async move {
+            ctx.schedule_activity("work", "").await
+        })
+        .build();
+    let mut config = options();
+    config.activity_cancellation_grace_period = Duration::from_secs(60);
+    let runtime = f.prepare(activities, orchestrations, config);
+    Arc::clone(&runtime).start_execution().await.unwrap();
+    f.client()
+        .start_orchestration("cancel-force", "cancel", "")
+        .await
+        .unwrap();
+    bounded(started.cancelled()).await;
+    f.client()
+        .cancel_instance("cancel-force", "instance cancellation")
+        .await
+        .unwrap();
+    bounded(cancelled.cancelled()).await;
+    let result = Arc::clone(&runtime)
+        .shutdown_with_timeouts(Duration::ZERO, Duration::from_secs(1))
+        .await;
+    assert_ne!(result, Err(RuntimeShutdownError::TimedOut));
+    assert_eq!(result, Ok(ShutdownOutcome::Forced));
+    assert_eq!(
+        f.hooks
+            .hits(LifecyclePoint::ProviderCommit(ProviderOperation::AcknowledgeActivity)),
+        0
+    );
+    f.assert_retired();
+    assert!(matches!(
+        f.client().get_orchestration_status("cancel-force").await.unwrap(),
+        runtime::OrchestrationStatus::Failed { .. }
+    ));
+}
+
 #[tokio::test]
 async fn cancel_parent_down_propagates_to_child() {
     let (store, _td) = common::create_sqlite_store_disk().await;

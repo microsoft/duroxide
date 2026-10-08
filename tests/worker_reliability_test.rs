@@ -12,6 +12,98 @@ use duroxide::*;
 use std::sync::Arc;
 
 mod common;
+#[path = "common/runtime_lifecycle.rs"]
+mod lifecycle_support;
+
+#[tokio::test]
+async fn lifecycle_fetch_and_ack_faults_preserve_activity_redelivery_at_commit_boundaries() {
+    use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
+    use duroxide::runtime::{Runtime, RuntimeShutdownError};
+    use lifecycle_support::{Fixture, bounded, entered, options};
+    use std::time::Duration;
+    for operation in [ProviderOperation::FetchActivity, ProviderOperation::AcknowledgeActivity] {
+        for after_commit in [false, true] {
+            let f = Fixture::new().await;
+            let registry = OrchestrationRegistry::builder()
+                .register("recover", |ctx: OrchestrationContext, _: String| async move {
+                    ctx.schedule_activity("work", "payload").await
+                })
+                .build();
+            let activity = ActivityRegistry::builder()
+                .register("work", |_: ActivityContext, _: String| async {
+                    Ok("recovered".to_string())
+                })
+                .build();
+            let mut seed_options = options();
+            seed_options.worker_concurrency = 0;
+            let seed =
+                Runtime::start_with_options(Arc::clone(&f.inner), activity.clone(), registry.clone(), seed_options)
+                    .await;
+            f.client()
+                .start_orchestration("activity-recovery", "recover", "")
+                .await
+                .unwrap();
+            assert!(
+                common::wait_for_history(
+                    Arc::clone(&f.inner),
+                    "activity-recovery",
+                    |events| events
+                        .iter()
+                        .any(|event| matches!(event.kind, EventKind::ActivityScheduled { .. })),
+                    2000
+                )
+                .await
+            );
+            seed.shutdown(None).await;
+
+            let point = if after_commit {
+                LifecyclePoint::ProviderReturn(operation)
+            } else {
+                LifecyclePoint::ProviderEnter(operation)
+            };
+            let held = f.hold(point);
+            f.hooks.fail_once(point).unwrap();
+            let mut config = options();
+            config.orchestration_concurrency = 0;
+            config.worker_lock_timeout = Duration::from_millis(50);
+            let runtime = f.prepare(activity.clone(), registry.clone(), config);
+            Arc::clone(&runtime).start_execution().await.unwrap();
+            entered(&held).await;
+            assert_eq!(
+                Arc::clone(&runtime)
+                    .shutdown_with_timeouts(Duration::ZERO, Duration::from_millis(100))
+                    .await,
+                Err(RuntimeShutdownError::TimedOut)
+            );
+            assert!(f.provider.active_operations() > 0);
+            held.release();
+            assert_eq!(
+                bounded(runtime.wait_for_shutdown_completion()).await,
+                Err(RuntimeShutdownError::Failed { quiescent: true })
+            );
+            f.assert_retired();
+            let peer = Runtime::start_with_options(Arc::clone(&f.inner), activity, registry, options()).await;
+            assert!(
+                matches!(bounded(f.client().wait_for_orchestration("activity-recovery", Duration::from_secs(3))).await.unwrap(),
+                OrchestrationStatus::Completed { output, .. } if output == "recovered")
+            );
+            peer.shutdown(None).await;
+            let history = f.inner.read("activity-recovery").await.unwrap();
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| matches!(event.kind, EventKind::ActivityCompleted { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                !history
+                    .iter()
+                    .any(|event| matches!(event.kind, EventKind::ActivityFailed { .. }))
+            );
+        }
+    }
+}
 
 /// Test that verifies activity completion reliability after crash between dequeue and enqueue
 ///

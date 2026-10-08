@@ -17,11 +17,12 @@
 use crate::providers::{ExecutionMetadata, ProviderError, ScheduledActivityIdentifier, WorkItem};
 use crate::{Event, EventKind};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::super::invocation_scope::{CleanupAttachment, InvocationScope};
+use super::super::task_group::{TaskResult, TaskRole};
 use super::super::{HistoryManager, Runtime, WorkItemReader};
 
 /// Validate runtime limits on the history delta and fail the orchestration if any are exceeded.
@@ -273,79 +274,84 @@ fn calculate_renewal_interval(lock_timeout: Duration, buffer: Duration) -> Durat
 }
 
 /// Spawn a background task to renew the lock for an in-flight orchestration.
-fn spawn_orchestration_lock_renewal_task(
-    store: Arc<dyn crate::providers::Provider>,
+async fn run_orchestration_lock_renewal_task(
+    rt: Arc<Runtime>,
     token: String,
-    lock_timeout: Duration,
-    buffer: Duration,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) -> JoinHandle<()> {
-    let renewal_interval = calculate_renewal_interval(lock_timeout, buffer);
+    retired: CancellationToken,
+) -> TaskResult {
+    Arc::clone(&rt)
+        .own_task(TaskRole::OrchestrationRenewal, move |_| {
+            Box::pin(async move {
+                let lock_timeout = rt.options.orchestrator_lock_timeout;
+                let buffer = rt.options.orchestrator_lock_renewal_buffer;
+                let renewal_interval = calculate_renewal_interval(lock_timeout, buffer);
 
-    tracing::debug!(
-        target: "duroxide::runtime::dispatchers::orchestration",
-        lock_token = %token,
-        lock_timeout_secs = %lock_timeout.as_secs(),
-        buffer_secs = %buffer.as_secs(),
-        renewal_interval_secs = %renewal_interval.as_secs(),
-        "Spawning orchestration lock renewal task"
-    );
+                tracing::debug!(
+                    target: "duroxide::runtime::dispatchers::orchestration",
+                    lock_token = %token,
+                    lock_timeout_secs = %lock_timeout.as_secs(),
+                    buffer_secs = %buffer.as_secs(),
+                    renewal_interval_secs = %renewal_interval.as_secs(),
+                    "Spawning orchestration lock renewal task"
+                );
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(renewal_interval);
-        interval.tick().await; // Skip first immediate tick
+                #[cfg(feature = "test-hooks")]
+                rt.hooks()
+                    .checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(
+                        TaskRole::OrchestrationRenewal,
+                    ))
+                    .await;
+                let mut interval = tokio::time::interval(renewal_interval);
+                interval.tick().await; // Skip first immediate tick
 
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    if shutdown.load(Ordering::Relaxed) {
-                        tracing::debug!(
-                            target: "duroxide::runtime::dispatchers::orchestration",
-                            lock_token = %token,
-                            "Lock renewal task stopping due to shutdown"
-                        );
-                        break;
-                    }
-
-                    match store.renew_orchestration_item_lock(&token, lock_timeout).await {
-                        Ok(()) => {
-                            tracing::trace!(
-                                target: "duroxide::runtime::dispatchers::orchestration",
-                                lock_token = %token,
-                                extend_secs = %lock_timeout.as_secs(),
-                                "Orchestration lock renewed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                target: "duroxide::runtime::dispatchers::orchestration",
-                                lock_token = %token,
-                                error = %e,
-                                "Failed to renew orchestration lock (may have been acked/abandoned)"
-                            );
-                            // Stop renewal - lock is gone or expired
-                            break;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = retired.cancelled() => break,
+                        () = rt.shutdown_state.force_signal().cancelled() => break,
+                        _ = interval.tick() => {
+                            match rt.history_store.renew_orchestration_item_lock(&token, lock_timeout).await {
+                                Ok(()) => {
+                                    tracing::trace!(
+                                        target: "duroxide::runtime::dispatchers::orchestration",
+                                        lock_token = %token,
+                                        extend_secs = %lock_timeout.as_secs(),
+                                        "Orchestration lock renewed"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        target: "duroxide::runtime::dispatchers::orchestration",
+                                        lock_token = %token,
+                                        error = %e,
+                                        "Failed to renew orchestration lock (may have been acked/abandoned)"
+                                    );
+                                    // Stop renewal - lock is gone or expired
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        tracing::debug!(
-            target: "duroxide::runtime::dispatchers::orchestration",
-            lock_token = %token,
-            "Orchestration lock renewal task stopped"
-        );
-    })
+                tracing::debug!(
+                    target: "duroxide::runtime::dispatchers::orchestration",
+                    lock_token = %token,
+                    "Orchestration lock renewal task stopped"
+                );
+                Ok(())
+            })
+        })
+        .await
 }
 
 impl Runtime {
     /// Start the orchestration dispatcher with N concurrent workers
-    pub(in crate::runtime) fn start_orchestration_dispatcher(self: Arc<Self>) -> JoinHandle<()> {
+    pub(in crate::runtime) async fn run_orchestration_dispatcher(self: Arc<Self>) -> TaskResult {
+        Arc::clone(&self).own_task(TaskRole::OrchestrationDispatcher, move |group| Box::pin(async move {
         // EXECUTION: spawns N concurrent orchestration workers
         // Instance-level locking in provider prevents concurrent processing of same instance
         let concurrency = self.options.orchestration_concurrency;
-        let shutdown = self.shutdown_flag.clone();
 
         // Build the capability filter once for all workers (immutable for this runtime's lifetime).
         let capability_filter = if let Some(ref custom_range) = self.options.supported_replay_versions {
@@ -372,22 +378,19 @@ impl Runtime {
             crate::providers::SemverRange::default_for_current_build()
         };
 
-        tokio::spawn(async move {
-            let mut worker_handles = Vec::new();
-
             for worker_idx in 0..concurrency {
                 let rt = Arc::clone(&self);
-                let shutdown = Arc::clone(&shutdown);
                 let cap_filter = Some(capability_filter.clone());
                 let supported_range = runtime_supported_range.clone();
                 // Generate unique worker ID: orch-{index}-{runtime_id}
                 let worker_id = format!("orch-{worker_idx}-{}", rt.runtime_id);
-                let handle = tokio::spawn(async move {
+                group.spawn(TaskRole::OrchestrationSlot.name(), Arc::clone(&rt).own_task(
+                    TaskRole::OrchestrationSlot, move |_| Box::pin(async move {
                     // debug!("Orchestration worker {} started", worker_id);
                     let mut consecutive_retryable_errors = 0u32;
                     loop {
                         // Check shutdown flag before fetching
-                        if shutdown.load(Ordering::Relaxed) {
+                        if rt.is_stopping() {
                             // debug!("Orchestration worker {} exiting", worker_id);
                             break;
                         }
@@ -407,6 +410,13 @@ impl Runtime {
                             .await
                         {
                             Ok(Some((item, lock_token, attempt_count))) => {
+                                if rt.is_stopping() {
+                                    if rt.history_store.abandon_orchestration_item(&lock_token, None, true).await.is_err() {
+                                        warn!(target: "duroxide::runtime::lifecycle", category = "stop_abandon_orchestration_failed",
+                                            "Fetched orchestration could not be abandoned; lock-expiry recovery remains available");
+                                    }
+                                    break;
+                                }
                                 // Reset error counter on success
                                 consecutive_retryable_errors = 0;
 
@@ -447,36 +457,9 @@ impl Runtime {
                                 // pinned_version == None means no history yet (brand new instance)
                                 // — always compatible, proceed normally.
 
-                                // Spawn lock renewal task for this orchestration
-                                let renewal_handle = spawn_orchestration_lock_renewal_task(
-                                    Arc::clone(&rt.history_store),
-                                    lock_token.clone(),
-                                    rt.options.orchestrator_lock_timeout,
-                                    rt.options.orchestrator_lock_renewal_buffer,
-                                    Arc::clone(&shutdown),
-                                );
-
-                                // TEST HOOK: Inject delay after spawning renewal task
-                                // This simulates slow processing to test lock renewal
-                                #[cfg(feature = "test-hooks")]
-                                if let Some(delay) =
-                                    crate::runtime::test_hooks::get_orch_processing_delay(&item.instance)
-                                {
-                                    tracing::debug!(
-                                        instance = %item.instance,
-                                        delay_ms = delay.as_millis(),
-                                        "Test hook: injecting orchestration processing delay"
-                                    );
-                                    tokio::time::sleep(delay).await;
-                                }
-
-                                // Process orchestration item atomically
-                                // Provider ensures no other worker has this instance locked
-                                rt.process_orchestration_item(item, &lock_token, attempt_count, &worker_id)
-                                    .await;
-
-                                // Stop lock renewal task now that orchestration turn is complete
-                                renewal_handle.abort();
+                                Arc::clone(&rt).process_orchestration_owned(
+                                    item, lock_token, attempt_count, worker_id.clone(),
+                                ).await?;
 
                                 work_found = true;
                             }
@@ -487,18 +470,18 @@ impl Runtime {
                             Err(e) => {
                                 if e.is_retryable() {
                                     // Exponential backoff for retryable errors (database locks, etc.)
-                                    consecutive_retryable_errors += 1;
-                                    let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors)).min(3000);
+                                    consecutive_retryable_errors = consecutive_retryable_errors.saturating_add(1);
+                                    let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors.min(5))).min(3000);
                                     warn!(
                                         "Error fetching orchestration item (retryable, attempt {}): {:?}, backing off {}ms",
                                         consecutive_retryable_errors, e, backoff_ms
                                     );
-                                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                    rt.sleep_while_running(Duration::from_millis(backoff_ms)).await;
                                 } else {
                                     // Permanent errors - log and continue with normal polling
                                     warn!("Error fetching orchestration item (permanent): {:?}", e);
                                     consecutive_retryable_errors = 0;
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    rt.sleep_while_running(Duration::from_millis(100)).await;
                                 }
                                 continue;
                             }
@@ -509,25 +492,64 @@ impl Runtime {
                             let elapsed = start_time.elapsed();
                             if elapsed < min_interval {
                                 let sleep_duration = min_interval - elapsed;
-                                if !shutdown.load(Ordering::Relaxed) {
-                                    tokio::time::sleep(sleep_duration).await;
-                                }
+                                rt.sleep_while_running(sleep_duration).await;
                             } else {
                                 // Waited long enough (e.g. long poll timeout expired), yield to prevent starvation
                                 tokio::task::yield_now().await;
                             }
                         }
                     }
-                });
-                worker_handles.push(handle);
+                    Ok(())
+                })));
             }
+            #[cfg(feature = "test-hooks")]
+            self.hooks().checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(TaskRole::OrchestrationDispatcher)).await;
+            Ok(())
+        })).await
+    }
 
-            // Wait for all workers to complete
-            for handle in worker_handles {
-                let _ = handle.await;
-            }
-            // debug!("Orchestration dispatcher exited");
-        })
+    async fn process_orchestration_owned(
+        self: Arc<Self>,
+        item: crate::providers::OrchestrationItem,
+        lock_token: String,
+        attempt_count: u32,
+        worker_id: String,
+    ) -> TaskResult {
+        Arc::clone(&self).own_work("orchestration-item", move |group| {
+            let retired = CancellationToken::new();
+            group.spawn_until_join(TaskRole::OrchestrationRenewal.name(), run_orchestration_lock_renewal_task(
+                Arc::clone(&self), lock_token.clone(), retired.clone(),
+            ), retired);
+            Box::pin(async move {
+                Arc::clone(&self).own_work("orchestration-turn", move |turn| {
+                    let scope = InvocationScope::new();
+                    #[cfg(feature = "test-hooks")]
+                    let scope = scope.with_hooks(self.hooks());
+                    let cleanup = scope.attachment();
+                    let cleanup_runtime = Arc::clone(&self);
+                    turn.retain_cleanup("invocation-cleanup",
+                        scope.retire_reporting(move |failures| cleanup_runtime.record_faults(failures)));
+                    Box::pin(async move {
+                        #[cfg(feature = "test-hooks")]
+                        {
+                            self.hooks().checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(TaskRole::OrchestrationSlot)).await;
+                            if let Some(delay) = crate::runtime::test_hooks::get_orch_processing_delay(&item.instance) {
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
+                        if self.shutdown_state.force_signal().is_cancelled() {
+                            if self.history_store.abandon_orchestration_item(&lock_token, None, true).await.is_err() {
+                                warn!(target: "duroxide::runtime::lifecycle", category = "force_abandon_orchestration_failed",
+                                    "Forced orchestration could not be abandoned; lock-expiry recovery remains available");
+                            }
+                        } else {
+                            self.process_orchestration_item(item, &lock_token, attempt_count, &worker_id, cleanup).await;
+                        }
+                        Ok(())
+                    })
+                }).await
+            })
+        }).await
     }
 
     /// Process a single orchestration item atomically
@@ -537,6 +559,7 @@ impl Runtime {
         lock_token: &str,
         attempt_count: u32,
         worker_id: &str,
+        cleanup: CleanupAttachment,
     ) {
         // EXECUTION: builds deltas and commits via ack_orchestration_item
         let instance = &item.instance;
@@ -650,6 +673,7 @@ impl Runtime {
                         execution_id_to_use,
                         worker_id,
                         item.kv_snapshot.clone(),
+                        cleanup,
                     )
                     .await;
 
@@ -1006,11 +1030,15 @@ impl Runtime {
                     Err(e2) => {
                         // Failed to commit failure event - abandon lock
                         warn!(instance = %instance, error = %e2, "Failed to commit failure event, abandoning lock");
-                        drop(self.history_store.abandon_orchestration_item(
-                            lock_token,
-                            Some(std::time::Duration::from_millis(50)),
-                            false,
-                        ));
+                        if self
+                            .history_store
+                            .abandon_orchestration_item(lock_token, Some(std::time::Duration::from_millis(50)), false)
+                            .await
+                            .is_err()
+                        {
+                            warn!(target: "duroxide::runtime::lifecycle", category = "abandon_orchestration_failed",
+                                "Failed orchestration acknowledgment could not be abandoned; lock-expiry recovery remains available");
+                        }
                     }
                 }
             }
@@ -1026,6 +1054,7 @@ impl Runtime {
     ///
     /// Returns `Err(UnregisteredOrchestration)` if the handler is not found in the registry,
     /// which the caller should handle by abandoning with backoff for rolling deployment support.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) async fn resolve_and_execute_orchestration_handler(
         self: &Arc<Self>,
         instance: &str,
@@ -1034,6 +1063,7 @@ impl Runtime {
         execution_id: u64,
         worker_id: &str,
         kv_snapshot: std::collections::HashMap<String, crate::providers::KvEntry>,
+        cleanup: CleanupAttachment,
     ) -> Result<(Vec<WorkItem>, Vec<WorkItem>, Vec<ScheduledActivityIdentifier>), OrchestrationProcessingError> {
         let mut worker_items = Vec::new();
         let mut orchestrator_items = Vec::new();
@@ -1105,7 +1135,7 @@ impl Runtime {
         // Run the atomic execution to get all changes, passing the resolved handler and version
         let (_exec_history_delta, exec_worker_items, exec_orchestrator_items, exec_cancelled_activities, _result) =
             Arc::clone(self)
-                .run_single_execution_atomic(
+                .run_single_execution_scoped(
                     instance,
                     history_mgr,
                     workitem_reader,
@@ -1114,6 +1144,7 @@ impl Runtime {
                     handler,
                     resolved_version.to_string(),
                     kv_snapshot,
+                    cleanup,
                 )
                 .await;
 
@@ -1191,17 +1222,25 @@ impl Runtime {
                     if attempts < max_attempts {
                         let backoff_ms = 10u64.saturating_mul(1 << attempts);
                         warn!(attempts, backoff_ms, error = %e, "ack_orchestration_item failed; retrying");
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        tokio::select! {
+                            biased;
+                            () = self.shutdown_state.force_signal().cancelled() => {}
+                            () = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
+                        }
                         attempts += 1;
                         continue;
                     } else {
                         warn!(attempts, error = %e, "Failed to ack_orchestration_item after max retries");
                         // Abandon the item to release lock
-                        drop(self.history_store.abandon_orchestration_item(
-                            lock_token,
-                            Some(std::time::Duration::from_millis(50)),
-                            false,
-                        ));
+                        if self
+                            .history_store
+                            .abandon_orchestration_item(lock_token, Some(std::time::Duration::from_millis(50)), false)
+                            .await
+                            .is_err()
+                        {
+                            warn!(target: "duroxide::runtime::lifecycle", category = "abandon_orchestration_failed",
+                                "Exhausted orchestration acknowledgment could not be abandoned; lock-expiry recovery remains available");
+                        }
                         return Err(e);
                     }
                 }

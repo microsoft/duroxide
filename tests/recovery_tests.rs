@@ -15,7 +15,84 @@ use duroxide::{ActivityContext, Client, Event, OrchestrationContext, Orchestrati
 use std::sync::Arc as StdArc;
 use std::time::Duration;
 mod common;
+#[path = "common/runtime_lifecycle.rs"]
+mod lifecycle_support;
 use common::*;
+
+#[tokio::test]
+async fn lifecycle_fetch_and_ack_faults_preserve_orchestration_recovery_across_commit_boundaries() {
+    use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
+    use duroxide::runtime::{Runtime, RuntimeShutdownError};
+    use lifecycle_support::{Fixture, bounded, entered, options};
+    for operation in [
+        ProviderOperation::FetchOrchestration,
+        ProviderOperation::AcknowledgeOrchestration,
+    ] {
+        for after_commit in [false, true] {
+            let f = Fixture::new().await;
+            let point = if after_commit {
+                LifecyclePoint::ProviderReturn(operation)
+            } else {
+                LifecyclePoint::ProviderEnter(operation)
+            };
+            let held = f.hold(point);
+            f.hooks.fail_once(point).unwrap();
+            let registry = OrchestrationRegistry::builder()
+                .register("recover", |_: OrchestrationContext, _: String| async {
+                    Ok("recovered".to_string())
+                })
+                .build();
+            let mut config = options();
+            config.worker_concurrency = 0;
+            config.orchestrator_lock_timeout = Duration::from_millis(50);
+            let runtime = f.prepare(ActivityRegistry::builder().build(), registry.clone(), config.clone());
+            f.client()
+                .start_orchestration("lifecycle-recovery", "recover", "")
+                .await
+                .unwrap();
+            StdArc::clone(&runtime).start_execution().await.unwrap();
+            entered(&held).await;
+            assert_eq!(
+                StdArc::clone(&runtime)
+                    .shutdown_with_timeouts(Duration::ZERO, Duration::from_millis(100))
+                    .await,
+                Err(RuntimeShutdownError::TimedOut),
+            );
+            assert!(f.provider.active_operations() > 0);
+            held.release();
+            assert_eq!(
+                bounded(runtime.wait_for_shutdown_completion()).await,
+                Err(RuntimeShutdownError::Failed { quiescent: true })
+            );
+            f.assert_retired();
+            let peer = Runtime::start_with_options(
+                StdArc::clone(&f.inner),
+                ActivityRegistry::builder().build(),
+                registry,
+                config,
+            )
+            .await;
+            assert!(
+                matches!(bounded(f.client().wait_for_orchestration("lifecycle-recovery", Duration::from_secs(3))).await.unwrap(),
+                OrchestrationStatus::Completed { output, .. } if output == "recovered")
+            );
+            peer.shutdown(None).await;
+            let history = f.inner.read("lifecycle-recovery").await.unwrap();
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| matches!(event.kind, EventKind::OrchestrationCompleted { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                !history
+                    .iter()
+                    .any(|event| matches!(event.kind, EventKind::OrchestrationFailed { .. }))
+            );
+        }
+    }
+}
 
 async fn recovery_across_restart_core<F1, F2>(make_store_stage1: F1, make_store_stage2: F2, instance: String)
 where

@@ -56,6 +56,9 @@ duroxide = "0.1"  # Core only — bring your own Provider
 
 ### Hello world
 
+The fallible lifecycle calls below are **unreleased**. Use the source build
+containing these changes; the published 0.1.30 crate does not have them.
+
 ```rust
 use std::sync::Arc;
 use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
@@ -82,7 +85,10 @@ let orchestrations = OrchestrationRegistry::builder()
     })
     .build();
 
-let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+let rt = runtime::Runtime::prepare(
+    store.clone(), activities, orchestrations, runtime::RuntimeOptions::default(),
+)?;
+Arc::clone(&rt).start_execution().await?;
 let client = Client::new(store);
 
 client.start_orchestration("inst-1", "HelloWorld", "Rust").await?;
@@ -91,10 +97,37 @@ match client.wait_for_orchestration("inst-1", std::time::Duration::from_secs(5))
     other => panic!("unexpected: {other:?}"),
 }
 
-rt.shutdown(None).await;
+rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await?;
 # Ok(())
 # }
 ```
+
+### Worker lifetime (unreleased)
+
+Use `Runtime::prepare` followed by `Arc::clone(&runtime).start_execution().await`
+to handle startup failures without panicking. Preparation does not dispatch or
+perform provider I/O. The legacy `start*` factories retain their panic-shaped
+startup contract, but partial startup work still has an owned rollback.
+
+Prefer `shutdown_with_grace(grace)` or `shutdown_with_timeouts(grace, total)`.
+They return `Result<ShutdownOutcome, RuntimeShutdownError>`: `Drained`/`Forced`
+prove retirement of the runtime's owned execution tree and registered foreign
+cleanup. Idle workers can stop early. The first valid stop fixes the deadlines;
+force at grace expiry does not guarantee cleanup finishes before total. Dropping
+a waiter or observing timeout does not drop cleanup ownership.
+
+`TimedOut` requires application/supervisor process termination even if a later
+observation proves cleanup. The SDK never kills the process and a stopped runtime
+cannot restart. `wait_for_shutdown_completion()` is an explicit, potentially
+indefinite observer of an already accepted stop, not an implicit disposal policy.
+An operational error remains an error; inspect `is_quiescent()` rather than
+assuming error means retirement.
+
+Legacy `shutdown(None)` still returns `()`, with one second of grace and six
+seconds total. It logs bounded best-effort failures instead of using timeout as
+a panic policy; its ordinary return is **not** proof of quiescence. See the
+[lifecycle guide](docs/ORCHESTRATION-GUIDE.md#worker-lifecycle-unreleased) for
+validation, provider I/O, and language-adapter boundaries.
 
 ### Surviving crashes
 

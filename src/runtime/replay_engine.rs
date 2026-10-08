@@ -501,6 +501,25 @@ impl ReplayEngine {
         orchestration_version: String,
         worker_id: &str,
     ) -> TurnResult {
+        self.execute_orchestration_scoped(
+            handler,
+            input,
+            orchestration_name,
+            orchestration_version,
+            worker_id,
+            Default::default(),
+        )
+    }
+
+    pub(super) fn execute_orchestration_scoped(
+        &mut self,
+        handler: Arc<dyn OrchestrationHandler>,
+        input: String,
+        orchestration_name: String,
+        orchestration_version: String,
+        worker_id: &str,
+        cleanup: super::invocation_scope::CleanupAttachment,
+    ) -> TurnResult {
         debug!(instance = %self.instance, "executing orchestration turn");
 
         if let Some(err) = self.abort_error.clone() {
@@ -544,7 +563,8 @@ impl ReplayEngine {
             orchestration_name.clone(),
             orchestration_version.clone(),
             Some(worker_id.to_string()),
-        );
+        )
+        .with_invocation_cleanup(cleanup.clone());
 
         // Seed KV state from provider snapshot before orchestration code runs.
         if !self.kv_snapshot.is_empty() {
@@ -576,85 +596,107 @@ impl ReplayEngine {
             }
         };
 
-        let mut open_schedules: HashSet<u64> = HashSet::new();
-        let mut schedule_kinds: std::collections::HashMap<u64, ActionKind> = std::collections::HashMap::new();
-        let mut emitted_actions: VecDeque<(u64, Action)> = VecDeque::new();
+        let decision = catch_unwind(AssertUnwindSafe(|| {
+            let mut open_schedules: HashSet<u64> = HashSet::new();
+            let mut schedule_kinds: std::collections::HashMap<u64, ActionKind> = std::collections::HashMap::new();
+            let mut emitted_actions: VecDeque<(u64, Action)> = VecDeque::new();
 
-        let mut must_poll = true;
-        let mut output_opt: Option<Result<String, String>> = None;
-        let replay_boundary = self.persisted_history_len;
+            let mut must_poll = true;
+            let mut output_opt: Option<Result<String, String>> = None;
+            let replay_boundary = self.persisted_history_len;
 
-        if replay_boundary == 0 {
-            ctx.set_is_replaying(false);
-        }
-
-        // Pre-initialize accumulated_custom_status from OrchestrationStarted before any polling.
-        // This is needed because the first poll may happen before apply_history_event processes
-        // the OrchestrationStarted event (the loop polls before applying at each iteration).
-        if let Some(EventKind::OrchestrationStarted {
-            initial_custom_status: Some(status),
-            ..
-        }) = working_history.first().map(|e| &e.kind)
-        {
-            ctx.inner
-                .lock()
-                .expect("Mutex should not be poisoned")
-                .accumulated_custom_status = Some(status.clone());
-        }
-
-        for (event_index, event) in working_history.iter().enumerate() {
-            if event_index >= replay_boundary {
+            if replay_boundary == 0 {
                 ctx.set_is_replaying(false);
             }
 
-            if must_poll {
-                match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
-                    Ok(Some(result)) => {
-                        output_opt = Some(result);
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(err) => return err,
-                }
-                must_poll = false;
+            // Pre-initialize accumulated_custom_status from OrchestrationStarted before any polling.
+            // This is needed because the first poll may happen before apply_history_event processes
+            // the OrchestrationStarted event (the loop polls before applying at each iteration).
+            if let Some(EventKind::OrchestrationStarted {
+                initial_custom_status: Some(status),
+                ..
+            }) = working_history.first().map(|e| &e.kind)
+            {
+                ctx.inner
+                    .lock()
+                    .expect("Mutex should not be poisoned")
+                    .accumulated_custom_status = Some(status.clone());
             }
 
-            if let Err(err) = self.apply_history_event(
-                &ctx,
-                event,
-                &mut emitted_actions,
-                &mut open_schedules,
-                &mut schedule_kinds,
-                &mut must_poll,
-            ) {
+            for (event_index, event) in working_history.iter().enumerate() {
+                if event_index >= replay_boundary {
+                    ctx.set_is_replaying(false);
+                }
+
+                if must_poll {
+                    match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
+                        Ok(Some(result)) => {
+                            output_opt = Some(result);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            cleanup.finalize();
+                            return err;
+                        }
+                    }
+                    must_poll = false;
+                }
+
+                if let Err(err) = self.apply_history_event(
+                    &ctx,
+                    event,
+                    &mut emitted_actions,
+                    &mut open_schedules,
+                    &mut schedule_kinds,
+                    &mut must_poll,
+                ) {
+                    cleanup.finalize();
+                    return err;
+                }
+            }
+
+            ctx.set_is_replaying(false);
+
+            if must_poll && output_opt.is_none() {
+                match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
+                    Ok(Some(result)) => output_opt = Some(result),
+                    Ok(None) => {}
+                    Err(err) => {
+                        cleanup.finalize();
+                        return err;
+                    }
+                }
+            }
+
+            {
+                let cancelled_queue_waits = ctx.get_cancelled_queue_ids();
+                for schedule_id in cancelled_queue_waits {
+                    ctx.mark_queue_subscription_cancelled(schedule_id);
+                }
+            }
+
+            self.convert_emitted_actions(&ctx, emitted_actions);
+
+            if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt) {
+                cleanup.finalize();
                 return err;
             }
-        }
 
-        ctx.set_is_replaying(false);
-
-        if must_poll && output_opt.is_none() {
-            match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
-                Ok(Some(result)) => output_opt = Some(result),
-                Ok(None) => {}
-                Err(err) => return err,
+            if cleanup.finalize() {
+                // Foreign mutations admitted before the fence belong to this turn.
+                self.convert_emitted_actions(&ctx, ctx.drain_emitted_actions());
             }
+            self.finalize_turn(&ctx, output_opt)
+        }));
+        // Future destruction can emit cancellation bookkeeping; it must follow
+        // the replay decision and its cancellation snapshot, including early exits.
+        cleanup.finalize();
+        cleanup.destroy_driver(fut);
+        match decision {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
-
-        {
-            let cancelled_queue_waits = ctx.get_cancelled_queue_ids();
-            for schedule_id in cancelled_queue_waits {
-                ctx.mark_queue_subscription_cancelled(schedule_id);
-            }
-        }
-
-        self.convert_emitted_actions(&ctx, emitted_actions);
-
-        if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt) {
-            return err;
-        }
-
-        self.finalize_turn(&ctx, output_opt)
     }
 
     fn poll_orchestration_future(

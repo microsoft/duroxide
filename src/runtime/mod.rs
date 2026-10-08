@@ -9,12 +9,16 @@
 //
 use crate::providers::{ExecutionMetadata, Provider, WorkItem};
 use crate::{Event, EventKind, OrchestrationContext};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use task_group::{FailureKind, TaskFailure, TaskFuture, TaskGroup, TaskResult, TaskRole};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+static NEXT_LIFECYCLE_ID: AtomicU64 = AtomicU64::new(1);
 
 // ============================================================================
 // Built-in System Activities
@@ -379,6 +383,10 @@ pub mod observability;
 pub mod registry;
 mod state_helpers;
 
+pub(crate) mod invocation_scope;
+mod shutdown;
+mod task_group;
+
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
 
@@ -388,7 +396,134 @@ pub use state_helpers::{HistoryManager, WorkItemReader};
 pub mod execution;
 pub mod replay_engine;
 
+pub use invocation_scope::AttachError as InvocationCleanupError;
 pub use observability::{LogFormat, ObservabilityConfig};
+
+/// A successful outcome certifies retirement of the entire owned execution tree
+/// and registered foreign invocation cleanup, not disposal of independent provider
+/// or client owners. A prior timeout's process-termination obligation remains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// All owned execution retired without requiring forced cancellation.
+    Drained,
+    /// Force was required, and all owned execution and registered cleanup retired.
+    Forced,
+}
+
+/// Startup failures never manufacture a running runtime or discard rollback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeStartError {
+    InvalidSessionIdleTimeout,
+    NoExecutor,
+    AlreadyStarted,
+    ShutdownRequested,
+    StartupFailed,
+}
+
+impl std::fmt::Display for RuntimeStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidSessionIdleTimeout => {
+                "session_idle_timeout must be greater than the worker lock renewal interval"
+            }
+            Self::NoExecutor => "runtime execution requires a Tokio executor",
+            Self::AlreadyStarted => "runtime execution has already been started",
+            Self::ShutdownRequested => "runtime shutdown has been requested; execution cannot start or restart",
+            Self::StartupFailed => "runtime startup failed; rollback remains owned until execution is quiescent",
+        })
+    }
+}
+
+impl std::error::Error for RuntimeStartError {}
+
+/// Timeout is an incomplete observation, not execution completion.
+///
+/// Cleanup stays retained. A timed-out worker requires application/supervisor
+/// process termination even if a later observer proves retirement; the SDK never
+/// kills the process. Operational failure remains an error even when quiescent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeShutdownError {
+    InvalidTimeouts,
+    DeadlineOverflow,
+    NotRequested,
+    TimedOut,
+    Failed { quiescent: bool },
+}
+
+impl RuntimeShutdownError {
+    /// Whether an operational failure was published after complete execution retirement.
+    pub fn is_quiescent(self) -> bool {
+        matches!(self, Self::Failed { quiescent: true })
+    }
+}
+
+impl std::fmt::Display for RuntimeShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidTimeouts => "total shutdown timeout must be at least the graceful timeout",
+            Self::DeadlineOverflow => "shutdown timeout exceeds the supported monotonic deadline range",
+            Self::NotRequested => "shutdown must be requested before observing its completion",
+            Self::TimedOut => {
+                "shutdown wait timed out; cleanup remains owned and incomplete; application or supervisor must terminate the process"
+            }
+            Self::Failed { quiescent: true } => "runtime execution failed; owned cleanup completed and is quiescent",
+            Self::Failed { quiescent: false } => {
+                "runtime execution failed without proven quiescence; application or supervisor must terminate the process"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RuntimeShutdownError {}
+
+impl From<shutdown::ShutdownError> for RuntimeShutdownError {
+    fn from(error: shutdown::ShutdownError) -> Self {
+        match error {
+            shutdown::ShutdownError::InvalidTimeouts => Self::InvalidTimeouts,
+            shutdown::ShutdownError::DeadlineOverflow => Self::DeadlineOverflow,
+            shutdown::ShutdownError::NotRequested => Self::NotRequested,
+            shutdown::ShutdownError::TimedOut => Self::TimedOut,
+            shutdown::ShutdownError::AlreadyCompleted | shutdown::ShutdownError::InvalidCompletion => {
+                Self::Failed { quiescent: false }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimePhase {
+    Created,
+    Starting,
+    Running,
+    ShuttingDown,
+    Stopped,
+}
+
+struct Retirement {
+    result: TaskResult,
+    at: Instant,
+}
+
+struct Lifecycle {
+    phase: RuntimePhase,
+    executor: Option<tokio::runtime::Handle>,
+    startup_owner: Option<JoinHandle<Retirement>>,
+    shutdown_owner: Option<JoinHandle<()>>,
+    failures: Vec<TaskFailure>,
+}
+
+struct StartWaiter {
+    runtime: Arc<Runtime>,
+    armed: bool,
+}
+
+impl Drop for StartWaiter {
+    fn drop(&mut self) {
+        if self.armed {
+            self.runtime.request_rollback();
+        }
+    }
+}
 
 /// High-level orchestration status derived from history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,11 +626,15 @@ pub fn kind_of(msg: &WorkItem) -> &'static str {
 /// In-process runtime that executes activities and timers and persists
 /// history via a `Provider`.
 pub struct Runtime {
-    joins: Mutex<Vec<JoinHandle<()>>>,
+    lifecycle_id: u64,
+    lifecycle: Mutex<Lifecycle>,
+    shutdown_state: shutdown::ShutdownState,
+    startup_result: watch::Sender<Option<Result<(), RuntimeStartError>>>,
     history_store: Arc<dyn Provider>,
+    activity_registry: Arc<registry::ActivityRegistry>,
     orchestration_registry: OrchestrationRegistry,
-    /// Shutdown flag checked by dispatchers
-    shutdown_flag: Arc<AtomicBool>,
+    #[cfg(feature = "test-hooks")]
+    lifecycle_hooks: Mutex<test_hooks::LifecycleHooks>,
     /// Runtime configuration options
     options: RuntimeOptions,
     /// Observability handle for metrics and logging
@@ -680,11 +819,13 @@ impl Runtime {
     /// - `duroxide_worker_queue_depth` - Current worker queue backlog
     async fn initialize_gauges(self: Arc<Self>) {
         if let Some(admin) = self.history_store.as_management_capability() {
-            // Query provider for current state (parallel for efficiency)
-            let system_metrics_future = admin.get_system_metrics();
-            let queue_depths_future = admin.get_queue_depths();
-
-            let (system_result, queue_result) = tokio::join!(system_metrics_future, queue_depths_future);
+            // Sequential I/O cannot discard a sibling provider future if one call panics.
+            let system_result = admin.get_system_metrics().await;
+            let queue_result = admin.get_queue_depths().await;
+            if system_result.is_err() || queue_result.is_err() {
+                warn!(target: "duroxide::runtime::lifecycle", lifecycle_id = self.lifecycle_id, category = "gauge_initialization_failed",
+                    "Optional gauge initialization failed; runtime startup continues");
+            }
 
             if let Some(provider) = self.observability_handle.as_ref().map(|h| h.metrics_provider()) {
                 // Initialize active orchestrations gauge
@@ -716,27 +857,32 @@ impl Runtime {
     ///
     /// Updates `duroxide_active_orchestrations`, `duroxide_orchestrator_queue_depth`,
     /// and `duroxide_worker_queue_depth` gauges from the database at the configured interval.
-    fn start_gauge_poller(self: Arc<Self>) -> JoinHandle<()> {
-        let interval = self.options.observability.gauge_poll_interval;
-        let shutdown_flag = self.shutdown_flag.clone();
+    async fn run_gauge_poller(self: Arc<Self>) -> TaskResult {
+        Arc::clone(&self)
+            .own_task(TaskRole::GaugePoller, move |_| {
+                Box::pin(async move {
+                    let interval = self.options.observability.gauge_poll_interval;
+                    #[cfg(feature = "test-hooks")]
+                    self.hooks()
+                        .checkpoint(test_hooks::LifecyclePoint::ParentWork(TaskRole::GaugePoller))
+                        .await;
+                    tracing::debug!(
+                        target: "duroxide::runtime",
+                        interval_secs = interval.as_secs(),
+                        "Gauge poller started"
+                    );
 
-        tokio::spawn(async move {
-            tracing::debug!(
-                target: "duroxide::runtime",
-                interval_secs = interval.as_secs(),
-                "Gauge poller started"
-            );
+                    loop {
+                        if !self.sleep_while_running(interval).await {
+                            break;
+                        }
 
-            loop {
-                tokio::time::sleep(interval).await;
-
-                if shutdown_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                self.clone().refresh_gauges().await;
-            }
-        })
+                        self.clone().refresh_gauges().await;
+                    }
+                    Ok(())
+                })
+            })
+            .await
     }
 
     /// Refresh all gauge metrics from the provider.
@@ -751,7 +897,12 @@ impl Runtime {
             None => return,
         };
 
-        let (system_result, queue_result) = tokio::join!(admin.get_system_metrics(), admin.get_queue_depths());
+        let system_result = admin.get_system_metrics().await;
+        let queue_result = admin.get_queue_depths().await;
+        if system_result.is_err() || queue_result.is_err() {
+            warn!(target: "duroxide::runtime::lifecycle", lifecycle_id = self.lifecycle_id, category = "gauge_refresh_failed",
+                "Optional gauge refresh failed");
+        }
 
         if let Ok(metrics) = system_result {
             provider.set_active_orchestrations(metrics.running_instances as i64);
@@ -893,6 +1044,10 @@ impl Runtime {
     /// Start a new runtime using the in-memory SQLite provider.
     ///
     /// Requires the `sqlite` feature.
+    ///
+    /// # Panics
+    /// Preserves the legacy panic-on-provider/startup-error contract. Started work
+    /// remains owned through rollback; use fallible preparation/execution in adapters.
     #[cfg(feature = "sqlite")]
     pub async fn start(
         activity_registry: registry::ActivityRegistry,
@@ -907,6 +1062,10 @@ impl Runtime {
     }
 
     /// Start a new runtime with a custom `Provider` implementation.
+    ///
+    /// # Panics
+    /// Panics on startup failure, without discarding owned rollback.
+    /// New callers should use [`Self::prepare`] and [`Self::start_execution`].
     pub async fn start_with_store(
         history_store: Arc<dyn Provider>,
         activity_registry: registry::ActivityRegistry,
@@ -925,28 +1084,74 @@ impl Runtime {
     ///
     /// # Panics
     ///
-    /// Panics if `session_idle_timeout` is not greater than the worker lock renewal interval
-    /// (`worker_lock_timeout - worker_lock_renewal_buffer`). This prevents sessions from being
-    /// unpinned during long-running activity execution.
+    /// Panics on invalid configuration or startup failure, preserving the legacy
+    /// factory contract. Any started work remains owned through rollback.
+    /// New callers should use [`Self::prepare`] and [`Self::start_execution`].
     pub async fn start_with_options(
         history_store: Arc<dyn Provider>,
         activity_registry: registry::ActivityRegistry,
         orchestration_registry: OrchestrationRegistry,
         options: RuntimeOptions,
     ) -> Arc<Self> {
-        // Validate session timeout invariant
+        let runtime = Self::prepare(history_store, activity_registry, orchestration_registry, options)
+            .unwrap_or_else(|error| panic!("{error}"));
+        Arc::clone(&runtime)
+            .start_execution()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        runtime
+    }
+
+    /// Prepare a non-executing runtime without provider I/O or dispatch.
+    ///
+    /// Use the returned Arc to own startup before awaiting [`Self::start_execution`].
+    /// Preparation is fallible; the legacy `start*` factories instead preserve
+    /// panic-shaped startup failures with independently retained rollback.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "sqlite")]
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use std::{sync::Arc, time::Duration};
+    /// use duroxide::{OrchestrationRegistry, providers::sqlite::SqliteProvider};
+    /// use duroxide::runtime::{Runtime, RuntimeOptions, ShutdownOutcome, registry::ActivityRegistry};
+    ///
+    /// let provider = Arc::new(SqliteProvider::new_in_memory().await?);
+    /// let runtime = Runtime::prepare(
+    ///     provider, ActivityRegistry::builder().build(),
+    ///     OrchestrationRegistry::builder().build(), RuntimeOptions::default(),
+    /// )?;
+    /// Arc::clone(&runtime).start_execution().await?;
+    /// let outcome = Arc::clone(&runtime)
+    ///     .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(6))
+    ///     .await?;
+    /// assert_eq!(outcome, ShutdownOutcome::Drained);
+    /// assert_eq!(runtime.wait_for_shutdown_completion().await?, outcome);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "sqlite"))]
+    /// # fn main() {}
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an explicit configuration error before execution can start.
+    pub fn prepare(
+        history_store: Arc<dyn Provider>,
+        activity_registry: registry::ActivityRegistry,
+        orchestration_registry: OrchestrationRegistry,
+        options: RuntimeOptions,
+    ) -> Result<Arc<Self>, RuntimeStartError> {
+        let lifecycle_id = NEXT_LIFECYCLE_ID.fetch_add(1, Ordering::Relaxed);
         let worker_renewal_interval = options
             .worker_lock_timeout
             .checked_sub(options.worker_lock_renewal_buffer)
             .unwrap_or(Duration::from_secs(1));
         if options.session_idle_timeout <= worker_renewal_interval {
-            panic!(
-                "session_idle_timeout ({}s) must be greater than worker lock renewal interval ({}s). \
-                 Sessions would unpin during long-running activity execution. \
-                 Increase session_idle_timeout or decrease worker_lock_timeout.",
-                options.session_idle_timeout.as_secs(),
-                worker_renewal_interval.as_secs(),
-            );
+            tracing::error!(target: "duroxide::runtime::lifecycle", lifecycle_id, category = "startup_invalid_options",
+                "Runtime preparation rejected invalid session_idle_timeout");
+            return Err(RuntimeStartError::InvalidSessionIdleTimeout);
         }
 
         // Inject built-in system activities (new_guid, utc_now_ms, get_kv_value)
@@ -956,16 +1161,14 @@ impl Runtime {
         let activity_registry = Arc::new(activity_registry);
 
         // Initialize observability (metrics + structured logging)
-        let observability_handle = observability::ObservabilityHandle::init(&options.observability).ok(); // Gracefully degrade if observability fails to initialize
-
-        // Print version on startup
-        tracing::info!(
-            target: "duroxide::runtime",
-            "duroxide runtime ({}) starting with provider {} ({})",
-            env!("CARGO_PKG_VERSION"),
-            history_store.name(),
-            history_store.version()
-        );
+        let observability_handle = match observability::ObservabilityHandle::init(&options.observability) {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                warn!(target: "duroxide::runtime::lifecycle", lifecycle_id, category = "observability_initialization_failed",
+                    "Optional observability initialization failed; runtime preparation continues");
+                None
+            }
+        };
 
         // Wrap provider with metrics instrumentation if metrics are enabled
         let history_store: Arc<dyn Provider> = if let Some(ref handle) = observability_handle {
@@ -978,8 +1181,6 @@ impl Runtime {
             history_store
         };
 
-        let joins: Vec<JoinHandle<()>> = Vec::new();
-
         // Generate unique runtime instance ID (4-char hex)
         use std::time::{SystemTime, UNIX_EPOCH};
         let runtime_id = format!(
@@ -990,78 +1191,541 @@ impl Runtime {
                 .unwrap_or(0)
         );
 
-        // start request queue + worker
-        let runtime = Arc::new(Self {
-            joins: Mutex::new(joins),
-            history_store,
-            orchestration_registry,
-            shutdown_flag: Arc::new(AtomicBool::new(false)),
+        tracing::info!(target: "duroxide::runtime::lifecycle", lifecycle_id, category = "runtime_prepared",
+            "Runtime lifecycle identity assigned; execution has not started");
 
+        // start request queue + worker
+        Ok(Arc::new(Self {
+            lifecycle_id,
+            lifecycle: Mutex::new(Lifecycle {
+                phase: RuntimePhase::Created,
+                executor: None,
+                startup_owner: None,
+                shutdown_owner: None,
+                failures: Vec::new(),
+            }),
+            shutdown_state: shutdown::ShutdownState::default(),
+            startup_result: watch::channel(None).0,
+            history_store,
+            activity_registry,
+            orchestration_registry,
+            #[cfg(feature = "test-hooks")]
+            lifecycle_hooks: Mutex::new(test_hooks::LifecycleHooks::default()),
             options,
             observability_handle,
             runtime_id,
-        });
-
-        // Initialize gauges from provider (if supported)
-        runtime.clone().initialize_gauges().await;
-
-        // Start periodic gauge polling if observability is enabled
-        if runtime.observability_handle.is_some() {
-            let gauge_handle = runtime.clone().start_gauge_poller();
-            runtime.joins.lock().await.push(gauge_handle);
-        }
-
-        // background orchestrator dispatcher (extracted from inline poller)
-        let handle = runtime.clone().start_orchestration_dispatcher();
-        runtime.joins.lock().await.push(handle);
-
-        // background work dispatcher (executes activities)
-        let work_handle = runtime.clone().start_work_dispatcher(activity_registry);
-        runtime.joins.lock().await.push(work_handle);
-
-        runtime
+        }))
     }
 
-    /// Shutdown the runtime.
+    /// Start once, retaining startup and its children independently of this waiter.
     ///
-    /// # Parameters
+    /// Dropping a pending waiter requests owned rollback. Stop during startup
+    /// prevents later application admission; this runtime can never restart.
+    /// Success returns after startup, not after shutdown. Entered provider I/O
+    /// and spawned children remain owned through partial-startup failure.
     ///
-    /// * `timeout_ms` - How long to wait for graceful shutdown:
-    ///   - `None`: Default 1000ms
-    ///   - `Some(Duration::ZERO)`: Immediate abort
-    ///   - `Some(ms)`: Wait specified milliseconds
-    pub async fn shutdown(self: Arc<Self>, timeout_ms: Option<u64>) {
-        let timeout_ms = timeout_ms.unwrap_or(1000);
-
-        if timeout_ms == 0 {
-            warn!("Immediate shutdown - aborting all tasks");
-            let mut joins = self.joins.lock().await;
-            for j in joins.drain(..) {
-                j.abort();
+    /// # Errors
+    /// Returns configuration/executor, repeated-start, stop, or owned-startup errors.
+    pub async fn start_execution(self: Arc<Self>) -> Result<(), RuntimeStartError> {
+        {
+            let mut state = self.lifecycle.lock().unwrap();
+            match state.phase {
+                RuntimePhase::Created => {}
+                RuntimePhase::Starting | RuntimePhase::Running => return Err(RuntimeStartError::AlreadyStarted),
+                RuntimePhase::ShuttingDown | RuntimePhase::Stopped => return Err(RuntimeStartError::ShutdownRequested),
             }
+            let executor = tokio::runtime::Handle::try_current().map_err(|_| RuntimeStartError::NoExecutor)?;
+            state.phase = RuntimePhase::Starting;
+            state.startup_owner = Some(executor.spawn(Arc::clone(&self).run_startup()));
+            state.executor = Some(executor);
+        }
+        let mut waiter = StartWaiter {
+            runtime: Arc::clone(&self),
+            armed: true,
+        };
+        let mut result = self.startup_result.subscribe();
+        loop {
+            let published = *result.borrow_and_update();
+            if let Some(mut published) = published {
+                if published.is_ok() && self.is_stopping() {
+                    published = Err(self.start_blocked_error());
+                }
+                waiter.armed = false;
+                return published;
+            }
+            result.changed().await.expect("runtime retains startup result");
+        }
+    }
+
+    async fn run_startup(self: Arc<Self>) -> Retirement {
+        let rt = Arc::clone(&self);
+        let result = self
+            .own_work("runtime-startup", move |group| {
+                Box::pin(async move {
+                    #[cfg(feature = "test-hooks")]
+                    rt.hooks().checkpoint(test_hooks::LifecyclePoint::StartupBeforeIo).await;
+                    if rt.stop_prevents_start() {
+                        return Ok(());
+                    }
+                    tracing::info!(target: "duroxide::runtime",
+                "duroxide runtime ({}) starting with provider {} ({})",
+                env!("CARGO_PKG_VERSION"), rt.history_store.name(), rt.history_store.version());
+                    Arc::clone(&rt).initialize_gauges().await;
+                    if rt.stop_prevents_start() {
+                        return Ok(());
+                    }
+                    if rt.observability_handle.is_some() {
+                        group.spawn(TaskRole::GaugePoller.name(), Arc::clone(&rt).run_gauge_poller());
+                        #[cfg(feature = "test-hooks")]
+                        rt.hooks()
+                            .checkpoint(test_hooks::LifecyclePoint::StartupAfterSpawn(TaskRole::GaugePoller))
+                            .await;
+                    }
+                    if rt.stop_prevents_start() {
+                        return Ok(());
+                    }
+                    group.spawn(
+                        TaskRole::OrchestrationDispatcher.name(),
+                        Arc::clone(&rt).run_orchestration_dispatcher(),
+                    );
+                    #[cfg(feature = "test-hooks")]
+                    rt.hooks()
+                        .checkpoint(test_hooks::LifecyclePoint::StartupAfterSpawn(
+                            TaskRole::OrchestrationDispatcher,
+                        ))
+                        .await;
+                    if rt.stop_prevents_start() {
+                        return Ok(());
+                    }
+                    group.spawn(TaskRole::WorkDispatcher.name(), Arc::clone(&rt).run_work_dispatcher());
+                    #[cfg(feature = "test-hooks")]
+                    rt.hooks()
+                        .checkpoint(test_hooks::LifecyclePoint::StartupAfterSpawn(TaskRole::WorkDispatcher))
+                        .await;
+                    let started = {
+                        let mut state = rt.lifecycle.lock().unwrap();
+                        if state.phase == RuntimePhase::Starting {
+                            state.phase = RuntimePhase::Running;
+                            Ok(())
+                        } else {
+                            Err(if state.failures.is_empty() {
+                                RuntimeStartError::ShutdownRequested
+                            } else {
+                                RuntimeStartError::StartupFailed
+                            })
+                        }
+                    };
+                    rt.publish_start(started);
+                    rt.shutdown_state.graceful_signal().cancelled().await;
+                    Ok(())
+                })
+            })
+            .await;
+        Retirement {
+            result,
+            at: Instant::now(),
+        }
+    }
+
+    fn publish_start(&self, result: Result<(), RuntimeStartError>) {
+        self.startup_result.send_if_modified(|slot| {
+            if slot.is_some() {
+                false
+            } else {
+                *slot = Some(result);
+                true
+            }
+        });
+    }
+
+    fn stop_prevents_start(&self) -> bool {
+        if self.is_stopping() {
+            self.publish_start(Err(self.start_blocked_error()));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn start_blocked_error(&self) -> RuntimeStartError {
+        if self.lifecycle.lock().unwrap().failures.is_empty() {
+            RuntimeStartError::ShutdownRequested
+        } else {
+            RuntimeStartError::StartupFailed
+        }
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.shutdown_state.graceful_signal().is_cancelled()
+    }
+
+    async fn sleep_while_running(&self, duration: Duration) -> bool {
+        tokio::select! {
+            biased;
+            () = self.shutdown_state.graceful_signal().cancelled() => false,
+            () = tokio::time::sleep(duration) => true,
+        }
+    }
+
+    async fn own_task(
+        self: Arc<Self>,
+        role: TaskRole,
+        work: impl for<'a> FnOnce(&'a mut TaskGroup) -> TaskFuture<'a>,
+    ) -> TaskResult {
+        #[cfg(feature = "test-hooks")]
+        let _guard = self.hooks().track(role);
+        self.own_work(role.name(), work).await
+    }
+
+    async fn own_work(
+        self: Arc<Self>,
+        name: &'static str,
+        work: impl for<'a> FnOnce(&'a mut TaskGroup) -> TaskFuture<'a>,
+    ) -> TaskResult {
+        task_group::run_owned_reporting(name, CancellationToken::new(), work, |failures| {
+            self.record_faults(failures);
+        })
+        .await
+    }
+
+    fn record_faults(self: &Arc<Self>, failures: &[TaskFailure]) {
+        if failures.is_empty() {
             return;
         }
-
-        // debug!("Graceful shutdown (timeout: {}ms)", timeout_ms);
-
-        // Set shutdown flag - workers check this between iterations
-        self.shutdown_flag.store(true, Ordering::Relaxed);
-
-        // Give workers time to notice and exit gracefully
-        tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
-
-        // Check if any tasks are still running (need to be aborted)
-        let mut joins = self.joins.lock().await;
-
-        // Abort any remaining tasks
-        for j in joins.drain(..) {
-            j.abort();
+        let fresh = {
+            let mut state = self.lifecycle.lock().unwrap();
+            let mut fresh = Vec::new();
+            for failure in failures {
+                if !state.failures.contains(failure) {
+                    state.failures.push(failure.clone());
+                    fresh.push(failure.clone());
+                }
+            }
+            fresh
+        };
+        self.request_rollback();
+        let reported = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.publish_start(Err(RuntimeStartError::StartupFailed));
+            for failure in fresh {
+                tracing::error!(target: "duroxide::runtime::lifecycle",
+                    lifecycle_id = self.lifecycle_id,
+                    category = "owned_execution_failed", task = failure.task, kind = ?failure.kind,
+                    "Owned runtime execution failed; cleanup remains retained");
+            }
+        }));
+        if let Err(payload) = reported {
+            let mut failures = Vec::new();
+            task_group::record_panic(
+                "lifecycle-reporting",
+                FailureKind::ReportingPanicked,
+                payload,
+                &mut failures,
+            );
+            self.lifecycle.lock().unwrap().failures.extend(failures);
         }
+    }
 
-        // debug!("Runtime shut down");
+    fn request_rollback(self: &Arc<Self>) {
+        let result = shutdown::Deadlines::from_timeouts(Instant::now(), Duration::ZERO, None)
+            .map_err(RuntimeShutdownError::from)
+            .and_then(|deadlines| self.request_shutdown_until(deadlines.grace, deadlines.total));
+        if let Err(error) = result {
+            tracing::error!(target: "duroxide::runtime::lifecycle", lifecycle_id = self.lifecycle_id, category = "rollback_request_failed",
+                error = %error, "Unable to accept runtime rollback");
+        }
+    }
 
-        // Shutdown observability last (after all workers stopped)
-        // Note: We can't move out of Arc here, so observability shutdown happens when Runtime is dropped
-        // or if we could restructure to take ownership in shutdown
+    /// Accept stop promptly, retaining the first valid pair of absolute deadlines.
+    ///
+    /// No callback, provider operation, startup wait, or join is performed here.
+    /// Already expired inherited deadlines are not renewed.
+    /// Stop before execution is terminal and immediately proves no-work retirement.
+    /// Use a shutdown wait or explicit completion observer to distinguish accepted
+    /// stop from finished execution.
+    ///
+    /// # Errors
+    /// Rejects total-before-grace before any state change, including repeated calls.
+    pub fn request_shutdown_until(
+        self: &Arc<Self>,
+        grace_deadline: Instant,
+        total_deadline: Instant,
+    ) -> Result<(), RuntimeShutdownError> {
+        if total_deadline < grace_deadline {
+            return Err(RuntimeShutdownError::InvalidTimeouts);
+        }
+        let mut state = self.lifecycle.lock().unwrap();
+        let (request, first) = self.shutdown_state.accept(shutdown::Deadlines {
+            grace: grace_deadline,
+            total: total_deadline,
+        })?;
+        if !first {
+            return Ok(());
+        }
+        let never_started = state.phase == RuntimePhase::Created;
+        state.phase = RuntimePhase::ShuttingDown;
+        if never_started {
+            state.phase = RuntimePhase::Stopped;
+            drop(state);
+            request.publish(Vec::new(), true)?;
+            return Ok(());
+        }
+        let owner = state
+            .startup_owner
+            .take()
+            .expect("execution owner installed before starting");
+        let executor = state
+            .executor
+            .as_ref()
+            .expect("execution owner has an executor")
+            .clone();
+        state.shutdown_owner = Some(executor.spawn(Arc::clone(self).run_shutdown(request, owner)));
+        Ok(())
+    }
+
+    async fn run_shutdown(self: Arc<Self>, request: Arc<shutdown::ShutdownRequest>, mut owner: JoinHandle<Retirement>) {
+        let mut joined = None;
+        let report = task_group::protect_future(
+            "shutdown-coordinator",
+            async {
+                #[cfg(feature = "test-hooks")]
+                self.hooks()
+                    .checkpoint(test_hooks::LifecyclePoint::ShutdownCoordinator)
+                    .await;
+                tokio::select! {
+                    biased;
+                    result = &mut owner => joined = Some(result),
+                    () = tokio::time::sleep_until(request.deadlines().grace.into()) => {
+                        request.request_force_if_due(Instant::now());
+                        #[cfg(feature = "test-hooks")]
+                        self.hooks().checkpoint(test_hooks::LifecyclePoint::ForceRequested).await;
+                    }
+                }
+                Ok(())
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        self.record_faults(&report.failures);
+        let joined = match joined {
+            Some(joined) => joined,
+            None => {
+                tokio::select! {
+                    biased;
+                    result = &mut owner => result,
+                    () = tokio::time::sleep_until(request.deadlines().grace.into()) => {
+                        request.request_force_if_due(Instant::now());
+                        owner.await
+                    }
+                }
+            }
+        };
+        let mut failures = report.failures;
+        let quiescent = match joined {
+            Ok(retired) => {
+                // Preserve classification if the coordinator was not polled at grace expiry.
+                if retired.at > request.deadlines().grace {
+                    request.request_force_if_due(retired.at);
+                }
+                if let Err(errors) = retired.result {
+                    failures.extend(errors);
+                }
+                true
+            }
+            Err(error) if error.is_panic() => {
+                task_group::record_panic(
+                    "runtime-startup-owner",
+                    FailureKind::JoinPanicked,
+                    error.into_panic(),
+                    &mut failures,
+                );
+                false
+            }
+            Err(_) => {
+                failures.push(TaskFailure {
+                    task: "runtime-startup-owner",
+                    kind: FailureKind::JoinCancelled,
+                });
+                false
+            }
+        };
+        self.record_faults(&failures);
+        {
+            let mut state = self.lifecycle.lock().unwrap();
+            failures = state.failures.clone();
+            state.phase = if quiescent {
+                RuntimePhase::Stopped
+            } else {
+                RuntimePhase::ShuttingDown
+            };
+        }
+        let failed = !failures.is_empty();
+        let published = request.publish(failures, quiescent);
+        let diagnostics = request.diagnostics();
+        match published {
+            Err(error) => {
+                tracing::error!(target: "duroxide::runtime::lifecycle", category = "completion_publication_failed",
+                    lifecycle_id = self.lifecycle_id,
+                    kind = ?error, "Runtime completion publication failed");
+            }
+            Ok(()) if failed => {
+                tracing::error!(target: "duroxide::runtime::lifecycle", category = "shutdown_execution_failed",
+                    lifecycle_id = self.lifecycle_id,
+                    grace_remaining_ns_at_acceptance = diagnostics.grace_remaining_ns,
+                    total_remaining_ns_at_acceptance = diagnostics.total_remaining_ns,
+                    elapsed_ms = diagnostics.elapsed_ms,
+                    core_timeout_observed = diagnostics.timeout_observed,
+                    error = %RuntimeShutdownError::Failed { quiescent }, quiescent,
+                    "Runtime shutdown reported an operational error");
+            }
+            Ok(()) if self.shutdown_state.force_signal().is_cancelled() => {
+                warn!(target: "duroxide::runtime::lifecycle", category = "shutdown_forced",
+                    lifecycle_id = self.lifecycle_id,
+                    grace_remaining_ns_at_acceptance = diagnostics.grace_remaining_ns,
+                    total_remaining_ns_at_acceptance = diagnostics.total_remaining_ns,
+                    elapsed_ms = diagnostics.elapsed_ms,
+                    grace_due_at_acceptance = diagnostics.grace_due_at_acceptance,
+                    core_timeout_observed = diagnostics.timeout_observed,
+                    outcome = "Forced", quiescent = true,
+                    "Forced runtime cleanup is quiescent; any earlier incomplete-shutdown termination obligation remains unchanged");
+            }
+            Ok(()) => {
+                tracing::debug!(target: "duroxide::runtime::lifecycle", category = "shutdown_drained",
+                    lifecycle_id = self.lifecycle_id,
+                    grace_remaining_ns_at_acceptance = diagnostics.grace_remaining_ns,
+                    total_remaining_ns_at_acceptance = diagnostics.total_remaining_ns,
+                    elapsed_ms = diagnostics.elapsed_ms,
+                    core_timeout_observed = diagnostics.timeout_observed,
+                    outcome = "Drained", quiescent = true, "Runtime execution drained");
+            }
+        }
+        if !quiescent {
+            // Losing an owner join is not evidence of complete execution retirement.
+            std::future::pending::<()>().await;
+            drop(self);
+        }
+    }
+
+    fn shutdown_outcome(completion: &shutdown::Completion) -> Result<ShutdownOutcome, RuntimeShutdownError> {
+        match completion {
+            shutdown::Completion::Drained => Ok(ShutdownOutcome::Drained),
+            shutdown::Completion::Forced => Ok(ShutdownOutcome::Forced),
+            shutdown::Completion::Failed { quiescent, .. } => {
+                Err(RuntimeShutdownError::Failed { quiescent: *quiescent })
+            }
+        }
+    }
+
+    async fn observe_shutdown(&self) -> Result<ShutdownOutcome, RuntimeShutdownError> {
+        let request = self.shutdown_state.accepted()?;
+        let result = request
+            .wait()
+            .await
+            .map_err(RuntimeShutdownError::from)
+            .and_then(|completion| Self::shutdown_outcome(&completion));
+        if let Err(error) = result {
+            let diagnostics = request.diagnostics();
+            tracing::error!(target: "duroxide::runtime::lifecycle", category = "shutdown_wait_failed",
+                lifecycle_id = self.lifecycle_id,
+                grace_remaining_ns_at_acceptance = diagnostics.grace_remaining_ns,
+                total_remaining_ns_at_acceptance = diagnostics.total_remaining_ns,
+                elapsed_ms = diagnostics.elapsed_ms,
+                core_timeout_observed = diagnostics.timeout_observed,
+                error = %error, quiescent = error.is_quiescent(), "Runtime shutdown wait failed");
+        }
+        result
+    }
+
+    /// Wait at most grace plus five seconds; timeout does not discard cleanup.
+    ///
+    /// Idle execution may retire early. Checked default-total addition and all
+    /// validation rules of [`Self::shutdown_with_timeouts`] apply, even after stop.
+    ///
+    /// # Errors
+    /// Reports invalid/overflowing deadlines, timeout, or an owned execution failure.
+    pub async fn shutdown_with_grace(
+        self: Arc<Self>,
+        grace: Duration,
+    ) -> Result<ShutdownOutcome, RuntimeShutdownError> {
+        let deadlines = shutdown::Deadlines::from_timeouts(Instant::now(), grace, None)?;
+        self.request_shutdown_until(deadlines.grace, deadlines.total)?;
+        self.observe_shutdown().await
+    }
+
+    /// Bound ordinary waiting independently of the retained execution cleanup.
+    ///
+    /// The first stop fixes both deadlines. Repeated calls validate their inputs
+    /// but cannot extend those deadlines. Positive sub-millisecond values are retained.
+    /// Durations must fit an unsigned 64-bit nanosecond interval and the platform's
+    /// monotonic clock, including the timer's one-millisecond rounding headroom.
+    /// Published actual completion/error has priority over expiry. With no started
+    /// work, a validated zero-total stop may already be proven [`ShutdownOutcome::Drained`].
+    ///
+    /// A finite grace does not guarantee finite forced cleanup. Already-entered
+    /// provider I/O and registered foreign cleanup remain owned after timeout or
+    /// a dropped waiter. Timeout requires application/supervisor process termination,
+    /// even if cleanup later completes; the SDK never terminates the process.
+    ///
+    /// # Errors
+    /// Reports invalid/overflowing deadlines, timeout, or an owned execution failure.
+    pub async fn shutdown_with_timeouts(
+        self: Arc<Self>,
+        grace: Duration,
+        total: Duration,
+    ) -> Result<ShutdownOutcome, RuntimeShutdownError> {
+        let deadlines = shutdown::Deadlines::from_timeouts(Instant::now(), grace, Some(total))?;
+        self.request_shutdown_until(deadlines.grace, deadlines.total)?;
+        self.observe_shutdown().await
+    }
+
+    /// Explicitly wait without an automatic deadline for an already accepted stop.
+    ///
+    /// Dropping this observer has no effect on cleanup or other observers.
+    /// This does not renew ordinary deadlines, request stop, or allow worker reuse.
+    /// Genuine late completion does not waive an earlier timeout's termination obligation.
+    ///
+    /// # Errors
+    /// Rejects observation before stop acceptance, or reports the actual execution error.
+    pub async fn wait_for_shutdown_completion(&self) -> Result<ShutdownOutcome, RuntimeShutdownError> {
+        let request = self.shutdown_state.accepted()?;
+        let completion = request.wait_for_completion().await;
+        Self::shutdown_outcome(&completion)
+    }
+
+    /// Bounded, logged best effort with the legacy unit-returning signature.
+    ///
+    /// Omitted grace is one second; total waiting is grace plus five seconds.
+    /// Zero grace requests force but still retains and joins unfinished work.
+    /// Normal return is not a quiescence certificate: use a result-returning method
+    /// when successful retirement must be distinguished from incomplete cleanup.
+    /// Timeout/operational errors are logged, not turned into a timeout-panic policy.
+    pub async fn shutdown(self: Arc<Self>, timeout_ms: Option<u64>) {
+        let lifecycle_id = self.lifecycle_id;
+        if let Err(error) = self
+            .shutdown_with_grace(Duration::from_millis(timeout_ms.unwrap_or(1000)))
+            .await
+        {
+            tracing::error!(target: "duroxide::runtime::lifecycle", category = "legacy_shutdown_failed",
+                lifecycle_id,
+                error = %error, quiescent = error.is_quiescent(), "Legacy runtime shutdown did not succeed");
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn hooks(&self) -> test_hooks::LifecycleHooks {
+        self.lifecycle_hooks.lock().unwrap().clone()
+    }
+
+    /// Install per-runtime lifecycle instrumentation before execution starts.
+    ///
+    /// # Errors
+    /// Rejects replacement after startup or stop acceptance.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_lifecycle_hooks(&self, hooks: test_hooks::LifecycleHooks) -> Result<(), RuntimeStartError> {
+        let state = self.lifecycle.lock().unwrap();
+        if state.phase != RuntimePhase::Created {
+            return Err(RuntimeStartError::AlreadyStarted);
+        }
+        *self.lifecycle_hooks.lock().unwrap() = hooks;
+        Ok(())
     }
 }
