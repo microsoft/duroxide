@@ -10,35 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `Runtime::shutdown` now actually stops the tasks its dispatchers spawn
-  ([#44](https://github.com/microsoft/duroxide/issues/44)). Previously it aborted only the
-  three supervisor tasks it tracked. Each supervisor had spawned N children into a local
-  vector, and dropping a `JoinHandle` *detaches* a task rather than cancelling it — so every
-  orchestration poller, worker poller, lock-renewal task, activity manager, and in-flight
-  activity survived shutdown indefinitely. Embedders whose providers hold pooled connections
-  (e.g. a `sqlx` `PgPool`) saw `close()` deadlock forever because the leaked pollers never
-  released their permits. The bug was invisible with the bundled SQLite provider because it
-  ignores `poll_timeout` and returns immediately, so its pollers happened to loop often
-  enough to notice the shutdown flag.
-- `Runtime::shutdown(Some(0))` no longer returns *before* signalling cancellation, so
-  "immediate abort" now really does ask children to stop as well as aborting them.
+  ([#44](https://github.com/microsoft/duroxide/issues/44)). Previously, aborting dispatcher
+  supervisors detached their child tasks. Pollers blocked in provider calls could outlive
+  shutdown and retain pooled connections indefinitely.
+- Shutdown retains task ownership if its caller is cancelled, and concurrent calls
+  wait for the same tasks to finish. Cleanup includes activity invocation and lock-renewal
+  tasks, not just dispatcher pollers.
+- `Runtime::shutdown(Some(0))` now signals cancellation and aborts work before waiting
+  for task cleanup, without requiring the caller to enter a Tokio context.
 - Dispatcher tasks now observe cancellation while parked in a long poll, an error backoff,
   or the minimum-poll-interval sleep, instead of only between loop iterations.
 - Lock-renewal loops (orchestration and activity) no longer stop the instant shutdown is
-  signalled. They kept renewing work that was still running only by accident of the short
-  default timeout; with a longer shutdown deadline the lock could expire mid-turn, letting
-  another node steal the item and execute it a second time. Renewal now stops when the work
-  finishes, and its task handle aborts on drop so it cannot outlive its owner.
+  signalled. They remain active through acknowledgement, preventing locks from expiring
+  while in-flight work drains.
 
 ### Changed
 
-- **`Runtime::shutdown` now returns `ShutdownOutcome`** instead of `()`. Existing calls used
-  as statements (`rt.shutdown(None).await;`) continue to compile unchanged; the type is
-  deliberately not `#[must_use]`. Note that Cargo treats `0.1.z` bumps as compatible, so this
-  will be picked up automatically — code that binds the result in a `let` with an explicit
-  `()` type annotation will need updating.
-- **`timeout_ms` is now a deadline, not a fixed delay.** `shutdown` previously slept for the
-  full timeout unconditionally; it now returns as soon as every task has drained. An idle
-  runtime shuts down in milliseconds rather than the default one second.
+- **`timeout_ms` is now a grace-period limit, not a fixed delay.** Shutdown returns once
+  all runtime-owned tasks stop, retaining its `()` return type. After the grace period it
+  aborts remaining work and waits for cancellation cleanup, so blocking or non-yielding
+  user code can delay its return beyond that period. See [the migration guide](docs/migration-guide.md).
 
 ## [0.1.30] - 2026-07-29
 

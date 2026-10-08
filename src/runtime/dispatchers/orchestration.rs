@@ -19,7 +19,7 @@ use crate::{Event, EventKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::warn;
 
 use super::super::{HistoryManager, Runtime, WorkItemReader};
@@ -274,6 +274,7 @@ fn calculate_renewal_interval(lock_timeout: Duration, buffer: Duration) -> Durat
 
 /// Spawn a background task to renew the lock for an in-flight orchestration.
 fn spawn_orchestration_lock_renewal_task(
+    task_tracker: &TaskTracker,
     store: Arc<dyn crate::providers::Provider>,
     token: String,
     lock_timeout: Duration,
@@ -293,7 +294,7 @@ fn spawn_orchestration_lock_renewal_task(
     // Deliberately does not observe the shutdown signal: the turn it is renewing may
     // still be running, and releasing the lock early would let another node steal the
     // item and execute it twice. The owning poller stops this task instead.
-    AbortOnDropHandle::new(tokio::spawn(async move {
+    AbortOnDropHandle::new(task_tracker.spawn(async move {
         let mut interval = tokio::time::interval(renewal_interval);
         interval.tick().await; // Skip first immediate tick
 
@@ -375,7 +376,7 @@ impl Runtime {
             let supported_range = runtime_supported_range.clone();
             // Generate unique worker ID: orch-{index}-{runtime_id}
             let worker_id = format!("orch-{worker_idx}-{}", rt.runtime_id);
-            let handle = tokio::spawn(async move {
+            let handle = self.task_tracker.spawn(async move {
                 // debug!("Orchestration worker {} started", worker_id);
                 let mut consecutive_retryable_errors = 0u32;
                 loop {
@@ -449,6 +450,7 @@ impl Runtime {
                             // abort-on-drop guard so it cannot outlive this task if the
                             // poller is aborted mid-turn.
                             let _renewal_guard = spawn_orchestration_lock_renewal_task(
+                                &rt.task_tracker,
                                 Arc::clone(&rt.history_store),
                                 lock_token.clone(),
                                 rt.options.orchestrator_lock_timeout,

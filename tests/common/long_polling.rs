@@ -19,6 +19,40 @@ use duroxide::providers::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOperation {
+    AfterOrchestrationFetch,
+    AfterWorkFetch,
+    BeforeOrchestrationAck,
+    AfterOrchestrationAck,
+    BeforeWorkAck,
+    AfterWorkAck,
+    BeforeOrchestrationRenewal,
+    BeforeWorkRenewal,
+}
+
+#[derive(Default)]
+pub struct ProviderGate {
+    entered: CancellationToken,
+    released: CancellationToken,
+}
+
+impl ProviderGate {
+    pub async fn wait_until_entered(&self) {
+        self.entered.cancelled().await;
+    }
+
+    pub fn open(&self) {
+        self.released.cancel();
+    }
+
+    async fn wait(&self) {
+        self.entered.cancel();
+        self.released.cancelled().await;
+    }
+}
 
 /// A wrapper around any Provider that simulates long polling behavior.
 ///
@@ -29,6 +63,7 @@ pub struct LongPollingSqliteProvider {
     /// Cloned into every in-flight fetch; strong count > 1 after shutdown means a
     /// poller task leaked.
     sentinel: Arc<()>,
+    gates: Vec<(ProviderOperation, Arc<ProviderGate>)>,
 }
 
 impl LongPollingSqliteProvider {
@@ -36,6 +71,20 @@ impl LongPollingSqliteProvider {
         Self {
             inner,
             sentinel: Arc::new(()),
+            gates: Vec::new(),
+        }
+    }
+
+    pub fn with_gate(mut self, operation: ProviderOperation, gate: Arc<ProviderGate>) -> Self {
+        self.gates.push((operation, gate));
+        self
+    }
+
+    async fn wait_at(&self, operation: ProviderOperation) {
+        for (target, gate) in &self.gates {
+            if *target == operation {
+                gate.wait().await;
+            }
         }
     }
 
@@ -45,7 +94,12 @@ impl LongPollingSqliteProvider {
     }
 
     /// Helper to poll inner provider until timeout
-    async fn poll_until<T, F, Fut>(&self, poll_timeout: Duration, f: F) -> Result<Option<T>, ProviderError>
+    async fn poll_until<T, F, Fut>(
+        &self,
+        poll_timeout: Duration,
+        after_fetch: ProviderOperation,
+        f: F,
+    ) -> Result<Option<T>, ProviderError>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<Option<T>, ProviderError>>,
@@ -57,6 +111,7 @@ impl LongPollingSqliteProvider {
         loop {
             // Try to fetch
             if let Some(item) = f().await? {
+                self.wait_at(after_fetch).await;
                 return Ok(Some(item));
             }
 
@@ -79,7 +134,7 @@ impl Provider for LongPollingSqliteProvider {
         poll_timeout: Duration,
         _filter: Option<&DispatcherCapabilityFilter>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
-        self.poll_until(poll_timeout, || {
+        self.poll_until(poll_timeout, ProviderOperation::AfterOrchestrationFetch, || {
             self.inner.fetch_orchestration_item(lock_timeout, Duration::ZERO, None)
         })
         .await
@@ -95,7 +150,7 @@ impl Provider for LongPollingSqliteProvider {
         // Clone session config for use in closure iterations
         let session_owned = session.cloned();
         let tag_filter = tag_filter.clone();
-        self.poll_until(poll_timeout, || {
+        self.poll_until(poll_timeout, ProviderOperation::AfterWorkFetch, || {
             self.inner
                 .fetch_work_item(lock_timeout, Duration::ZERO, session_owned.as_ref(), &tag_filter)
         })
@@ -113,6 +168,7 @@ impl Provider for LongPollingSqliteProvider {
         metadata: ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
+        self.wait_at(ProviderOperation::BeforeOrchestrationAck).await;
         self.inner
             .ack_orchestration_item(
                 lock_token,
@@ -123,7 +179,9 @@ impl Provider for LongPollingSqliteProvider {
                 metadata,
                 cancelled_activities,
             )
-            .await
+            .await?;
+        self.wait_at(ProviderOperation::AfterOrchestrationAck).await;
+        Ok(())
     }
 
     async fn abandon_orchestration_item(
@@ -157,10 +215,14 @@ impl Provider for LongPollingSqliteProvider {
     }
 
     async fn ack_work_item(&self, token: &str, completion: Option<WorkItem>) -> Result<(), ProviderError> {
-        self.inner.ack_work_item(token, completion).await
+        self.wait_at(ProviderOperation::BeforeWorkAck).await;
+        self.inner.ack_work_item(token, completion).await?;
+        self.wait_at(ProviderOperation::AfterWorkAck).await;
+        Ok(())
     }
 
     async fn renew_work_item_lock(&self, token: &str, extend_for: Duration) -> Result<(), ProviderError> {
+        self.wait_at(ProviderOperation::BeforeWorkRenewal).await;
         self.inner.renew_work_item_lock(token, extend_for).await
     }
 
@@ -187,6 +249,7 @@ impl Provider for LongPollingSqliteProvider {
     }
 
     async fn renew_orchestration_item_lock(&self, token: &str, extend_for: Duration) -> Result<(), ProviderError> {
+        self.wait_at(ProviderOperation::BeforeOrchestrationRenewal).await;
         self.inner.renew_orchestration_item_lock(token, extend_for).await
     }
 

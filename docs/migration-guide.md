@@ -2,45 +2,28 @@
 
 This guide helps you migrate between Duroxide versions and handle orchestration versioning.
 
-## `Runtime::shutdown` returns `ShutdownOutcome` (Unreleased)
+## `Runtime::shutdown` waits for task cleanup (Unreleased)
 
-`Runtime::shutdown` previously returned `()`. It now returns
-[`ShutdownOutcome`](../src/runtime/mod.rs), which is either `Drained` (every task stopped
-cooperatively) or `Aborted { tasks }` (the deadline expired, or `Some(0)` was passed, and
-`tasks` handles were aborted).
+The signature is unchanged: `shutdown(timeout_ms: Option<u64>)` still returns `()`.
+It stops fetching new work and lets in-flight work finish within the grace period,
+then aborts remaining work and waits for all runtime-owned tasks to release their
+resources. Work-item locks continue to be renewed through acknowledgement.
 
-The common call site is unaffected:
+`timeout_ms` is now a grace-period limit rather than an unconditional sleep.
+`None` still means 1000 ms; `Some(0)` skips the graceful drain but waits for
+cancellation cleanup. Idle runtimes return as soon as their tasks stop.
+With `Some(0)`, the caller need not enter a Tokio context, but the Tokio runtime
+executing the tasks must continue driving them during cleanup.
 
-```rust
-rt.shutdown(None).await;              // still compiles
-```
+**The grace period is not a hard return deadline.** Tokio cannot forcibly preempt
+blocking or non-yielding user code, so that code can delay shutdown indefinitely.
+Activities must yield or otherwise finish, and application-spawned tasks and
+threads remain the application's responsibility.
 
-You only need to change code that bound the result with an explicit unit annotation:
-
-```rust
-// Before
-let _: () = rt.shutdown(None).await;
-
-// After
-let outcome = rt.shutdown(None).await;
-if let ShutdownOutcome::Aborted { tasks } = outcome {
-    tracing::warn!(tasks, "runtime did not drain before the deadline");
-}
-```
-
-The type is intentionally **not** `#[must_use]`, so ignoring it produces no warning.
-
-### `timeout_ms` is now a deadline
-
-`shutdown` used to sleep for the whole `timeout_ms` regardless of how quickly the runtime
-went quiet. It now returns as soon as all tasks have drained, so an idle runtime shuts down
-in milliseconds instead of the default one second. If you relied on `shutdown` as a fixed
-delay — for example to let background work settle before asserting in a test — insert an
-explicit `tokio::time::sleep` before the call.
-
-Because the timeout is now a real deadline you can safely raise it. A value longer than your
-`worker_lock_timeout` is now a reasonable choice for draining in-flight activities, where
-previously it would simply have added dead time to every shutdown.
+Concurrent shutdown calls all wait for cleanup; a shorter grace period can force
+an earlier abort. Dropping a shutdown future does not lose ownership of the tasks:
+keep a runtime handle and call `shutdown` again to finish teardown. An interrupted
+shutdown is not evidence that it is safe to tear down dependent resources.
 
 ## Reserved `sub::` instance-id marker (Unreleased)
 
