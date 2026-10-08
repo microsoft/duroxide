@@ -432,7 +432,6 @@ pub mod provider_stress_test;
 pub use client::{Client, ClientError};
 pub use runtime::{
     OrchestrationHandler, OrchestrationRegistry, OrchestrationRegistryBuilder, OrchestrationStatus, RuntimeOptions,
-    ShutdownOutcome,
 };
 
 // Re-export management types for convenience

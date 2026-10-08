@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::warn;
 
 // ============================================================================
@@ -491,8 +492,10 @@ pub fn kind_of(msg: &WorkItem) -> &'static str {
 /// In-process runtime that executes activities and timers and persists
 /// history via a `Provider`.
 pub struct Runtime {
-    /// Every task this runtime spawns, so shutdown can abort what it cannot drain.
+    /// Dispatcher handles stay owned here even if a shutdown caller is cancelled.
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Includes per-item child tasks, whose abort guards do not wait for cleanup.
+    task_tracker: TaskTracker,
     history_store: Arc<dyn Provider>,
     orchestration_registry: OrchestrationRegistry,
     /// Shutdown signal observed by all dispatcher tasks
@@ -720,8 +723,9 @@ impl Runtime {
     fn start_gauge_poller(self: Arc<Self>) -> JoinHandle<()> {
         let interval = self.options.observability.gauge_poll_interval;
         let cancel = self.cancel.clone();
+        let tracker = self.task_tracker.clone();
 
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             tracing::debug!(
                 target: "duroxide::runtime",
                 interval_secs = interval.as_secs(),
@@ -978,8 +982,6 @@ impl Runtime {
             history_store
         };
 
-        let tasks: Vec<JoinHandle<()>> = Vec::new();
-
         // Generate unique runtime instance ID (4-char hex)
         use std::time::{SystemTime, UNIX_EPOCH};
         let runtime_id = format!(
@@ -992,7 +994,8 @@ impl Runtime {
 
         // start request queue + worker
         let runtime = Arc::new(Self {
-            tasks: Mutex::new(tasks),
+            tasks: Mutex::new(Vec::new()),
+            task_tracker: TaskTracker::new(),
             history_store,
             orchestration_registry,
             cancel: CancellationToken::new(),
@@ -1024,87 +1027,56 @@ impl Runtime {
 
     /// Shutdown the runtime.
     ///
-    /// Signals every dispatcher task to stop, waits up to `timeout_ms` for them to
-    /// drain, then aborts whatever is left.
+    /// Stops fetching new work and allows in-flight work to finish within the grace
+    /// period. After that, aborts remaining work and waits for all runtime-owned
+    /// tasks, including lock renewal and activity invocation, to release their resources.
     ///
     /// # Parameters
     ///
-    /// * `timeout_ms` - Upper bound on how long to wait for a graceful drain. This is a
-    ///   deadline, not a fixed delay: an idle runtime returns almost immediately.
+    /// * `timeout_ms` - Grace period for in-flight work, not a fixed delay:
     ///   - `None`: Default 1000ms
-    ///   - `Some(0)`: Signal cancellation, then abort immediately without waiting
-    ///   - `Some(ms)`: Wait up to the given milliseconds before aborting stragglers
+    ///   - `Some(0)`: Abort immediately, then wait for cancellation cleanup
+    ///   - `Some(ms)`: Allow up to the given milliseconds before aborting stragglers
     ///
-    /// # Returns
+    /// This is not a hard return deadline. Tokio cancellation requires tasks to yield;
+    /// blocking or non-yielding user code can delay shutdown beyond the grace period.
+    /// Tasks or threads spawned by application code are the application's responsibility.
     ///
-    /// [`ShutdownOutcome::Drained`] if every task stopped on its own, or
-    /// [`ShutdownOutcome::Aborted`] with the number of tasks that had to be aborted.
-    pub async fn shutdown(self: Arc<Self>, timeout_ms: Option<u64>) -> ShutdownOutcome {
+    /// Concurrent calls all wait for cleanup; a shorter grace period can force an
+    /// earlier abort. If this future is dropped, task ownership is retained and a
+    /// subsequent call can finish shutdown.
+    pub async fn shutdown(self: Arc<Self>, timeout_ms: Option<u64>) {
         let timeout_ms = timeout_ms.unwrap_or(1000);
 
-        // Always signal first: an aborted task may still observe cancellation, and a
-        // task that is mid-await needs the signal to unwind cooperatively.
         self.cancel.cancel();
+        self.task_tracker.close();
+
+        if tokio::time::timeout(Duration::from_millis(timeout_ms), self.task_tracker.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_ms,
+                remaining_tasks = self.task_tracker.len(),
+                "Shutdown grace period expired; aborting dispatchers and waiting for task cleanup"
+            );
+            for handle in self.tasks.lock().await.iter() {
+                handle.abort();
+            }
+        }
+
+        self.task_tracker.wait().await;
 
         let mut tasks = self.tasks.lock().await;
-        let mut handles: Vec<JoinHandle<()>> = tasks.drain(..).collect();
-        drop(tasks);
-
-        if handles.is_empty() {
-            return ShutdownOutcome::Drained;
-        }
-
-        if timeout_ms == 0 {
-            warn!("Immediate shutdown - aborting all tasks");
-            return ShutdownOutcome::Aborted {
-                tasks: abort_all(&handles),
-            };
-        }
-
-        // Tasks already run concurrently, so awaiting them in order still completes
-        // as soon as the slowest one does.
-        let drain = async {
-            for handle in handles.iter_mut() {
-                let _ = handle.await;
+        while let Some(handle) = tasks.last_mut() {
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                warn!(%error, "Runtime task failed");
             }
-        };
-
-        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), drain).await {
-            Ok(()) => ShutdownOutcome::Drained,
-            Err(_) => {
-                warn!("Graceful shutdown deadline expired - aborting remaining tasks");
-                ShutdownOutcome::Aborted {
-                    tasks: abort_all(&handles),
-                }
-            }
+            // Do not remove the handle until its result has been observed: this
+            // await can itself be cancelled by a shutdown caller.
+            tasks.pop();
         }
     }
-}
-
-/// Abort every handle that has not already finished, returning how many were aborted.
-fn abort_all(handles: &[JoinHandle<()>]) -> usize {
-    let mut aborted = 0;
-    for handle in handles {
-        if !handle.is_finished() {
-            handle.abort();
-            aborted += 1;
-        }
-    }
-    aborted
-}
-
-/// Outcome of a [`Runtime::shutdown`] call.
-///
-/// Not `#[must_use]`: the overwhelmingly common call is `rt.shutdown(None).await;`
-/// as a statement, and warning on those would add noise without adding safety.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShutdownOutcome {
-    /// Every task stopped cooperatively within the deadline.
-    Drained,
-    /// The deadline expired (or `Some(0)` was passed) and tasks were aborted.
-    ///
-    /// `tasks` counts handles still running when the abort was issued. It is a
-    /// diagnostic: `abort` requests cancellation, so a task that never yields may
-    /// still be running briefly after `shutdown` returns.
-    Aborted { tasks: usize },
 }

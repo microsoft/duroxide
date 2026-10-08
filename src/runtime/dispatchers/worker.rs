@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{error, warn};
 
 use super::super::{Runtime, registry};
@@ -206,7 +206,7 @@ impl Runtime {
                 session_owner_ids.push(session_owner.clone());
             }
 
-            let handle = tokio::spawn(async move {
+            let handle = self.task_tracker.spawn(async move {
                 let mut consecutive_retryable_errors: u32 = 0;
 
                 loop {
@@ -269,7 +269,7 @@ impl Runtime {
         // Spawn a single session manager background task for heartbeat + cleanup
         let session_rt = Arc::clone(&self);
         let session_cancel = cancel.clone();
-        let session_handle = tokio::spawn(async move {
+        let session_handle = self.task_tracker.spawn(async move {
             run_session_manager(session_rt, session_cancel, session_owner_ids).await;
         });
         worker_handles.push(session_handle);
@@ -473,6 +473,7 @@ async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::Activity
     let cancellation_token = CancellationToken::new();
 
     let manager_handle = spawn_activity_manager(
+        &rt.task_tracker,
         Arc::clone(&rt.history_store),
         ctx.lock_token.clone(),
         rt.options.worker_lock_timeout,
@@ -510,7 +511,6 @@ async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::Activity
             .await
         }
         None => {
-            drop(manager_handle);
             abandon_unregistered_activity(rt, &ctx).await;
             // Early return after abandonment - no ack_result needed since we abandoned
             return;
@@ -553,18 +553,20 @@ async fn run_activity_with_cancellation(
     handler: Arc<dyn crate::runtime::ActivityHandler>,
     activity_ctx: crate::ActivityContext,
     cancellation_token: CancellationToken,
-    manager_handle: AbortOnDropHandle<()>,
+    _manager_handle: AbortOnDropHandle<()>,
     start_time: std::time::Instant,
 ) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
     let input = ctx.input.clone();
     // Abort-on-drop so the invocation cannot outlive this task if the worker is
     // aborted mid-activity during shutdown.
-    let mut activity_handle =
-        AbortOnDropHandle::new(tokio::spawn(async move { handler.invoke(activity_ctx, input).await }));
+    let mut activity_handle = AbortOnDropHandle::new(
+        rt.task_tracker
+            .spawn(async move { handler.invoke(activity_ctx, input).await }),
+    );
 
     tokio::select! {
         joined = &mut activity_handle => {
-            drop(manager_handle);
+            // Keep the renewal guard until acknowledgement finishes, not just invocation.
             // Handle normal activity completion (success, error, or panic)
             match joined {
                 Ok(Ok(result)) => handle_activity_success(rt, ctx, result, start_time).await,
@@ -573,7 +575,6 @@ async fn run_activity_with_cancellation(
             }
         }
         _ = cancellation_token.cancelled() => {
-            drop(manager_handle);
             // Handle cancellation: wait grace period, then drop result
             let grace = rt.options.activity_cancellation_grace_period;
 
@@ -805,6 +806,7 @@ fn calculate_renewal_interval(lock_timeout: Duration, buffer: Duration) -> Durat
 ///
 /// Handles: lock renewal, cancellation detection, and cancellation signaling.
 fn spawn_activity_manager(
+    task_tracker: &TaskTracker,
     store: Arc<dyn crate::providers::Provider>,
     token: String,
     lock_timeout: Duration,
@@ -832,7 +834,7 @@ fn spawn_activity_manager(
     // renewing may still be running, and releasing the lock early would let another
     // node steal the work item and execute it twice. The owning worker stops this
     // task instead (this handle aborts on drop).
-    AbortOnDropHandle::new(tokio::spawn(async move {
+    AbortOnDropHandle::new(task_tracker.spawn(async move {
         let mut interval = tokio::time::interval(renewal_interval);
         interval.tick().await; // Skip first immediate tick
 
