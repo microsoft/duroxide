@@ -1871,10 +1871,17 @@ impl CtxInner {
     /// Uses compressed (effective) indices that skip cancelled subscriptions:
     /// effective_index = raw_index - count_of_cancelled_subscriptions_with_lower_raw_index
     ///
-    /// Stale events are prevented from entering the arrival list by the causal
-    /// check in the replay loop (`has_pending_subscription_slot`), so the
-    /// arrival array only contains events that have a matching active slot.
+    /// The replay loop admits signals only for bound active slots.
+    /// New-policy cancellation also removes
+    /// an accepted value assigned to a dropped, unresolved slot.
     fn get_external_event(&self, schedule_id: u64) -> Option<&String> {
+        let (name, _) = self.external_subscriptions.get(&schedule_id)?;
+        let effective_index = self.external_arrival_index(schedule_id)?;
+        let arrivals = self.external_arrivals.get(name)?;
+        arrivals.get(effective_index)
+    }
+
+    fn external_arrival_index(&self, schedule_id: u64) -> Option<usize> {
         let (name, subscription_index) = self.external_subscriptions.get(&schedule_id)?;
 
         // If this subscription is cancelled, it never resolves
@@ -1885,23 +1892,29 @@ impl CtxInner {
         // Count cancelled subscriptions for this name with a lower raw index
         let cancelled_below = self
             .external_subscriptions
-            .values()
-            .filter(|(n, idx)| n == name && *idx < *subscription_index)
-            .filter(|(_, idx)| {
-                // Check if this subscription's schedule_id is in the cancelled set
-                self.external_subscriptions
-                    .iter()
-                    .any(|(sid, (n, i))| n == name && i == idx && self.external_cancelled_subscriptions.contains(sid))
+            .iter()
+            .filter(|(sid, (n, idx))| {
+                n == name && *idx < *subscription_index && self.external_cancelled_subscriptions.contains(sid)
             })
             .count();
 
-        let effective_index = subscription_index - cancelled_below;
-        let arrivals = self.external_arrivals.get(name)?;
-        arrivals.get(effective_index)
+        Some(subscription_index - cancelled_below)
     }
 
     /// Mark an external subscription as cancelled.
     fn mark_external_subscription_cancelled(&mut self, schedule_id: u64) {
+        // Positional signals answer a specific active slot. If its future is
+        // dropped before observing an already-delivered value, discard that stale
+        // value instead of shifting it onto the replacement wait. Queue arrivals
+        // intentionally have different, persistent semantics.
+        if self.race_cancellation_policy == RaceCancellationPolicy::V0131
+            && let Some(index) = self.external_arrival_index(schedule_id)
+            && let Some((name, _)) = self.external_subscriptions.get(&schedule_id)
+            && let Some(arrivals) = self.external_arrivals.get_mut(name)
+            && index < arrivals.len()
+        {
+            arrivals.remove(index);
+        }
         self.external_cancelled_subscriptions.insert(schedule_id);
     }
 
@@ -2016,9 +2029,12 @@ impl CtxInner {
         // next poll, not only when its later history breadcrumb is replayed.
         if self.race_cancellation_policy == RaceCancellationPolicy::V0131
             && let Some(schedule_id) = self.get_bound_schedule_id(token)
-            && matches!(kind, ScheduleKind::QueueDequeue { .. })
         {
-            self.mark_queue_subscription_cancelled(schedule_id);
+            match &kind {
+                ScheduleKind::QueueDequeue { .. } => self.mark_queue_subscription_cancelled(schedule_id),
+                ScheduleKind::ExternalWait { .. } => self.mark_external_subscription_cancelled(schedule_id),
+                _ => {}
+            }
         }
         self.cancelled_tokens.insert(token);
         self.cancelled_token_kinds.insert(token, kind);
