@@ -10,10 +10,11 @@
 use crate::providers::{ExecutionMetadata, Provider, WorkItem};
 use crate::{Event, EventKind, OrchestrationContext};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::warn;
 
 // ============================================================================
@@ -491,11 +492,14 @@ pub fn kind_of(msg: &WorkItem) -> &'static str {
 /// In-process runtime that executes activities and timers and persists
 /// history via a `Provider`.
 pub struct Runtime {
-    joins: Mutex<Vec<JoinHandle<()>>>,
+    /// Dispatcher handles stay owned here even if a shutdown caller is cancelled.
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Includes per-item child tasks, whose abort guards do not wait for cleanup.
+    task_tracker: TaskTracker,
     history_store: Arc<dyn Provider>,
     orchestration_registry: OrchestrationRegistry,
-    /// Shutdown flag checked by dispatchers
-    shutdown_flag: Arc<AtomicBool>,
+    /// Shutdown signal observed by all dispatcher tasks
+    cancel: CancellationToken,
     /// Runtime configuration options
     options: RuntimeOptions,
     /// Observability handle for metrics and logging
@@ -718,9 +722,10 @@ impl Runtime {
     /// and `duroxide_worker_queue_depth` gauges from the database at the configured interval.
     fn start_gauge_poller(self: Arc<Self>) -> JoinHandle<()> {
         let interval = self.options.observability.gauge_poll_interval;
-        let shutdown_flag = self.shutdown_flag.clone();
+        let cancel = self.cancel.clone();
+        let tracker = self.task_tracker.clone();
 
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             tracing::debug!(
                 target: "duroxide::runtime",
                 interval_secs = interval.as_secs(),
@@ -728,10 +733,9 @@ impl Runtime {
             );
 
             loop {
-                tokio::time::sleep(interval).await;
-
-                if shutdown_flag.load(Ordering::Relaxed) {
-                    break;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => {}
                 }
 
                 self.clone().refresh_gauges().await;
@@ -978,8 +982,6 @@ impl Runtime {
             history_store
         };
 
-        let joins: Vec<JoinHandle<()>> = Vec::new();
-
         // Generate unique runtime instance ID (4-char hex)
         use std::time::{SystemTime, UNIX_EPOCH};
         let runtime_id = format!(
@@ -992,10 +994,11 @@ impl Runtime {
 
         // start request queue + worker
         let runtime = Arc::new(Self {
-            joins: Mutex::new(joins),
+            tasks: Mutex::new(Vec::new()),
+            task_tracker: TaskTracker::new(),
             history_store,
             orchestration_registry,
-            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            cancel: CancellationToken::new(),
 
             options,
             observability_handle,
@@ -1008,60 +1011,76 @@ impl Runtime {
         // Start periodic gauge polling if observability is enabled
         if runtime.observability_handle.is_some() {
             let gauge_handle = runtime.clone().start_gauge_poller();
-            runtime.joins.lock().await.push(gauge_handle);
+            runtime.tasks.lock().await.push(gauge_handle);
         }
 
-        // background orchestrator dispatcher (extracted from inline poller)
-        let handle = runtime.clone().start_orchestration_dispatcher();
-        runtime.joins.lock().await.push(handle);
+        // Dispatchers return one handle per spawned task; every one must be tracked so
+        // shutdown can abort it. Aborting a supervisor would only detach its children.
+        let orch_handles = runtime.clone().start_orchestration_dispatcher();
+        runtime.tasks.lock().await.extend(orch_handles);
 
-        // background work dispatcher (executes activities)
-        let work_handle = runtime.clone().start_work_dispatcher(activity_registry);
-        runtime.joins.lock().await.push(work_handle);
+        let work_handles = runtime.clone().start_work_dispatcher(activity_registry);
+        runtime.tasks.lock().await.extend(work_handles);
 
         runtime
     }
 
     /// Shutdown the runtime.
     ///
+    /// Stops fetching new work and allows in-flight work to finish within the grace
+    /// period. After that, aborts remaining work and waits for all runtime-owned
+    /// tasks, including lock renewal and activity invocation, to release their resources.
+    ///
     /// # Parameters
     ///
-    /// * `timeout_ms` - How long to wait for graceful shutdown:
+    /// * `timeout_ms` - Grace period for in-flight work, not a fixed delay:
     ///   - `None`: Default 1000ms
-    ///   - `Some(Duration::ZERO)`: Immediate abort
-    ///   - `Some(ms)`: Wait specified milliseconds
+    ///   - `Some(0)`: Abort immediately, then wait for cancellation cleanup
+    ///   - `Some(ms)`: Allow up to the given milliseconds before aborting stragglers
+    ///
+    /// This is not a hard return deadline. Tokio cancellation requires tasks to yield;
+    /// blocking or non-yielding user code can delay shutdown beyond the grace period.
+    /// Tasks or threads spawned by application code are the application's responsibility.
+    ///
+    /// Concurrent calls all wait for cleanup; a shorter grace period can force an
+    /// earlier abort. If this future is dropped, task ownership is retained and a
+    /// subsequent call can finish shutdown.
+    ///
+    /// With `Some(0)`, this future can be awaited outside a Tokio context, provided
+    /// the Tokio runtime executing the tasks continues driving them during cleanup.
     pub async fn shutdown(self: Arc<Self>, timeout_ms: Option<u64>) {
         let timeout_ms = timeout_ms.unwrap_or(1000);
 
-        if timeout_ms == 0 {
-            warn!("Immediate shutdown - aborting all tasks");
-            let mut joins = self.joins.lock().await;
-            for j in joins.drain(..) {
-                j.abort();
+        self.cancel.cancel();
+        self.task_tracker.close();
+
+        if timeout_ms == 0
+            || tokio::time::timeout(Duration::from_millis(timeout_ms), self.task_tracker.wait())
+                .await
+                .is_err()
+        {
+            warn!(
+                timeout_ms,
+                remaining_tasks = self.task_tracker.len(),
+                "Aborting dispatchers and waiting for task cleanup"
+            );
+            for handle in self.tasks.lock().await.iter() {
+                handle.abort();
             }
-            return;
         }
 
-        // debug!("Graceful shutdown (timeout: {}ms)", timeout_ms);
+        self.task_tracker.wait().await;
 
-        // Set shutdown flag - workers check this between iterations
-        self.shutdown_flag.store(true, Ordering::Relaxed);
-
-        // Give workers time to notice and exit gracefully
-        tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
-
-        // Check if any tasks are still running (need to be aborted)
-        let mut joins = self.joins.lock().await;
-
-        // Abort any remaining tasks
-        for j in joins.drain(..) {
-            j.abort();
+        let mut tasks = self.tasks.lock().await;
+        while let Some(handle) = tasks.last_mut() {
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                warn!(%error, "Runtime task failed");
+            }
+            // Do not remove the handle until its result has been observed: this
+            // await can itself be cancelled by a shutdown caller.
+            tasks.pop();
         }
-
-        // debug!("Runtime shut down");
-
-        // Shutdown observability last (after all workers stopped)
-        // Note: We can't move out of Arc here, so observability shutdown happens when Runtime is dropped
-        // or if we could restructure to take ownership in shutdown
     }
 }

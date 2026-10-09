@@ -238,8 +238,10 @@ async fn continue_as_new_event_routes_to_latest() {
 #[tokio::test]
 async fn continue_as_new_event_drop_then_process() {
     let (store, _td) = common::create_sqlite_store_disk().await;
+    let second_execution_started = tokio_util::sync::CancellationToken::new();
+    let early_event_processed = tokio_util::sync::CancellationToken::new();
 
-    // Orchestrator: first execution continues; second waits for Go twice (second send expected to deliver)
+    // Hold execution 2 before subscribing until its early event has been processed.
     let orch = |ctx: OrchestrationContext, input: String| async move {
         match input.as_str() {
             "start" => {
@@ -248,6 +250,7 @@ async fn continue_as_new_event_drop_then_process() {
             }
             "wait" => {
                 ctx.trace_info("second exec -> subscribe and wait".to_string());
+                ctx.schedule_activity("WaitForEarlyEvent", "").await?;
                 let v = ctx.schedule_wait("Go").await;
                 Ok(v)
             }
@@ -258,31 +261,50 @@ async fn continue_as_new_event_drop_then_process() {
     let orchestration_registry = OrchestrationRegistry::builder()
         .register("EvtDropThenProcess", orch)
         .build();
-    let activity_registry = ActivityRegistry::builder().build();
+    let activity_registry = ActivityRegistry::builder()
+        .register("WaitForEarlyEvent", {
+            let started = second_execution_started.clone();
+            let processed = early_event_processed.clone();
+            move |_: ActivityContext, _: String| {
+                let started = started.clone();
+                let processed = processed.clone();
+                async move {
+                    started.cancel();
+                    processed.cancelled().await;
+                    Ok(String::new())
+                }
+            }
+        })
+        .build();
     let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
     let client = duroxide::Client::new(store.clone());
-
-    // Start orchestrator
-    let client_c1 = duroxide::Client::new(store.clone());
-    tokio::spawn(async move {
-        // Intentionally send too early to new execution (before subscription)
-        // We wait a bit to ensure CAN happens but before subscription is recorded.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = client_c1.raise_event("inst-can-evt-drop", "Go", "early").await;
-    });
-
-    // After subscription exists, send again
-    let store_for_wait = store.clone();
-    let client_c2 = duroxide::Client::new(store.clone());
-    tokio::spawn(async move {
-        let _ = common::wait_for_subscription(store_for_wait, "inst-can-evt-drop", "Go", 2_000).await;
-        let _ = client_c2.raise_event("inst-can-evt-drop", "Go", "late").await;
-    });
 
     client
         .start_orchestration("inst-can-evt-drop", "EvtDropThenProcess", "start")
         .await
         .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), second_execution_started.cancelled())
+        .await
+        .expect("execution 2 did not reach its pre-subscription activity");
+    client.raise_event("inst-can-evt-drop", "Go", "early").await.unwrap();
+    assert!(
+        common::wait_for_history(
+            store.clone(),
+            "inst-can-evt-drop",
+            |history| history.iter().any(|event| {
+                event.execution_id == 2
+                    && matches!(&event.kind, EventKind::ExternalEvent { name, data }
+                        if name == "Go" && data == "early")
+            }),
+            5_000,
+        )
+        .await,
+        "early event was not processed before subscribing"
+    );
+    early_event_processed.cancel();
+    assert!(common::wait_for_subscription(store.clone(), "inst-can-evt-drop", "Go", 5_000).await);
+    client.raise_event("inst-can-evt-drop", "Go", "late").await.unwrap();
 
     match client
         .wait_for_orchestration("inst-can-evt-drop", std::time::Duration::from_secs(5))
@@ -315,21 +337,21 @@ async fn continue_as_new_event_drop_then_process() {
     let e2 = mgmt2
         .read_history_with_execution_id("inst-can-evt-drop", 2)
         .await
-        .unwrap_or_default();
+        .unwrap();
     assert!(
         e2.iter()
             .any(|e| matches!(&e.kind, EventKind::ExternalSubscribed { name, .. } if name == "Go"))
     );
     assert!(
         e2.iter()
-            .any(|e| matches!(&e.kind, EventKind::ExternalEvent { name, .. } if name == "Go"))
+            .any(|e| matches!(&e.kind, EventKind::ExternalEvent { name, data } if name == "Go" && data == "late"))
     );
 
     // Exec1 must not have ExternalEvent
     let e1 = mgmt2
         .read_history_with_execution_id("inst-can-evt-drop", 1)
         .await
-        .unwrap_or_default();
+        .unwrap();
     assert!(
         !e1.iter()
             .any(|e| matches!(&e.kind, EventKind::ExternalEvent { name, .. } if name == "Go"))

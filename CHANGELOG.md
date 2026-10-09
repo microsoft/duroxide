@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Runtime::shutdown` now actually stops the tasks its dispatchers spawn
+  ([#44](https://github.com/microsoft/duroxide/issues/44)). Previously, aborting dispatcher
+  supervisors detached their child tasks. Pollers blocked in provider calls could outlive
+  shutdown and retain pooled connections indefinitely.
+- Shutdown retains task ownership if its caller is cancelled, and concurrent calls
+  wait for the same tasks to finish. Cleanup includes activity invocation and lock-renewal
+  tasks, not just dispatcher pollers.
+- `Runtime::shutdown(Some(0))` now signals cancellation and aborts work before waiting
+  for task cleanup, without requiring the caller to enter a Tokio context.
+- Dispatcher tasks now observe cancellation while parked in a long poll, an error backoff,
+  or the minimum-poll-interval sleep, instead of only between loop iterations.
+- Lock-renewal loops (orchestration and activity) no longer stop the instant shutdown is
+  signalled. They remain active through acknowledgement, preventing locks from expiring
+  while in-flight work drains.
+
+### Changed
+
+- **`timeout_ms` is now a grace-period limit, not a fixed delay.** Shutdown returns once
+  all runtime-owned tasks stop, retaining its `()` return type. After the grace period it
+  aborts remaining work and waits for cancellation cleanup, so blocking or non-yielding
+  user code can delay its return beyond that period. See [the migration guide](docs/migration-guide.md).
+
 ## [0.1.30] - 2026-07-29
 
 **Release:** <https://crates.io/crates/duroxide/0.1.30>

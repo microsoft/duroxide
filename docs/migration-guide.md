@@ -2,6 +2,29 @@
 
 This guide helps you migrate between Duroxide versions and handle orchestration versioning.
 
+## `Runtime::shutdown` waits for task cleanup (Unreleased)
+
+The signature is unchanged: `shutdown(timeout_ms: Option<u64>)` still returns `()`.
+It stops fetching new work and lets in-flight work finish within the grace period,
+then aborts remaining work and waits for all runtime-owned tasks to release their
+resources. Work-item locks continue to be renewed through acknowledgement.
+
+`timeout_ms` is now a grace-period limit rather than an unconditional sleep.
+`None` still means 1000 ms; `Some(0)` skips the graceful drain but waits for
+cancellation cleanup. Idle runtimes return as soon as their tasks stop.
+With `Some(0)`, the caller need not enter a Tokio context, but the Tokio runtime
+executing the tasks must continue driving them during cleanup.
+
+**The grace period is not a hard return deadline.** Tokio cannot forcibly preempt
+blocking or non-yielding user code, so that code can delay shutdown indefinitely.
+Activities must yield or otherwise finish, and application-spawned tasks and
+threads remain the application's responsibility.
+
+Concurrent shutdown calls all wait for cleanup; a shorter grace period can force
+an earlier abort. Dropping a shutdown future does not lose ownership of the tasks:
+keep a runtime handle and call `shutdown` again to finish teardown. An interrupted
+shutdown is not evidence that it is safe to tear down dependent resources.
+
 ## Reserved `sub::` instance-id marker (Unreleased)
 
 The `sub::` marker is now reserved for runtime-generated sub-orchestration instance ids.
