@@ -1672,6 +1672,10 @@ struct CtxInner {
     queue_subscriptions: Vec<(u64, String)>,
     /// Persistent arrivals: name -> list of payloads in arrival order
     queue_arrivals: std::collections::HashMap<String, Vec<String>>,
+    /// History arrival order across names as (name, per-name position), plus the
+    /// per-name positions actually returned. Payloads stay in `queue_arrivals`.
+    queue_arrival_order: Vec<(String, usize)>,
+    queue_consumed_positions: std::collections::HashSet<(String, usize)>,
     /// Persistent subscriptions that have been cancelled (dropped without completing)
     queue_cancelled_subscriptions: std::collections::HashSet<u64>,
     /// Persistent subscriptions that have already been resolved (consumed an arrival)
@@ -1747,6 +1751,8 @@ impl CtxInner {
             external_cancelled_subscriptions: Default::default(),
             queue_subscriptions: Default::default(),
             queue_arrivals: Default::default(),
+            queue_arrival_order: Default::default(),
+            queue_consumed_positions: Default::default(),
             queue_cancelled_subscriptions: Default::default(),
             queue_resolved_subscriptions: Default::default(),
             #[cfg(feature = "replay-version-test")]
@@ -1927,7 +1933,9 @@ impl CtxInner {
 
     /// Deliver a persistent external event (appends to arrival list for the name).
     fn deliver_queue_message(&mut self, name: String, data: String) {
-        self.queue_arrivals.entry(name).or_default().push(data);
+        let arrivals = self.queue_arrivals.entry(name.clone()).or_default();
+        self.queue_arrival_order.push((name, arrivals.len()));
+        arrivals.push(data);
     }
 
     /// Mark a persistent subscription as cancelled (dropped without completing).
@@ -1975,6 +1983,7 @@ impl CtxInner {
         if arrival_index < arrivals.len() {
             // Mark as resolved
             self.queue_resolved_subscriptions.insert(schedule_id);
+            self.queue_consumed_positions.insert((name, arrival_index));
             Some(arrivals[arrival_index].clone())
         } else {
             None
@@ -2549,6 +2558,28 @@ impl OrchestrationContext {
 
     pub(crate) fn set_race_cancellation_policy(&self, policy: RaceCancellationPolicy) {
         self.inner.lock().unwrap().race_cancellation_policy = policy;
+    }
+
+    pub(crate) fn race_cancellation_fix_enabled(&self) -> bool {
+        self.inner.lock().unwrap().race_cancellation_policy == RaceCancellationPolicy::V0131
+    }
+
+    pub(crate) fn unconsumed_queue_arrivals(&self) -> Vec<(String, String)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .queue_arrival_order
+            .iter()
+            .filter(|position| !inner.queue_consumed_positions.contains(*position))
+            .map(|(name, index)| {
+                // Arrival vectors are append-only, so a recorded position always exists.
+                let data = inner
+                    .queue_arrivals
+                    .get(name)
+                    .and_then(|arrivals| arrivals.get(*index))
+                    .expect("queue arrival order must reference a recorded arrival");
+                (name.clone(), data.clone())
+            })
+            .collect()
     }
 
     /// Get cancelled activity schedule_ids for this turn.

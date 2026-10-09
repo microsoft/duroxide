@@ -29,7 +29,12 @@ pub enum TurnResult {
     /// Orchestration failed with error details
     Failed(crate::ErrorDetails),
     /// Orchestration requested continue-as-new
-    ContinueAsNew { input: String, version: Option<String> },
+    ContinueAsNew {
+        input: String,
+        version: Option<String>,
+        /// New policy carries exact unread positions; None preserves legacy history counting.
+        unconsumed_queue_arrivals: Option<Vec<(String, String)>>,
+    },
     /// Orchestration was cancelled
     Cancelled(String),
 }
@@ -662,6 +667,8 @@ impl ReplayEngine {
         }
 
         {
+            // Legacy turns apply dropped queue cancellation here. In immediate
+            // mode these IDs were already marked at drop/bind; repeating is idempotent.
             let cancelled_queue_waits = ctx.get_cancelled_queue_ids();
             for schedule_id in cancelled_queue_waits {
                 ctx.mark_queue_subscription_cancelled(schedule_id);
@@ -1056,6 +1063,11 @@ impl ReplayEngine {
                 return TurnResult::ContinueAsNew {
                     input: input.clone(),
                     version: version.clone(),
+                    // New-policy executions carry exactly the unread arrivals; legacy
+                    // executions keep counting subscriptions from history.
+                    unconsumed_queue_arrivals: ctx
+                        .race_cancellation_fix_enabled()
+                        .then(|| ctx.unconsumed_queue_arrivals()),
                 };
             }
         }
