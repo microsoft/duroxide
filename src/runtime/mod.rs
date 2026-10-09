@@ -373,6 +373,14 @@ impl Default for RuntimeOptions {
     }
 }
 
+impl RuntimeOptions {
+    /// Fetches left before poison (a message is poisoned once its attempt count
+    /// exceeds `max_attempts`). Used in warnings.
+    pub(crate) fn attempts_until_poison(&self, attempt_count: u32) -> u64 {
+        (u64::from(self.max_attempts) + 1).saturating_sub(u64::from(attempt_count))
+    }
+}
+
 mod dispatchers;
 pub mod limits;
 pub mod observability;

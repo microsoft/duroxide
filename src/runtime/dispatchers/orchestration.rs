@@ -569,7 +569,7 @@ impl Runtime {
             // version capable of deserialising these events) a window to pick it up,
             // without the exponential growth that would slow down the poison path.
             let backoff = Duration::from_secs(1);
-            let remaining = self.options.max_attempts.saturating_sub(attempt_count);
+            let remaining = self.options.attempts_until_poison(attempt_count);
             warn!(
                 instance = %instance,
                 error = %error,
@@ -589,19 +589,50 @@ impl Runtime {
         // Extract metadata from history and work items
         let temp_history_mgr = HistoryManager::from_history(&item.history);
         let workitem_reader = WorkItemReader::from_messages(&item.messages, &temp_history_mgr, instance);
+        // The poison path records a CAN successor's failure after the CAN row.
+        let terminal_after_can = temp_history_mgr.is_continued_as_new
+            && item
+                .history
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::OrchestrationFailed { .. }));
 
-        // Bail on truly terminal histories (Completed/Failed), or ContinuedAsNew without a CAN start message
-        if temp_history_mgr.is_completed
-            || temp_history_mgr.is_failed
-            || (temp_history_mgr.is_continued_as_new && !workitem_reader.is_continue_as_new)
-        {
-            warn!(instance = %instance, "Instance is terminal (completed/failed or CAN without start), acking batch without processing");
+        // Between executions nothing can run until the successor's start arrives. The start
+        // is committed with the CAN row, but this batch can miss it: the fetch cutoff preceded
+        // its visible_at, or a delayed abandon pushed it (for example an old worker without the
+        // successor's version). Keep every input and retry with the backoff and attempt budget
+        // of an unregistered handler. Successor replay drops stale completions; order against
+        // later arrivals is best effort, as with any delayed abandon.
+        if temp_history_mgr.is_continued_as_new && !terminal_after_can && !workitem_reader.is_continue_as_new {
+            let backoff = self.options.unregistered_backoff.delay(attempt_count);
+            let remaining_attempts = self.options.attempts_until_poison(attempt_count);
+            warn!(
+                instance = %instance,
+                attempt_count,
+                max_attempts = self.options.max_attempts,
+                remaining_attempts,
+                backoff_secs = %backoff.as_secs_f32(),
+                messages = item.messages.len(),
+                "CAN successor start not visible, abandoning instance inputs with {:.1}s backoff (will poison in {} more attempts)",
+                backoff.as_secs_f32(),
+                remaining_attempts
+            );
+            // If the abandon fails, the lock expires and the inputs are redelivered.
+            let _ = self
+                .history_store
+                .abandon_orchestration_item(lock_token, Some(backoff), false)
+                .await;
+            return;
+        }
+
+        // Bail on truly terminal histories (Completed/Failed)
+        if temp_history_mgr.is_completed || temp_history_mgr.is_failed || terminal_after_can {
+            warn!(instance = %instance, "Instance is terminal (completed/failed), acking batch without processing");
             // If this terminal instance receives a StartOrchestration for the same child id,
             // the incoming start is discarded here. When that start belongs to a different
             // scheduling parent than the terminal child originally recorded, notify the
             // incoming parent with SubOrchFailed so it does not wait forever for a child
             // start that was never accepted.
-            let orchestrator_items = self.terminal_collision_notifications(&item).await;
+            let orchestrator_items = self.terminal_collision_notifications(&item, &temp_history_mgr).await;
             let _ = self
                 .ack_orchestration_with_changes(
                     lock_token,
@@ -618,6 +649,11 @@ impl Runtime {
 
         // Extract version before moving temp_history_mgr
         let version = temp_history_mgr.version().unwrap_or_else(|| "unknown".to_string());
+        let collision_notifications = if !item.history.is_empty() {
+            self.terminal_collision_notifications(&item, &temp_history_mgr).await
+        } else {
+            Vec::new()
+        };
 
         // Decide execution id and history to use for this execution
         let (execution_id_to_use, mut history_mgr) = if workitem_reader.is_continue_as_new {
@@ -685,7 +721,7 @@ impl Runtime {
                     Err(OrchestrationProcessingError::UnregisteredOrchestration) => {
                         // Orchestration not registered - abandon with exponential backoff
                         let backoff = self.options.unregistered_backoff.delay(attempt_count);
-                        let remaining_attempts = self.options.max_attempts.saturating_sub(attempt_count);
+                        let remaining_attempts = self.options.attempts_until_poison(attempt_count);
 
                         tracing::warn!(
                             target: "duroxide::runtime",
@@ -947,6 +983,7 @@ impl Runtime {
         }
 
         // Robust ack with basic retry on any provider error
+        orchestrator_items.extend(collision_notifications.iter().cloned());
         match self
             .ack_orchestration_with_changes(
                 lock_token,
@@ -993,7 +1030,7 @@ impl Runtime {
                         execution_id_for_ack,
                         failure_delta.clone(),
                         vec![],
-                        vec![],
+                        collision_notifications,
                         failure_metadata,
                         vec![], // cancelled_activities - none for failure commits
                     )
@@ -1442,8 +1479,14 @@ impl Runtime {
     /// the provider contract requires `ack_orchestration_item` to delete the batch, append
     /// history, and enqueue outbound work in a single transaction. A child's start is
     /// therefore consumed exactly once, before the child can reach a terminal state.
-    async fn terminal_collision_notifications(&self, item: &crate::providers::OrchestrationItem) -> Vec<WorkItem> {
+    /// `history` is the manager already built from `item.history` for this batch.
+    async fn terminal_collision_notifications(
+        &self,
+        item: &crate::providers::OrchestrationItem,
+        history: &HistoryManager,
+    ) -> Vec<WorkItem> {
         let mut notifications = Vec::new();
+        let terminal = history.is_completed || history.is_failed;
         for msg in &item.messages {
             if let WorkItem::StartOrchestration {
                 parent_instance: Some(parent_instance),
@@ -1452,11 +1495,24 @@ impl Runtime {
                 ..
             } = msg
             {
+                // Defensive: a parent enqueues a child's start once, in its atomic ack, so a
+                // correct provider never redelivers it to the running child. If one does,
+                // keep the base behaviour and ignore it. An unknown generation cannot prove
+                // it is the same call, so that case is notified.
+                if !terminal
+                    && history.parent_instance.as_ref() == Some(parent_instance)
+                    && history.parent_id == Some(*parent_id)
+                    && parent_execution_id.is_some()
+                    && history.parent_execution_id == *parent_execution_id
+                {
+                    continue;
+                }
+                let state = if terminal { " and is terminal" } else { "" };
                 warn!(
                     instance = %item.instance,
                     parent_instance = %parent_instance,
                     parent_id = %parent_id,
-                    "Sub-orchestration target instance id already exists and is terminal; notifying parent of failure"
+                    "Sub-orchestration target instance id already exists; notifying colliding parent of failure"
                 );
                 // Prefer the execution id stamped on the colliding start; fall back to a
                 // durable provider read for work items produced by older runtimes.
@@ -1470,8 +1526,8 @@ impl Runtime {
                     details: crate::ErrorDetails::Application {
                         kind: crate::AppErrorKind::OrchestrationFailed,
                         message: format!(
-                            "sub-orchestration instance id '{}' already exists and is terminal",
-                            item.instance
+                            "sub-orchestration instance id '{}' already exists{state}",
+                            item.instance,
                         ),
                         retryable: false,
                     },

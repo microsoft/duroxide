@@ -417,6 +417,14 @@ impl WorkItemReader {
         // Separate start/CAN from completions
         for work_item in messages {
             match work_item {
+                // A start for an instance with history cannot replace its pinned handler,
+                // and cannot take the place of the instance's CAN start.
+                WorkItem::StartOrchestration { .. } if !history_mgr.is_empty() => {
+                    warn!(
+                        instance,
+                        "Ignoring duplicate StartOrchestration for an existing instance"
+                    );
+                }
                 WorkItem::StartOrchestration { .. } | WorkItem::ContinueAsNew { .. } => {
                     if start_item.is_some() {
                         warn!(instance, "Duplicate Start/ContinueAsNew in batch - ignoring duplicate");
