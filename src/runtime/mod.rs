@@ -1062,7 +1062,7 @@ impl Runtime {
             warn!(
                 timeout_ms,
                 remaining_tasks = self.task_tracker.len(),
-                "Shutdown grace period expired; aborting dispatchers and waiting for task cleanup"
+                "Aborting dispatchers and waiting for task cleanup"
             );
             for handle in self.tasks.lock().await.iter() {
                 handle.abort();
