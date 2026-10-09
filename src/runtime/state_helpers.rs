@@ -568,6 +568,147 @@ mod tests {
     use super::*;
 
     #[test]
+    fn can_start_precedes_duplicate_client_start_selection() {
+        let history = HistoryManager::from_history(&[
+            Event::with_event_id(
+                1,
+                "instance",
+                1,
+                None,
+                EventKind::OrchestrationStarted {
+                    name: "Original".into(),
+                    version: "1.0.0".into(),
+                    input: "old".into(),
+                    parent_instance: None,
+                    parent_id: None,
+                    parent_execution_id: None,
+                    carry_forward_events: None,
+                    initial_custom_status: None,
+                },
+            ),
+            Event::with_event_id(
+                2,
+                "instance",
+                1,
+                None,
+                EventKind::OrchestrationContinuedAsNew { input: "next".into() },
+            ),
+        ]);
+        let duplicate = WorkItem::StartOrchestration {
+            instance: "instance".into(),
+            orchestration: "Wrong".into(),
+            input: "duplicate".into(),
+            version: None,
+            execution_id: 1,
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
+        };
+        let can = WorkItem::ContinueAsNew {
+            instance: "instance".into(),
+            orchestration: "Original".into(),
+            input: "next".into(),
+            version: Some("1.0.0".into()),
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
+            carry_forward_events: vec![],
+            initial_custom_status: None,
+        };
+        for batch in [vec![duplicate.clone(), can.clone()], vec![can, duplicate]] {
+            let reader = WorkItemReader::from_messages(&batch, &history, "instance");
+            assert!(reader.is_continue_as_new);
+            assert_eq!(reader.orchestration_name, "Original");
+            assert_eq!(reader.input, "next");
+        }
+    }
+
+    #[test]
+    fn duplicate_client_start_does_not_replace_pinned_running_handler() {
+        let history = HistoryManager::from_history(&[Event::with_event_id(
+            1,
+            "instance",
+            1,
+            None,
+            EventKind::OrchestrationStarted {
+                name: "Original".into(),
+                version: "1.0.0".into(),
+                input: "old".into(),
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
+                carry_forward_events: None,
+                initial_custom_status: None,
+            },
+        )]);
+        let reader = WorkItemReader::from_messages(
+            &[WorkItem::StartOrchestration {
+                instance: "instance".into(),
+                orchestration: "Wrong".into(),
+                input: "duplicate".into(),
+                version: None,
+                execution_id: 1,
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
+            }],
+            &history,
+            "instance",
+        );
+        assert!(!reader.has_start_item());
+        assert_eq!(reader.orchestration_name, "Original");
+        assert_eq!(reader.version.as_deref(), Some("1.0.0"));
+        assert_eq!(reader.input, "old");
+    }
+
+    #[test]
+    fn terminal_activity_cancellations_are_ordered() {
+        for stamp in ["0.1.30", "0.1.31"] {
+            let mut start = Event::with_event_id(
+                1,
+                "test-inst",
+                1,
+                None,
+                EventKind::OrchestrationStarted {
+                    name: "Test".into(),
+                    version: "1.0.0".into(),
+                    input: "".into(),
+                    parent_instance: None,
+                    parent_id: None,
+                    parent_execution_id: None,
+                    carry_forward_events: None,
+                    initial_custom_status: None,
+                },
+            );
+            start.duroxide_version = stamp.into();
+            let mut history = vec![start];
+            for id in 2..=20 {
+                history.push(Event::with_event_id(
+                    id,
+                    "test-inst",
+                    1,
+                    None,
+                    EventKind::ActivityScheduled {
+                        name: "pending".into(),
+                        input: "".into(),
+                        session_id: None,
+                        tag: None,
+                    },
+                ));
+            }
+            for _ in 0..16 {
+                let manager = HistoryManager::from_history(&history);
+                let ids: Vec<_> = manager
+                    .compute_inflight_activities("test-inst", 1)
+                    .into_iter()
+                    .map(|activity| activity.activity_id)
+                    .collect();
+                assert_eq!(ids, (2..=20).collect::<Vec<_>>(), "{stamp}");
+            }
+        }
+    }
+
+    #[test]
     fn test_history_reader_from_empty_history() {
         let metadata = HistoryManager::from_history(&[]);
         assert!(metadata.orchestration_name.is_none());

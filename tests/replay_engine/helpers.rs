@@ -30,7 +30,7 @@ pub const TEST_WORKER_ID: &str = "test-worker";
 
 /// Create an OrchestrationStarted event
 pub fn started_event(event_id: u64) -> Event {
-    Event::with_event_id(
+    let mut event = Event::with_event_id(
         event_id,
         TEST_INSTANCE,
         TEST_EXECUTION_ID,
@@ -45,7 +45,11 @@ pub fn started_event(event_id: u64) -> Event {
             carry_forward_events: None,
             initial_custom_status: None,
         },
-    )
+    );
+    // This is the reviewed immediate-policy boundary, independent of the
+    // package version used by a future test build.
+    event.duroxide_version = "0.1.31".into();
+    event
 }
 
 /// Create an ActivityScheduled event

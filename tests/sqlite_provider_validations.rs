@@ -190,6 +190,84 @@ mod tests {
     /// Used by the vast majority of tests that don't need direct DB manipulation.
     struct SqliteTestFactory;
 
+    #[tokio::test]
+    async fn queue_race_cancellation_replay() {
+        duroxide::provider_validations::race_replay::test_queue_race_cancellation_replay(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn queue_replay_version_stamp_roundtrip() {
+        duroxide::provider_validations::race_replay::test_queue_replay_version_stamp_roundtrip(&SqliteTestFactory)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn positional_wait_race_replay() {
+        duroxide::provider_validations::race_replay::test_positional_wait_race_replay(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_delayed_abandon_preserves_unlocked_rows() {
+        duroxide::provider_validations::poison_message::orchestration_delayed_abandon_preserves_unlocked_rows(
+            &SqliteTestFactory,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_ignore_attempt_preserves_hidden_start() {
+        duroxide::provider_validations::poison_message::orchestration_ignore_attempt_preserves_hidden_start(
+            &SqliteTestFactory,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_queue_race_replay() {
+        duroxide::provider_validations::race_replay::test_continue_as_new_queue_race_replay(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_transition_delivery_legacy_stamp() {
+        duroxide::provider_validations::race_replay::test_continue_as_new_transition_delivery(
+            &SqliteTestFactory,
+            "0.1.30",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_transition_delivery_new_stamp() {
+        duroxide::provider_validations::race_replay::test_continue_as_new_transition_delivery(
+            &SqliteTestFactory,
+            "0.1.31",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_duplicate_start() {
+        duroxide::provider_validations::race_replay::test_continue_as_new_duplicate_start(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_unregistered_backoff() {
+        duroxide::provider_validations::race_replay::test_continue_as_new_unregistered_backoff(&SqliteTestFactory)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_start_preserves_pinned_handler() {
+        duroxide::provider_validations::race_replay::test_duplicate_start_preserves_pinned_handler(&SqliteTestFactory)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_queue_race_decision_preserved() {
+        duroxide::provider_validations::race_replay::test_legacy_queue_race_decision_preserved(&SqliteTestFactory)
+            .await;
+    }
+
     #[async_trait::async_trait]
     impl ProviderFactory for SqliteTestFactory {
         async fn create_provider(&self) -> Arc<dyn Provider> {

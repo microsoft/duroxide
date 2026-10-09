@@ -4145,6 +4145,215 @@ impl OrchestrationContext {
 }
 
 #[cfg(test)]
+mod queue_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn context_defaults_to_legacy_until_the_engine_pins_a_policy() {
+        let ctx = OrchestrationContext::new(Vec::new(), 1, "default".into(), "Test".into(), "1.0.0".into(), None);
+        assert!(!ctx.race_cancellation_fix_enabled());
+    }
+
+    #[test]
+    fn current_build_covers_the_queue_cancellation_semantic_threshold() {
+        let threshold = crate::runtime::replay_engine::RACE_CANCELLATION_FIX_SINCE.clone();
+        assert!(crate::providers::current_build_version() >= threshold);
+    }
+
+    #[test]
+    fn dropping_already_resolved_dequeue_never_cancels_its_consumed_slot() {
+        for immediate in [false, true] {
+            let ctx = OrchestrationContext::new(
+                Vec::new(),
+                1,
+                "resolved".into(),
+                "resolved".into(),
+                "1.0.0".into(),
+                None,
+            );
+            ctx.set_race_cancellation_policy(if immediate {
+                RaceCancellationPolicy::V0131
+            } else {
+                RaceCancellationPolicy::Legacy
+            });
+            ctx.deliver_queue_message("q".into(), "first".into());
+            ctx.deliver_queue_message("q".into(), "second".into());
+            let mut first = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 2);
+            ctx.bind_queue_subscription(2, "q");
+            let waker = std::task::Waker::noop();
+            let mut task = std::task::Context::from_waker(waker);
+            assert_eq!(
+                std::pin::Pin::new(&mut first).poll(&mut task),
+                Poll::Ready("first".into())
+            );
+            assert!(first.completed);
+            drop(first);
+            assert!(ctx.get_cancelled_queue_ids().is_empty());
+            assert!(!ctx.inner.lock().unwrap().queue_cancelled_subscriptions.contains(&2));
+            let mut second = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 3);
+            ctx.bind_queue_subscription(3, "q");
+            assert_eq!(
+                std::pin::Pin::new(&mut second).poll(&mut task),
+                Poll::Ready("second".into())
+            );
+            drop(second);
+            assert!(ctx.get_cancelled_queue_ids().is_empty());
+        }
+    }
+
+    #[test]
+    fn dropping_already_resolved_wait_never_cancels_its_slot() {
+        let waker = std::task::Waker::noop();
+        let mut task = std::task::Context::from_waker(waker);
+        for immediate in [false, true] {
+            let ctx = OrchestrationContext::new(
+                Vec::new(),
+                1,
+                "resolved".into(),
+                "resolved".into(),
+                "1.0.0".into(),
+                None,
+            );
+            ctx.set_race_cancellation_policy(if immediate {
+                RaceCancellationPolicy::V0131
+            } else {
+                RaceCancellationPolicy::Legacy
+            });
+            let mut first = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 2);
+            ctx.bind_external_subscription(2, "s");
+            ctx.deliver_external_event("s".into(), "first".into());
+            assert_eq!(
+                std::pin::Pin::new(&mut first).poll(&mut task),
+                Poll::Ready("first".into())
+            );
+            assert!(first.completed);
+            drop(first);
+            assert!(ctx.get_cancelled_external_wait_ids().is_empty());
+            assert!(!ctx.inner.lock().unwrap().external_cancelled_subscriptions.contains(&2));
+            let mut second = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 3);
+            ctx.bind_external_subscription(3, "s");
+            ctx.deliver_external_event("s".into(), "second".into());
+            assert_eq!(
+                std::pin::Pin::new(&mut second).poll(&mut task),
+                Poll::Ready("second".into()),
+                "the resolved wait's value must stay consumed, not shift onto the next wait"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_an_unresolved_middle_wait_discards_only_its_own_value() {
+        let waker = std::task::Waker::noop();
+        let mut task = std::task::Context::from_waker(waker);
+        let ctx = OrchestrationContext::new(Vec::new(), 1, "middle".into(), "middle".into(), "1.0.0".into(), None);
+        ctx.set_race_cancellation_policy(RaceCancellationPolicy::V0131);
+        let mut waits = Vec::new();
+        for id in [2, 3, 4] {
+            let wait = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, id);
+            ctx.bind_external_subscription(id, "s");
+            waits.push(wait);
+        }
+        let mut last = waits.pop().expect("third wait");
+        let middle = waits.pop().expect("second wait");
+        let mut first = waits.pop().expect("first wait");
+        ctx.deliver_external_event("s".into(), "a".into());
+        ctx.deliver_external_event("s".into(), "b".into());
+        assert_eq!(std::pin::Pin::new(&mut first).poll(&mut task), Poll::Ready("a".into()));
+        drop(first);
+        // "b" was accepted into the middle slot; dropping that wait discards it.
+        drop(middle);
+        assert_eq!(ctx.get_cancelled_external_wait_ids(), vec![3]);
+        assert_eq!(std::pin::Pin::new(&mut last).poll(&mut task), Poll::Pending);
+        ctx.deliver_external_event("s".into(), "c".into());
+        assert_eq!(std::pin::Pin::new(&mut last).poll(&mut task), Poll::Ready("c".into()));
+    }
+
+    #[test]
+    fn dropping_a_bound_wait_lets_the_next_bound_wait_take_a_later_signal() {
+        let waker = std::task::Waker::noop();
+        let mut task = std::task::Context::from_waker(waker);
+        for immediate in [false, true] {
+            let ctx = OrchestrationContext::new(Vec::new(), 1, "next".into(), "next".into(), "1.0.0".into(), None);
+            ctx.set_race_cancellation_policy(if immediate {
+                RaceCancellationPolicy::V0131
+            } else {
+                RaceCancellationPolicy::Legacy
+            });
+            let first = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 2);
+            ctx.bind_external_subscription(2, "s");
+            let mut second = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 3);
+            ctx.bind_external_subscription(3, "s");
+            drop(first);
+            ctx.deliver_external_event("s".into(), "a".into());
+            let read = std::pin::Pin::new(&mut second).poll(&mut task);
+            if immediate {
+                // "a" arrived after the first wait was dropped: it answers the open wait.
+                assert_eq!(read, Poll::Ready("a".into()));
+            } else {
+                // Legacy keeps the dropped wait's slot until its cancellation row.
+                assert_eq!(read, Poll::Pending);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn context_fifo_reads_characterize_delayed_and_immediate_cancellation() {
+        for immediate in [false, true] {
+            let ctx = OrchestrationContext::new(Vec::new(), 1, "fifo".into(), "fifo".into(), "1.0.0".into(), None);
+            ctx.set_race_cancellation_policy(if immediate {
+                RaceCancellationPolicy::V0131
+            } else {
+                RaceCancellationPolicy::Legacy
+            });
+
+            let loser = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 2);
+            ctx.bind_queue_subscription(2, "q");
+            drop(loser);
+
+            ctx.deliver_queue_message("q".into(), "first".into());
+            ctx.deliver_queue_message("q".into(), "second".into());
+            let next = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 3);
+            ctx.bind_queue_subscription(3, "q");
+            let first_read = next.await;
+
+            // Legacy replay reaches the end-of-turn breadcrumb only after this read.
+            ctx.mark_queue_subscription_cancelled(2);
+            let following = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 4);
+            ctx.bind_queue_subscription(4, "q");
+            let second_read = following.await;
+
+            if immediate {
+                assert_eq!((first_read.as_str(), second_read.as_str()), ("first", "second"));
+            } else {
+                // The canceled loser made the first read skip index zero. Re-indexing
+                // cannot undo a resolved subscription, so index one is then read twice.
+                assert_eq!((first_read.as_str(), second_read.as_str()), ("second", "second"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod system_stats_tests {
     use super::*;
 

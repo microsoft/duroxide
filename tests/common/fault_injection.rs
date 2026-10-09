@@ -40,6 +40,14 @@ pub struct PoisonInjectingProvider {
     orchestration_skip_count: AtomicU32,
     /// Skip this many activity fetches before injecting (0 = immediate)
     activity_skip_count: AtomicU32,
+    fail_orchestration_abandon: AtomicBool,
+    failed_abandon_calls: AtomicU32,
+    fail_next_orchestration_ack: AtomicBool,
+    failure_commit_collision_notifications: AtomicU32,
+    collision_notices: std::sync::Mutex<Vec<(u64, u64)>>,
+    successful_ignored_abandons: AtomicU32,
+    counted_abandon_delays: std::sync::Mutex<Vec<Duration>>,
+    orchestration_fetches: std::sync::Mutex<Vec<(String, String, u32)>>,
 }
 
 impl PoisonInjectingProvider {
@@ -52,6 +60,14 @@ impl PoisonInjectingProvider {
             activity_injection_persistent: AtomicBool::new(false),
             orchestration_skip_count: AtomicU32::new(0),
             activity_skip_count: AtomicU32::new(0),
+            fail_orchestration_abandon: AtomicBool::new(false),
+            failed_abandon_calls: AtomicU32::new(0),
+            fail_next_orchestration_ack: AtomicBool::new(false),
+            failure_commit_collision_notifications: AtomicU32::new(0),
+            collision_notices: std::sync::Mutex::new(Vec::new()),
+            successful_ignored_abandons: AtomicU32::new(0),
+            counted_abandon_delays: std::sync::Mutex::new(Vec::new()),
+            orchestration_fetches: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -109,6 +125,49 @@ impl PoisonInjectingProvider {
         self.activity_injection_persistent.store(false, Ordering::SeqCst);
         self.orchestration_skip_count.store(0, Ordering::SeqCst);
         self.activity_skip_count.store(0, Ordering::SeqCst);
+        self.fail_orchestration_abandon.store(false, Ordering::SeqCst);
+    }
+
+    pub fn fail_orchestration_abandon_persistently(&self) {
+        self.failed_abandon_calls.store(0, Ordering::SeqCst);
+        self.fail_orchestration_abandon.store(true, Ordering::SeqCst);
+    }
+
+    pub fn failed_abandon_calls(&self) -> u32 {
+        self.failed_abandon_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn fail_next_orchestration_ack(&self) {
+        self.fail_next_orchestration_ack.store(true, Ordering::SeqCst);
+    }
+
+    pub fn failure_commit_collision_notifications(&self) -> u32 {
+        self.failure_commit_collision_notifications.load(Ordering::SeqCst)
+    }
+
+    /// (parent_id, parent_execution_id) of every committed `SubOrchFailed`.
+    pub fn collision_notices(&self) -> Vec<(u64, u64)> {
+        self.collision_notices.lock().expect("notices lock").clone()
+    }
+
+    pub fn successful_ignored_abandons(&self) -> u32 {
+        self.successful_ignored_abandons.load(Ordering::SeqCst)
+    }
+
+    /// (lock token, real attempt count) of every orchestration fetch that returned `instance`.
+    pub fn orchestration_fetches(&self, instance: &str) -> Vec<(String, u32)> {
+        self.orchestration_fetches
+            .lock()
+            .expect("fetches lock")
+            .iter()
+            .filter(|(fetched, _, _)| fetched == instance)
+            .map(|(_, lock, attempt)| (lock.clone(), *attempt))
+            .collect()
+    }
+
+    /// Delays of successful orchestration abandons that kept their attempt (`ignore_attempt = false`).
+    pub fn counted_abandon_delays(&self) -> Vec<Duration> {
+        self.counted_abandon_delays.lock().expect("delays lock").clone()
     }
 }
 
@@ -126,6 +185,11 @@ impl Provider for PoisonInjectingProvider {
             .await?;
 
         if let Some((item, lock_token, real_attempt_count)) = result {
+            self.orchestration_fetches.lock().expect("fetches lock").push((
+                item.instance.clone(),
+                lock_token.clone(),
+                real_attempt_count,
+            ));
             // Check if we need to skip this fetch
             let skip = self.orchestration_skip_count.load(Ordering::SeqCst);
             if skip > 0 {
@@ -189,6 +253,34 @@ impl Provider for PoisonInjectingProvider {
         metadata: ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
+        if self.fail_next_orchestration_ack.swap(false, Ordering::SeqCst) {
+            return Err(ProviderError::permanent(
+                "ack_orchestration_item",
+                "injected permanent turn-ack failure",
+            ));
+        }
+        let collision_count = if history_delta
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::OrchestrationFailed { .. }))
+        {
+            orchestrator_items
+                .iter()
+                .filter(|w| matches!(w, WorkItem::SubOrchFailed { .. }))
+                .count() as u32
+        } else {
+            0
+        };
+        let notices: Vec<(u64, u64)> = orchestrator_items
+            .iter()
+            .filter_map(|w| match w {
+                WorkItem::SubOrchFailed {
+                    parent_id,
+                    parent_execution_id,
+                    ..
+                } => Some((*parent_id, *parent_execution_id)),
+                _ => None,
+            })
+            .collect();
         self.inner
             .ack_orchestration_item(
                 lock_token,
@@ -199,7 +291,11 @@ impl Provider for PoisonInjectingProvider {
                 metadata,
                 cancelled_activities,
             )
-            .await
+            .await?;
+        self.failure_commit_collision_notifications
+            .fetch_add(collision_count, Ordering::SeqCst);
+        self.collision_notices.lock().expect("notices lock").extend(notices);
+        Ok(())
     }
 
     async fn abandon_orchestration_item(
@@ -208,9 +304,27 @@ impl Provider for PoisonInjectingProvider {
         delay: Option<Duration>,
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
-        self.inner
+        if self.fail_orchestration_abandon.load(Ordering::SeqCst) {
+            self.failed_abandon_calls.fetch_add(1, Ordering::SeqCst);
+            return Err(ProviderError::retryable(
+                "abandon_orchestration_item",
+                "injected persistent abandon failure",
+            ));
+        }
+        let result = self
+            .inner
             .abandon_orchestration_item(lock_token, delay, ignore_attempt)
-            .await
+            .await;
+        if ignore_attempt && result.is_ok() {
+            self.successful_ignored_abandons.fetch_add(1, Ordering::SeqCst);
+        }
+        if !ignore_attempt
+            && result.is_ok()
+            && let Some(delay) = delay
+        {
+            self.counted_abandon_delays.lock().expect("delays lock").push(delay);
+        }
+        result
     }
 
     async fn ack_work_item(&self, token: &str, completion: Option<WorkItem>) -> Result<(), ProviderError> {
