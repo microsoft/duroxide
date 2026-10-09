@@ -307,8 +307,8 @@ impl HistoryManager {
     /// terminated, we delete the worker queue entries for any in-flight activities to signal
     /// to the worker that the activity has been cancelled.
     pub fn compute_inflight_activities(&self, instance: &str, execution_id: u64) -> Vec<ScheduledActivityIdentifier> {
-        // Collect all scheduled activity event IDs
-        let scheduled: std::collections::HashSet<u64> = self
+        // Collect all scheduled activity event IDs (ordered, so cancellations are deterministic)
+        let scheduled: std::collections::BTreeSet<u64> = self
             .full_history_iter()
             .filter_map(|e| {
                 if matches!(&e.kind, EventKind::ActivityScheduled { .. }) {
@@ -320,7 +320,7 @@ impl HistoryManager {
             .collect();
 
         // Collect all completed/failed activity source_event_ids (the ActivityScheduled event_id they reference)
-        let completed: std::collections::HashSet<u64> = self
+        let completed: std::collections::BTreeSet<u64> = self
             .full_history_iter()
             .filter_map(|e| {
                 if matches!(

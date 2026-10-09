@@ -1634,6 +1634,12 @@ pub enum CompletionResult {
     ExternalData(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RaceCancellationPolicy {
+    Legacy,
+    V0131,
+}
+
 #[derive(Debug)]
 struct CtxInner {
     /// Whether we're currently replaying history (true) or processing new events (false).
@@ -1690,6 +1696,8 @@ struct CtxInner {
     cancelled_tokens: std::collections::HashSet<u64>,
     /// Cancelled token -> ScheduleKind mapping (for determining cancellation action)
     cancelled_token_kinds: std::collections::HashMap<u64, ScheduleKind>,
+    /// Shared execution-pinned queue, positional-wait, and CAN cancellation policy.
+    race_cancellation_policy: RaceCancellationPolicy,
 
     // Execution metadata
     execution_id: u64,
@@ -1752,6 +1760,7 @@ impl CtxInner {
             // Cancellation tracking
             cancelled_tokens: Default::default(),
             cancelled_token_kinds: Default::default(),
+            race_cancellation_policy: RaceCancellationPolicy::Legacy,
 
             // Execution metadata
             execution_id,
@@ -1792,6 +1801,14 @@ impl CtxInner {
     /// Bind a token to a schedule_id (called by replay engine when matching action to history).
     fn bind_token(&mut self, token: u64, schedule_id: u64) {
         self.token_bindings.insert(token, schedule_id);
+        if self.race_cancellation_policy == RaceCancellationPolicy::V0131
+            && matches!(
+                self.cancelled_token_kinds.get(&token),
+                Some(ScheduleKind::QueueDequeue { .. })
+            )
+        {
+            self.mark_queue_subscription_cancelled(schedule_id);
+        }
     }
 
     /// Get the schedule_id bound to a token (returns None if not yet bound).
@@ -1929,7 +1946,9 @@ impl CtxInner {
 
         // Our arrival index is exactly the number of active (non-cancelled)
         // subscriptions for this name that were created before us.
-        // This guarantees strict FIFO matching regardless of poll order.
+        // A held older subscription still reserves its position. Cancelling it
+        // after a newer one resolved can reindex later reads; that pattern is a
+        // separate known limitation of this matching model.
         let arrival_index: usize = self
             .queue_subscriptions
             .iter()
@@ -1960,6 +1979,7 @@ impl CtxInner {
                 ids.push(schedule_id);
             }
         }
+        ids.sort_unstable();
         ids
     }
 
@@ -1992,6 +2012,14 @@ impl CtxInner {
 
     /// Mark a token as cancelled (called by DurableFuture::drop).
     fn mark_token_cancelled(&mut self, token: u64, kind: ScheduleKind) {
+        // Matching must honor a dropped queue or positional wait before the
+        // next poll, not only when its later history breadcrumb is replayed.
+        if self.race_cancellation_policy == RaceCancellationPolicy::V0131
+            && let Some(schedule_id) = self.get_bound_schedule_id(token)
+            && matches!(kind, ScheduleKind::QueueDequeue { .. })
+        {
+            self.mark_queue_subscription_cancelled(schedule_id);
+        }
         self.cancelled_tokens.insert(token);
         self.cancelled_token_kinds.insert(token, kind);
     }
@@ -2007,6 +2035,7 @@ impl CtxInner {
                 ids.push(schedule_id);
             }
         }
+        ids.sort_unstable();
         ids
     }
 
@@ -2021,6 +2050,7 @@ impl CtxInner {
                 ids.push(schedule_id);
             }
         }
+        ids.sort_unstable();
         ids
     }
 
@@ -2041,6 +2071,7 @@ impl CtxInner {
                 // If not in mapping, the action wasn't bound yet - nothing to cancel
             }
         }
+        cancels.sort_by_key(|(id, _)| *id);
         cancels
     }
 
@@ -2498,6 +2529,10 @@ impl OrchestrationContext {
     /// Mark a token as cancelled (called by DurableFuture::drop).
     pub(crate) fn mark_token_cancelled(&self, token: u64, kind: &ScheduleKind) {
         self.inner.lock().unwrap().mark_token_cancelled(token, kind.clone());
+    }
+
+    pub(crate) fn set_race_cancellation_policy(&self, policy: RaceCancellationPolicy) {
+        self.inner.lock().unwrap().race_cancellation_policy = policy;
     }
 
     /// Get cancelled activity schedule_ids for this turn.

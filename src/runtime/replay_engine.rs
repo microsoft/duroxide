@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{debug, warn};
 
+/// This version must not be released without the queue, positional and CAN cutover.
+pub(crate) const RACE_CANCELLATION_FIX_SINCE: semver::Version = semver::Version::new(0, 1, 31);
+
 /// Result of executing an orchestration turn
 #[derive(Debug)]
 pub enum TurnResult {
@@ -545,6 +548,23 @@ impl ReplayEngine {
             orchestration_version.clone(),
             Some(worker_id.to_string()),
         );
+
+        // This must be pinned for the whole execution, including its new turns.
+        // Applying the fix to old decisions can change a recorded race winner.
+        let race_cancellation_policy = match semver::Version::parse(&working_history[0].duroxide_version) {
+            Ok(version) if version >= RACE_CANCELLATION_FIX_SINCE => crate::RaceCancellationPolicy::V0131,
+            Ok(_) => crate::RaceCancellationPolicy::Legacy,
+            Err(error) => {
+                warn!(
+                    instance = %self.instance,
+                    version = %working_history[0].duroxide_version,
+                    %error,
+                    "Invalid pinned version; retaining legacy race cancellation semantics"
+                );
+                crate::RaceCancellationPolicy::Legacy
+            }
+        };
+        ctx.set_race_cancellation_policy(race_cancellation_policy);
 
         // Seed KV state from provider snapshot before orchestration code runs.
         if !self.kv_snapshot.is_empty() {
