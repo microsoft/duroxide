@@ -467,7 +467,7 @@ pub type OrchestrationHandlerRef = Arc<dyn runtime::OrchestrationHandler>;
 /// this discriminator to determine how to cancel the underlying work:
 /// - **Activity**: Lock stealing via provider (DELETE from worker_queue)
 /// - **Timer**: No-op (virtual construct, no external state)
-/// - **ExternalWait**: No-op (virtual construct, no external state)  
+/// - **ExternalWait**: Cancel the positional slot (virtual, no provider operation)
 /// - **SubOrchestration**: Enqueue `CancelInstance` work item for child
 #[derive(Debug, Clone)]
 pub enum ScheduleKind {
@@ -503,7 +503,8 @@ pub enum ScheduleKind {
 ///
 /// - **Activities**: Lock stealing via provider (removes from worker queue)
 /// - **Sub-orchestrations**: `CancelInstance` work item enqueued for child
-/// - **Timers/External waits**: No-op (virtual constructs with no external state)
+/// - **Timers**: No provider operation (virtual construct)
+/// - **External waits**: Cancel their positional slot under the execution-pinned policy
 ///
 /// # Examples
 ///
@@ -1804,7 +1805,8 @@ impl CtxInner {
         std::mem::take(&mut self.emitted_actions)
     }
 
-    /// Bind a token to a schedule_id (called by replay engine when matching action to history).
+    /// Bind a token to a schedule_id when matching an action to history.
+    /// A recorded queue drop is applied at bind only under V0131; contexts default to Legacy.
     fn bind_token(&mut self, token: u64, schedule_id: u64) {
         self.token_bindings.insert(token, schedule_id);
         if self.race_cancellation_policy == RaceCancellationPolicy::V0131
@@ -3718,9 +3720,13 @@ impl OrchestrationContext {
 
     /// Subscribe to an external event and return a cancellation-aware future.
     ///
-    /// External waits are virtual constructs - dropping the future is a no-op since
-    /// there's no external state to cancel. However, wrapping in `DurableFuture`
-    /// maintains API consistency.
+    /// Dropping an unresolved wait cancels its positional slot. For executions
+    /// stamped 0.1.31+, cancellation is immediate and a value already assigned
+    /// to the dropped slot is discarded. A signal is accepted only while a bound,
+    /// open wait for its name exists: one that arrives after a wait is dropped and
+    /// before its replacement is bound is dropped as early (`docs/external-events.md`).
+    /// Earlier executions retain legacy timing.
+    /// No provider-side cancellation operation is needed for this virtual wait.
     pub fn schedule_wait(&self, name: impl Into<String>) -> DurableFuture<String> {
         let name: String = name.into();
 
@@ -3765,10 +3771,11 @@ impl OrchestrationContext {
     /// Dequeue the next message from a named queue (FIFO mailbox semantics).
     ///
     /// Unlike `schedule_wait`, queued events use FIFO matching:
-    /// - No positional pairing — any unresolved subscription gets the first unmatched arrival
-    /// - Cancelled subscriptions are skipped (don't consume arrivals)
+    /// - Bound subscriptions reserve FIFO positions, including held, unpolled futures
+    /// - Under the 0.1.31 policy, cancellation releases the held reservation without consuming it
     /// - Events that arrive before a subscription are buffered until consumed
-    /// - Events survive `continue_as_new` boundaries (carried forward)
+    /// - At most 100 unread arrivals survive `continue_as_new`, in arrival order across names;
+    ///   excess newer unread arrivals are dropped with a warning
     ///
     /// The caller enqueues messages with [`Client::enqueue_event`].
     pub fn dequeue_event(&self, queue: impl Into<String>) -> DurableFuture<String> {

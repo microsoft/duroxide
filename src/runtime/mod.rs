@@ -277,10 +277,12 @@ pub struct RuntimeOptions {
     /// Set this to change the range for advanced scenarios:
     /// - **Narrowing:** Restrict a node to only process a specific version band
     ///   (e.g., `>=1.0.0, <=1.9.999` in a mixed-version cluster).
-    /// - **Widening to drain stuck items:** Set a wide range like `>=0.0.0, <=99.0.0`
-    ///   to fetch orchestrations pinned at any version. Items with unknown event types
-    ///   will fail at provider-level deserialization (never reaching the replay engine)
-    ///   and remain in the queue with escalating `attempt_count`.
+    /// - **Widening:** Requires semantic compatibility, not only successful event
+    ///   deserialization. Versions can change replay policy without changing event
+    ///   types. Do not admit stamps newer than this build. In particular, never
+    ///   widen a pre-0.1.31 runtime beyond 0.1.30 while 0.1.31+ executions exist:
+    ///   it cannot reproduce their queue, signal or carry-forward policy.
+    ///   The override is not clamped to this build; operators own that boundary.
     ///
     /// Default: `None` (uses `>=0.0.0, <=CURRENT_BUILD_VERSION`)
     pub supported_replay_versions: Option<crate::providers::SemverRange>,
