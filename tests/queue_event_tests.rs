@@ -14,6 +14,95 @@ use duroxide::{ActivityContext, OrchestrationContext, OrchestrationRegistry};
 mod common;
 use std::time::Duration;
 
+#[tokio::test]
+async fn immediate_0131_queue_race_replays_same_batch_after_restart() {
+    use duroxide::Event;
+    use duroxide::providers::{ExecutionMetadata, WorkItem};
+
+    let (store, _td) = common::create_sqlite_store_disk().await;
+    let instance = "queue-race-restart";
+    common::seed_instance_with_pinned_version(store.as_ref(), instance, "QueueRace", semver::Version::new(0, 1, 31))
+        .await;
+
+    // Persist a 0.1.31 live turn that timed out, then consumed "first" using a new
+    // subscription, before recording the losing subscription's cancellation.
+    let event = |id, source, kind| Event::with_event_id(id, instance, 1, source, kind);
+    common::seed_history_turn(
+        store.as_ref(),
+        WorkItem::QueueMessage {
+            instance: instance.into(),
+            name: "q".into(),
+            data: "first".into(),
+        },
+        1,
+        vec![
+            event(2, None, EventKind::QueueSubscribed { name: "q".into() }),
+            event(3, None, EventKind::TimerCreated { fire_at_ms: 1000 }),
+            event(4, Some(3), EventKind::TimerFired { fire_at_ms: 1000 }),
+            event(
+                5,
+                None,
+                EventKind::QueueEventDelivered {
+                    name: "q".into(),
+                    data: "first".into(),
+                },
+            ),
+            event(6, None, EventKind::QueueSubscribed { name: "q".into() }),
+            event(7, None, EventKind::TimerCreated { fire_at_ms: 1000 }),
+            event(8, None, EventKind::QueueSubscribed { name: "q".into() }),
+            event(9, None, EventKind::TimerCreated { fire_at_ms: 1000 }),
+            event(
+                10,
+                Some(2),
+                EventKind::QueueSubscriptionCancelled {
+                    reason: "dropped_future".into(),
+                },
+            ),
+        ],
+        vec![],
+        ExecutionMetadata::default(),
+    )
+    .await;
+
+    let orchestration = |ctx: OrchestrationContext, _: String| async move {
+        let mut messages = Vec::new();
+        let mut timers = 0;
+        while messages.len() < 2 {
+            match ctx
+                .select2(ctx.dequeue_event("q"), ctx.schedule_timer(Duration::from_millis(20)))
+                .await
+            {
+                Either2::First(message) => messages.push(message),
+                Either2::Second(()) => timers += 1,
+            }
+        }
+        Ok(format!("{timers}:{}", messages.join(",")))
+    };
+    let rt = runtime::Runtime::start_with_options(
+        store.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder()
+            .register("QueueRace", orchestration)
+            .build(),
+        runtime::RuntimeOptions {
+            dispatcher_min_poll_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = Client::new(store);
+    client.enqueue_event(instance, "q", "second").await.unwrap();
+    let status = client
+        .wait_for_orchestration(instance, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&status, runtime::OrchestrationStatus::Completed { output, .. } if output == "1:first,second"),
+        "Expected deterministic FIFO replay after restart, got {status:?}"
+    );
+    rt.shutdown(None).await;
+}
+
 /// Basic persistent event delivery: raise then subscribe.
 #[tokio::test]
 async fn persistent_event_basic_delivery() {
@@ -1268,5 +1357,91 @@ async fn events_enqueued_before_start_orchestration_are_dropped() {
         other => panic!("Expected Completed, got: {other:?}"),
     }
 
+    rt.shutdown(None).await;
+}
+
+/// The exact unread list is still capped at 100 at continue-as-new: the oldest 100
+/// arrivals survive in cross-name arrival order, and only the overflow is dropped with
+/// a warning.
+#[tokio::test]
+async fn continue_as_new_carries_the_oldest_100_unread_arrivals_across_names() {
+    let (logs, _guard) = common::tracing_capture::install_tracing_capture();
+    let (store, _td) = common::create_sqlite_store_disk().await;
+    let orch = |ctx: OrchestrationContext, _: String| async move {
+        if ctx.execution_id() == 1 {
+            // Hold the execution open while queue messages arrive unread.
+            ctx.schedule_wait("go").await;
+            return ctx.continue_as_new("next").await;
+        }
+        Ok("done".to_string())
+    };
+    let rt = runtime::Runtime::start_with_options(
+        store.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder().register("CarryCap", orch).build(),
+        runtime::RuntimeOptions {
+            dispatcher_min_poll_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = Client::new(store.clone());
+    for total in [100usize, 101] {
+        let instance = format!("carry-cap-{total}");
+        client.start_orchestration(&instance, "CarryCap", "").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let history = store.read_with_execution(&instance, 1).await.unwrap_or_default();
+                if history
+                    .iter()
+                    .any(|e| matches!(&e.kind, EventKind::ExternalSubscribed { name } if name == "go"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the wait must be bound before the signal is raised");
+        let sent: Vec<(String, String)> = (0..total)
+            .map(|i| {
+                let name = if i % 2 == 0 { "a" } else { "b" };
+                (name.to_string(), format!("{name}{i}"))
+            })
+            .collect();
+        for (name, data) in &sent {
+            client.enqueue_event(&instance, name, data).await.unwrap();
+        }
+        logs.lock().unwrap().clear();
+        client.raise_event(&instance, "go", "").await.unwrap();
+        let status = client
+            .wait_for_orchestration(&instance, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&status, runtime::OrchestrationStatus::Completed { output, .. } if output == "done"),
+            "{status:?}"
+        );
+        let successor = store.read_with_execution(&instance, 2).await.unwrap();
+        let carried = successor
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestrationStarted {
+                    carry_forward_events, ..
+                } => Some(carry_forward_events.clone().unwrap_or_default()),
+                _ => None,
+            })
+            .expect("successor start");
+        assert_eq!(carried, sent[..total.min(100)].to_vec(), "{total} unread arrivals");
+        let dropped: Vec<String> = logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.message.contains("Dropping carry-forward event beyond limit"))
+            .filter_map(|e| e.field("data"))
+            .collect();
+        let expected: Vec<String> = sent[total.min(100)..].iter().map(|(_, data)| data.clone()).collect();
+        assert_eq!(dropped, expected, "only the overflow is dropped with a warning");
+    }
     rt.shutdown(None).await;
 }

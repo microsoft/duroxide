@@ -467,7 +467,7 @@ pub type OrchestrationHandlerRef = Arc<dyn runtime::OrchestrationHandler>;
 /// this discriminator to determine how to cancel the underlying work:
 /// - **Activity**: Lock stealing via provider (DELETE from worker_queue)
 /// - **Timer**: No-op (virtual construct, no external state)
-/// - **ExternalWait**: No-op (virtual construct, no external state)  
+/// - **ExternalWait**: Cancel the positional slot (virtual, no provider operation)
 /// - **SubOrchestration**: Enqueue `CancelInstance` work item for child
 #[derive(Debug, Clone)]
 pub enum ScheduleKind {
@@ -503,7 +503,8 @@ pub enum ScheduleKind {
 ///
 /// - **Activities**: Lock stealing via provider (removes from worker queue)
 /// - **Sub-orchestrations**: `CancelInstance` work item enqueued for child
-/// - **Timers/External waits**: No-op (virtual constructs with no external state)
+/// - **Timers**: No provider operation (virtual construct)
+/// - **External waits**: Cancel their positional slot under the execution-pinned policy
 ///
 /// # Examples
 ///
@@ -1634,6 +1635,12 @@ pub enum CompletionResult {
     ExternalData(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RaceCancellationPolicy {
+    Legacy,
+    V0131,
+}
+
 #[derive(Debug)]
 struct CtxInner {
     /// Whether we're currently replaying history (true) or processing new events (false).
@@ -1666,6 +1673,10 @@ struct CtxInner {
     queue_subscriptions: Vec<(u64, String)>,
     /// Persistent arrivals: name -> list of payloads in arrival order
     queue_arrivals: std::collections::HashMap<String, Vec<String>>,
+    /// History arrival order across names as (name, per-name position), plus the
+    /// per-name positions actually returned. Payloads stay in `queue_arrivals`.
+    queue_arrival_order: Vec<(String, usize)>,
+    queue_consumed_positions: std::collections::HashSet<(String, usize)>,
     /// Persistent subscriptions that have been cancelled (dropped without completing)
     queue_cancelled_subscriptions: std::collections::HashSet<u64>,
     /// Persistent subscriptions that have already been resolved (consumed an arrival)
@@ -1690,6 +1701,8 @@ struct CtxInner {
     cancelled_tokens: std::collections::HashSet<u64>,
     /// Cancelled token -> ScheduleKind mapping (for determining cancellation action)
     cancelled_token_kinds: std::collections::HashMap<u64, ScheduleKind>,
+    /// Shared execution-pinned queue, positional-wait, and CAN cancellation policy.
+    race_cancellation_policy: RaceCancellationPolicy,
 
     // Execution metadata
     execution_id: u64,
@@ -1739,6 +1752,8 @@ impl CtxInner {
             external_cancelled_subscriptions: Default::default(),
             queue_subscriptions: Default::default(),
             queue_arrivals: Default::default(),
+            queue_arrival_order: Default::default(),
+            queue_consumed_positions: Default::default(),
             queue_cancelled_subscriptions: Default::default(),
             queue_resolved_subscriptions: Default::default(),
             #[cfg(feature = "replay-version-test")]
@@ -1752,6 +1767,7 @@ impl CtxInner {
             // Cancellation tracking
             cancelled_tokens: Default::default(),
             cancelled_token_kinds: Default::default(),
+            race_cancellation_policy: RaceCancellationPolicy::Legacy,
 
             // Execution metadata
             execution_id,
@@ -1789,9 +1805,18 @@ impl CtxInner {
         std::mem::take(&mut self.emitted_actions)
     }
 
-    /// Bind a token to a schedule_id (called by replay engine when matching action to history).
+    /// Bind a token to a schedule_id when matching an action to history.
+    /// A recorded queue drop is applied at bind only under V0131; contexts default to Legacy.
     fn bind_token(&mut self, token: u64, schedule_id: u64) {
         self.token_bindings.insert(token, schedule_id);
+        if self.race_cancellation_policy == RaceCancellationPolicy::V0131
+            && matches!(
+                self.cancelled_token_kinds.get(&token),
+                Some(ScheduleKind::QueueDequeue { .. })
+            )
+        {
+            self.mark_queue_subscription_cancelled(schedule_id);
+        }
     }
 
     /// Get the schedule_id bound to a token (returns None if not yet bound).
@@ -1854,10 +1879,17 @@ impl CtxInner {
     /// Uses compressed (effective) indices that skip cancelled subscriptions:
     /// effective_index = raw_index - count_of_cancelled_subscriptions_with_lower_raw_index
     ///
-    /// Stale events are prevented from entering the arrival list by the causal
-    /// check in the replay loop (`has_pending_subscription_slot`), so the
-    /// arrival array only contains events that have a matching active slot.
+    /// The replay loop admits signals only for bound active slots.
+    /// New-policy cancellation also removes
+    /// an accepted value assigned to a dropped, unresolved slot.
     fn get_external_event(&self, schedule_id: u64) -> Option<&String> {
+        let (name, _) = self.external_subscriptions.get(&schedule_id)?;
+        let effective_index = self.external_arrival_index(schedule_id)?;
+        let arrivals = self.external_arrivals.get(name)?;
+        arrivals.get(effective_index)
+    }
+
+    fn external_arrival_index(&self, schedule_id: u64) -> Option<usize> {
         let (name, subscription_index) = self.external_subscriptions.get(&schedule_id)?;
 
         // If this subscription is cancelled, it never resolves
@@ -1868,23 +1900,29 @@ impl CtxInner {
         // Count cancelled subscriptions for this name with a lower raw index
         let cancelled_below = self
             .external_subscriptions
-            .values()
-            .filter(|(n, idx)| n == name && *idx < *subscription_index)
-            .filter(|(_, idx)| {
-                // Check if this subscription's schedule_id is in the cancelled set
-                self.external_subscriptions
-                    .iter()
-                    .any(|(sid, (n, i))| n == name && i == idx && self.external_cancelled_subscriptions.contains(sid))
+            .iter()
+            .filter(|(sid, (n, idx))| {
+                n == name && *idx < *subscription_index && self.external_cancelled_subscriptions.contains(sid)
             })
             .count();
 
-        let effective_index = subscription_index - cancelled_below;
-        let arrivals = self.external_arrivals.get(name)?;
-        arrivals.get(effective_index)
+        Some(subscription_index - cancelled_below)
     }
 
     /// Mark an external subscription as cancelled.
     fn mark_external_subscription_cancelled(&mut self, schedule_id: u64) {
+        // Positional signals answer a specific active slot. If its future is
+        // dropped before observing an already-delivered value, discard that stale
+        // value instead of shifting it onto the replacement wait. Queue arrivals
+        // intentionally have different, persistent semantics.
+        if self.race_cancellation_policy == RaceCancellationPolicy::V0131
+            && let Some(index) = self.external_arrival_index(schedule_id)
+            && let Some((name, _)) = self.external_subscriptions.get(&schedule_id)
+            && let Some(arrivals) = self.external_arrivals.get_mut(name)
+            && index < arrivals.len()
+        {
+            arrivals.remove(index);
+        }
         self.external_cancelled_subscriptions.insert(schedule_id);
     }
 
@@ -1897,7 +1935,9 @@ impl CtxInner {
 
     /// Deliver a persistent external event (appends to arrival list for the name).
     fn deliver_queue_message(&mut self, name: String, data: String) {
-        self.queue_arrivals.entry(name).or_default().push(data);
+        let arrivals = self.queue_arrivals.entry(name.clone()).or_default();
+        self.queue_arrival_order.push((name, arrivals.len()));
+        arrivals.push(data);
     }
 
     /// Mark a persistent subscription as cancelled (dropped without completing).
@@ -1929,7 +1969,9 @@ impl CtxInner {
 
         // Our arrival index is exactly the number of active (non-cancelled)
         // subscriptions for this name that were created before us.
-        // This guarantees strict FIFO matching regardless of poll order.
+        // A held older subscription still reserves its position. Cancelling it
+        // after a newer one resolved can reindex later reads; that pattern is a
+        // separate known limitation of this matching model.
         let arrival_index: usize = self
             .queue_subscriptions
             .iter()
@@ -1943,6 +1985,7 @@ impl CtxInner {
         if arrival_index < arrivals.len() {
             // Mark as resolved
             self.queue_resolved_subscriptions.insert(schedule_id);
+            self.queue_consumed_positions.insert((name, arrival_index));
             Some(arrivals[arrival_index].clone())
         } else {
             None
@@ -1960,6 +2003,7 @@ impl CtxInner {
                 ids.push(schedule_id);
             }
         }
+        ids.sort_unstable();
         ids
     }
 
@@ -1992,6 +2036,17 @@ impl CtxInner {
 
     /// Mark a token as cancelled (called by DurableFuture::drop).
     fn mark_token_cancelled(&mut self, token: u64, kind: ScheduleKind) {
+        // Matching must honor a dropped queue or positional wait before the
+        // next poll, not only when its later history breadcrumb is replayed.
+        if self.race_cancellation_policy == RaceCancellationPolicy::V0131
+            && let Some(schedule_id) = self.get_bound_schedule_id(token)
+        {
+            match &kind {
+                ScheduleKind::QueueDequeue { .. } => self.mark_queue_subscription_cancelled(schedule_id),
+                ScheduleKind::ExternalWait { .. } => self.mark_external_subscription_cancelled(schedule_id),
+                _ => {}
+            }
+        }
         self.cancelled_tokens.insert(token);
         self.cancelled_token_kinds.insert(token, kind);
     }
@@ -2007,6 +2062,7 @@ impl CtxInner {
                 ids.push(schedule_id);
             }
         }
+        ids.sort_unstable();
         ids
     }
 
@@ -2021,6 +2077,7 @@ impl CtxInner {
                 ids.push(schedule_id);
             }
         }
+        ids.sort_unstable();
         ids
     }
 
@@ -2041,6 +2098,7 @@ impl CtxInner {
                 // If not in mapping, the action wasn't bound yet - nothing to cancel
             }
         }
+        cancels.sort_by_key(|(id, _)| *id);
         cancels
     }
 
@@ -2498,6 +2556,32 @@ impl OrchestrationContext {
     /// Mark a token as cancelled (called by DurableFuture::drop).
     pub(crate) fn mark_token_cancelled(&self, token: u64, kind: &ScheduleKind) {
         self.inner.lock().unwrap().mark_token_cancelled(token, kind.clone());
+    }
+
+    pub(crate) fn set_race_cancellation_policy(&self, policy: RaceCancellationPolicy) {
+        self.inner.lock().unwrap().race_cancellation_policy = policy;
+    }
+
+    pub(crate) fn race_cancellation_fix_enabled(&self) -> bool {
+        self.inner.lock().unwrap().race_cancellation_policy == RaceCancellationPolicy::V0131
+    }
+
+    pub(crate) fn unconsumed_queue_arrivals(&self) -> Vec<(String, String)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .queue_arrival_order
+            .iter()
+            .filter(|position| !inner.queue_consumed_positions.contains(*position))
+            .map(|(name, index)| {
+                // Arrival vectors are append-only, so a recorded position always exists.
+                let data = inner
+                    .queue_arrivals
+                    .get(name)
+                    .and_then(|arrivals| arrivals.get(*index))
+                    .expect("queue arrival order must reference a recorded arrival");
+                (name.clone(), data.clone())
+            })
+            .collect()
     }
 
     /// Get cancelled activity schedule_ids for this turn.
@@ -3358,7 +3442,10 @@ impl OrchestrationContext {
     ///
     /// Pure read from in-memory state — no provider call, no event emitted.
     pub fn get_kv_all_keys(&self) -> Vec<String> {
-        self.inner.lock().unwrap().kv_state.keys().cloned().collect()
+        let mut keys: Vec<String> = self.inner.lock().unwrap().kv_state.keys().cloned().collect();
+        // Key order, not HashMap order: callers may emit actions per key.
+        keys.sort_unstable();
+        keys
     }
 
     /// Return the number of KV entries.
@@ -3409,7 +3496,7 @@ impl OrchestrationContext {
     ///
     /// Returns the number of keys cleared.
     pub fn prune_kv_values_updated_before(&self, updated_before_ms: u64) -> usize {
-        let keys_to_clear: Vec<String> = {
+        let mut keys_to_clear: Vec<String> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .kv_metadata
@@ -3419,6 +3506,8 @@ impl OrchestrationContext {
                 .map(|(key, _)| key.clone())
                 .collect()
         };
+        // Key order, not HashMap order, so every replay emits the same clears.
+        keys_to_clear.sort_unstable();
         let count = keys_to_clear.len();
         for key in keys_to_clear {
             self.clear_kv_value(key);
@@ -3636,9 +3725,13 @@ impl OrchestrationContext {
 
     /// Subscribe to an external event and return a cancellation-aware future.
     ///
-    /// External waits are virtual constructs - dropping the future is a no-op since
-    /// there's no external state to cancel. However, wrapping in `DurableFuture`
-    /// maintains API consistency.
+    /// Dropping an unresolved wait cancels its positional slot. For executions
+    /// stamped 0.1.31+, cancellation is immediate and a value already assigned
+    /// to the dropped slot is discarded. A signal is accepted only while a bound,
+    /// open wait for its name exists: one that arrives after a wait is dropped and
+    /// before its replacement is bound is dropped as early (`docs/external-events.md`).
+    /// Earlier executions retain legacy timing.
+    /// No provider-side cancellation operation is needed for this virtual wait.
     pub fn schedule_wait(&self, name: impl Into<String>) -> DurableFuture<String> {
         let name: String = name.into();
 
@@ -3683,10 +3776,11 @@ impl OrchestrationContext {
     /// Dequeue the next message from a named queue (FIFO mailbox semantics).
     ///
     /// Unlike `schedule_wait`, queued events use FIFO matching:
-    /// - No positional pairing — any unresolved subscription gets the first unmatched arrival
-    /// - Cancelled subscriptions are skipped (don't consume arrivals)
+    /// - Bound subscriptions reserve FIFO positions, including held, unpolled futures
+    /// - Under the 0.1.31 policy, cancellation releases the held reservation without consuming it
     /// - Events that arrive before a subscription are buffered until consumed
-    /// - Events survive `continue_as_new` boundaries (carried forward)
+    /// - At most 100 unread arrivals survive `continue_as_new`, in arrival order across names;
+    ///   excess newer unread arrivals are dropped with a warning
     ///
     /// The caller enqueues messages with [`Client::enqueue_event`].
     pub fn dequeue_event(&self, queue: impl Into<String>) -> DurableFuture<String> {
@@ -4059,6 +4153,215 @@ impl OrchestrationContext {
         F3: Future<Output = T3>,
     {
         combinators::Select3::new(f1, f2, f3).await
+    }
+}
+
+#[cfg(test)]
+mod queue_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn context_defaults_to_legacy_until_the_engine_pins_a_policy() {
+        let ctx = OrchestrationContext::new(Vec::new(), 1, "default".into(), "Test".into(), "1.0.0".into(), None);
+        assert!(!ctx.race_cancellation_fix_enabled());
+    }
+
+    #[test]
+    fn current_build_covers_the_queue_cancellation_semantic_threshold() {
+        let threshold = crate::runtime::replay_engine::RACE_CANCELLATION_FIX_SINCE.clone();
+        assert!(crate::providers::current_build_version() >= threshold);
+    }
+
+    #[test]
+    fn dropping_already_resolved_dequeue_never_cancels_its_consumed_slot() {
+        for immediate in [false, true] {
+            let ctx = OrchestrationContext::new(
+                Vec::new(),
+                1,
+                "resolved".into(),
+                "resolved".into(),
+                "1.0.0".into(),
+                None,
+            );
+            ctx.set_race_cancellation_policy(if immediate {
+                RaceCancellationPolicy::V0131
+            } else {
+                RaceCancellationPolicy::Legacy
+            });
+            ctx.deliver_queue_message("q".into(), "first".into());
+            ctx.deliver_queue_message("q".into(), "second".into());
+            let mut first = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 2);
+            ctx.bind_queue_subscription(2, "q");
+            let waker = std::task::Waker::noop();
+            let mut task = std::task::Context::from_waker(waker);
+            assert_eq!(
+                std::pin::Pin::new(&mut first).poll(&mut task),
+                Poll::Ready("first".into())
+            );
+            assert!(first.completed);
+            drop(first);
+            assert!(ctx.get_cancelled_queue_ids().is_empty());
+            assert!(!ctx.inner.lock().unwrap().queue_cancelled_subscriptions.contains(&2));
+            let mut second = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 3);
+            ctx.bind_queue_subscription(3, "q");
+            assert_eq!(
+                std::pin::Pin::new(&mut second).poll(&mut task),
+                Poll::Ready("second".into())
+            );
+            drop(second);
+            assert!(ctx.get_cancelled_queue_ids().is_empty());
+        }
+    }
+
+    #[test]
+    fn dropping_already_resolved_wait_never_cancels_its_slot() {
+        let waker = std::task::Waker::noop();
+        let mut task = std::task::Context::from_waker(waker);
+        for immediate in [false, true] {
+            let ctx = OrchestrationContext::new(
+                Vec::new(),
+                1,
+                "resolved".into(),
+                "resolved".into(),
+                "1.0.0".into(),
+                None,
+            );
+            ctx.set_race_cancellation_policy(if immediate {
+                RaceCancellationPolicy::V0131
+            } else {
+                RaceCancellationPolicy::Legacy
+            });
+            let mut first = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 2);
+            ctx.bind_external_subscription(2, "s");
+            ctx.deliver_external_event("s".into(), "first".into());
+            assert_eq!(
+                std::pin::Pin::new(&mut first).poll(&mut task),
+                Poll::Ready("first".into())
+            );
+            assert!(first.completed);
+            drop(first);
+            assert!(ctx.get_cancelled_external_wait_ids().is_empty());
+            assert!(!ctx.inner.lock().unwrap().external_cancelled_subscriptions.contains(&2));
+            let mut second = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 3);
+            ctx.bind_external_subscription(3, "s");
+            ctx.deliver_external_event("s".into(), "second".into());
+            assert_eq!(
+                std::pin::Pin::new(&mut second).poll(&mut task),
+                Poll::Ready("second".into()),
+                "the resolved wait's value must stay consumed, not shift onto the next wait"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_an_unresolved_middle_wait_discards_only_its_own_value() {
+        let waker = std::task::Waker::noop();
+        let mut task = std::task::Context::from_waker(waker);
+        let ctx = OrchestrationContext::new(Vec::new(), 1, "middle".into(), "middle".into(), "1.0.0".into(), None);
+        ctx.set_race_cancellation_policy(RaceCancellationPolicy::V0131);
+        let mut waits = Vec::new();
+        for id in [2, 3, 4] {
+            let wait = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, id);
+            ctx.bind_external_subscription(id, "s");
+            waits.push(wait);
+        }
+        let mut last = waits.pop().expect("third wait");
+        let middle = waits.pop().expect("second wait");
+        let mut first = waits.pop().expect("first wait");
+        ctx.deliver_external_event("s".into(), "a".into());
+        ctx.deliver_external_event("s".into(), "b".into());
+        assert_eq!(std::pin::Pin::new(&mut first).poll(&mut task), Poll::Ready("a".into()));
+        drop(first);
+        // "b" was accepted into the middle slot; dropping that wait discards it.
+        drop(middle);
+        assert_eq!(ctx.get_cancelled_external_wait_ids(), vec![3]);
+        assert_eq!(std::pin::Pin::new(&mut last).poll(&mut task), Poll::Pending);
+        ctx.deliver_external_event("s".into(), "c".into());
+        assert_eq!(std::pin::Pin::new(&mut last).poll(&mut task), Poll::Ready("c".into()));
+    }
+
+    #[test]
+    fn dropping_a_bound_wait_lets_the_next_bound_wait_take_a_later_signal() {
+        let waker = std::task::Waker::noop();
+        let mut task = std::task::Context::from_waker(waker);
+        for immediate in [false, true] {
+            let ctx = OrchestrationContext::new(Vec::new(), 1, "next".into(), "next".into(), "1.0.0".into(), None);
+            ctx.set_race_cancellation_policy(if immediate {
+                RaceCancellationPolicy::V0131
+            } else {
+                RaceCancellationPolicy::Legacy
+            });
+            let first = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 2);
+            ctx.bind_external_subscription(2, "s");
+            let mut second = ctx.schedule_wait("s");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 3);
+            ctx.bind_external_subscription(3, "s");
+            drop(first);
+            ctx.deliver_external_event("s".into(), "a".into());
+            let read = std::pin::Pin::new(&mut second).poll(&mut task);
+            if immediate {
+                // "a" arrived after the first wait was dropped: it answers the open wait.
+                assert_eq!(read, Poll::Ready("a".into()));
+            } else {
+                // Legacy keeps the dropped wait's slot until its cancellation row.
+                assert_eq!(read, Poll::Pending);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn context_fifo_reads_characterize_delayed_and_immediate_cancellation() {
+        for immediate in [false, true] {
+            let ctx = OrchestrationContext::new(Vec::new(), 1, "fifo".into(), "fifo".into(), "1.0.0".into(), None);
+            ctx.set_race_cancellation_policy(if immediate {
+                RaceCancellationPolicy::V0131
+            } else {
+                RaceCancellationPolicy::Legacy
+            });
+
+            let loser = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 2);
+            ctx.bind_queue_subscription(2, "q");
+            drop(loser);
+
+            ctx.deliver_queue_message("q".into(), "first".into());
+            ctx.deliver_queue_message("q".into(), "second".into());
+            let next = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 3);
+            ctx.bind_queue_subscription(3, "q");
+            let first_read = next.await;
+
+            // Legacy replay reaches the end-of-turn breadcrumb only after this read.
+            ctx.mark_queue_subscription_cancelled(2);
+            let following = ctx.dequeue_event("q");
+            let token = ctx.drain_emitted_actions()[0].0;
+            ctx.bind_token(token, 4);
+            ctx.bind_queue_subscription(4, "q");
+            let second_read = following.await;
+
+            if immediate {
+                assert_eq!((first_read.as_str(), second_read.as_str()), ("first", "second"));
+            } else {
+                // The canceled loser made the first read skip index zero. Re-indexing
+                // cannot undo a resolved subscription, so index one is then read twice.
+                assert_eq!((first_read.as_str(), second_read.as_str()), ("second", "second"));
+            }
+        }
     }
 }
 

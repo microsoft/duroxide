@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Continue-as-new admission window** - A CAN-terminal fetch that cannot
+  yet see the successor's start no longer acknowledges instance-scoped inputs.
+  Queue messages, positional signals and cancellation requests are abandoned
+  with the unregistered-handler backoff (`unregistered_backoff`, 1 s doubling
+  to 60 s by default), keeping the attempt, until the start is visible. Their
+  order relative to later arrivals is best effort, as for any delayed abandon.
+  If the abandon fails, the lease expires and the inputs are fetched again.
+  A start that never becomes visible (for example one deleted by an unpatched
+  worker) ends in poison after `max_attempts`, about five minutes with the
+  defaults, instead of an endless wait.
+  A successor failure recorded after CAN makes the instance terminal, so later
+  inputs are acknowledged rather than waiting for a start already consumed.
+  Stale completions for the previous execution wait with the other inputs and
+  the successor discards them. This dispatcher correction is
+  not version-gated and changes no existing recorded replay decision.
+  All orchestration workers must be patched to close the ingestion window
+  in a mixed deployment.
+  A CAN start now takes priority over a duplicate client start regardless of
+  batch order. Duplicate starts cannot replace a running instance's pinned
+  handler name, version or input. A colliding sub-orchestration start now
+  fails its parent when the target is still running, not only when it is
+  finished; a running instance's own parent re-sending the same call (with a
+  known parent execution id) is still ignored.
+
+- **KV key order** - `prune_kv_values_updated_before` clears keys in key order and
+  `get_kv_all_keys` returns them in key order, instead of `HashMap` order that
+  differed between replays (`nondeterministic: kv clear mismatch`, #57). Replay
+  accepts a run of `KeyValueCleared` rows in any order, so histories recorded by
+  older runtimes still replay.
+
+- **SQLite abandon affects only the locked rows** - `abandon_orchestration_item`
+  now undoes the attempt increment and applies its delay only to the rows that
+  fetch locked, matching PostgreSQL and the provider contract. Before, it
+  updated every visible row of the instance, so a delayed abandon could hide a
+  continue-as-new start that became visible after the fetch, repeatedly while
+  inputs kept arriving. New provider validation:
+  `orchestration_delayed_abandon_preserves_unlocked_rows`.
+
+- **Shared race cancellation cutover** - Positional waits now cancel at drop
+  and discard stale signals assigned to a dropped slot. Continue-as-new
+  carries exact unread arrival positions, including held and non-prefix
+  dequeues.
+  Positional signals require a bound open slot. Same-batch signals applied
+  before a replacement is bound are dropped as early, even if that wait was
+  emitted by an earlier poll. This retains the documented early-event contract.
+  These corrections share the 0.1.31 execution threshold with the queue fix.
+  Activity/child terminal cleanup and cancellation validation are unchanged by
+  this continue-as-new path.
+  Dropped-future and terminal activity cancellations are now written in ID
+  order within each type, for every execution. Replay compares them as sets,
+  so recorded histories are unaffected.
+  Earlier executions preserve their original policy, including known defects.
+  Version 0.1.31 is reserved and must never be published without these fixes;
+  the subsequent release PR may use 0.1.32 and retains the same threshold.
+
+- **Queued-event race replay** - Dropping an unresolved dequeue now
+  excludes its subscription from FIFO matching immediately, including when the
+  token has not yet been bound. A timer followed by a queue message in the same
+  turn replays the covered immediate-replacement race shapes consistently.
+  Creation-versus-poll ordering, cancellation of an older dequeue after a newer
+  one resolved, and poll-on-demand gaps remain separate known limitations.
+  The behavior is pinned by the execution's `OrchestrationStarted` core version:
+  executions started before 0.1.31 retain legacy cancellation semantics, and
+  executions started by 0.1.31 or later use the fix. Existing executions switch
+  only when a new execution is started by a runtime at or above the threshold,
+  including continue-as-new. This avoids
+  changing race winners in otherwise valid old histories.
+  The doc-hidden `bind_token` helper now applies a previously recorded dequeue
+  drop when binding its token to a queue schedule only under V0131; contexts
+  default to Legacy.
+
+### Changed
+
+- The public `TurnResult::ContinueAsNew` variant now includes
+  `unconsumed_queue_arrivals`. External code constructing or exhaustively
+  matching this variant must add the field or use `..` in its match.
+  This is a Rust source-compatibility change, not a persisted event-format change.
+
 ## [0.1.30] - 2026-07-29
 
 **Release:** <https://crates.io/crates/duroxide/0.1.30>
@@ -1237,4 +1317,3 @@ return ctx.continue_as_new(input).await;
 - OpenTelemetry metrics and structured logging
 - Provider validation test suite
 - Comprehensive documentation
-

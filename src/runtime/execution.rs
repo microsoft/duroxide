@@ -297,11 +297,17 @@ impl Runtime {
 
                 Err(details.display_message())
             }
-            TurnResult::ContinueAsNew { input, version } => {
+            TurnResult::ContinueAsNew {
+                input,
+                version,
+                unconsumed_queue_arrivals,
+            } => {
                 // Carry forward unmatched persistent events to the new execution.
                 // MUST be called BEFORE emit_terminal_cancellation_breadcrumbs, which appends
                 // QueueSubscriptionCancelled events that would confuse the matching.
-                let mut unmatched = Self::collect_unmatched_queue_messages(history_mgr.full_history_iter(), instance);
+                let mut unmatched = unconsumed_queue_arrivals.unwrap_or_else(|| {
+                    Self::collect_unmatched_queue_messages(history_mgr.full_history_iter(), instance)
+                });
 
                 // Emit cancellation breadcrumbs BEFORE the terminal event.
                 // Terminal events (Completed/Failed/CAN) must be the last event in history.

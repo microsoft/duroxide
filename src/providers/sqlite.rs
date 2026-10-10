@@ -2216,47 +2216,37 @@ impl Provider for SqliteProvider {
             .await
             .map_err(|e| Self::sqlx_to_provider_error("abandon_orchestration_item", e))?;
 
-        // Get instance_id from lock before removing it
-        let instance_id: Option<String> =
-            sqlx::query_scalar("SELECT instance_id FROM instance_locks WHERE lock_token = ?")
-                .bind(lock_token)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| Self::sqlx_to_provider_error("abandon_orchestration_item", e))?;
-
-        let Some(instance_id) = instance_id else {
-            return Err(ProviderError::permanent(
-                "abandon_orchestration_item",
-                "Invalid lock token",
-            ));
-        };
-
-        // Remove instance lock
-        sqlx::query("DELETE FROM instance_locks WHERE lock_token = ?")
+        // Remove the instance lock; an unknown token is rejected
+        let removed = sqlx::query("DELETE FROM instance_locks WHERE lock_token = ?")
             .bind(lock_token)
             .execute(&mut *tx)
             .await
             .map_err(|e| Self::sqlx_to_provider_error("abandon_orchestration_item", e))?;
-
-        // If ignore_attempt is true, decrement attempt_count on orchestrator_queue messages
-        if ignore_attempt {
-            sqlx::query(
-                "UPDATE orchestrator_queue SET attempt_count = MAX(0, attempt_count - 1) WHERE instance_id = ?",
-            )
-            .bind(&instance_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("abandon_orchestration_item", e))?;
+        if removed.rows_affected() == 0 {
+            return Err(ProviderError::permanent(
+                "abandon_orchestration_item",
+                "Invalid lock token",
+            ));
         }
 
-        // Optionally delay messages for this instance
+        // Restore only attempts incremented by this fetch, not hidden starts or
+        // other instance rows that were never part of the locked batch.
+        if ignore_attempt {
+            sqlx::query("UPDATE orchestrator_queue SET attempt_count = MAX(0, attempt_count - 1) WHERE lock_token = ?")
+                .bind(lock_token)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Self::sqlx_to_provider_error("abandon_orchestration_item", e))?;
+        }
+
+        // Optionally delay only the messages this fetch locked. Rows that became visible
+        // after the fetch (for example a continue-as-new start) keep their visibility.
         if let Some(delay) = delay {
             let delay_ms = delay.as_millis().min(i64::MAX as u128) as i64;
             let visible_at = Self::now_millis().saturating_add(delay_ms);
-            sqlx::query("UPDATE orchestrator_queue SET visible_at = ? WHERE instance_id = ? AND visible_at <= ?")
+            sqlx::query("UPDATE orchestrator_queue SET visible_at = ? WHERE lock_token = ?")
                 .bind(visible_at)
-                .bind(&instance_id)
-                .bind(Self::now_millis())
+                .bind(lock_token)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Self::sqlx_to_provider_error("abandon_orchestration_item", e))?;

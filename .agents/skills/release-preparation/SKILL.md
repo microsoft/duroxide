@@ -27,6 +27,12 @@ Never:
 
 ## Required Input
 
+Version 0.1.31 is reserved for the race-cancellation semantic cutover. Do not
+prepare a 0.1.31+ release or hotfix from an older branch without all queue,
+positional-wait and exact continue-as-new carry-forward fixes. The subsequent
+release PR uses 0.1.32; never change the semantic threshold to that release
+number. See the reservation in `RELEASE_POLICY.md`.
+
 Obtain the target semantic version from the user. Do not choose a major, minor,
 or patch bump without confirmation.
 

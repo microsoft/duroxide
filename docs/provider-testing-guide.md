@@ -378,6 +378,20 @@ File SQLite          2/2        281        0          100.00     25.98          
 
 ## Provider Validation Tests
 
+The `provider_validations::race_replay` module covers queue FIFO/replay,
+positional live-turn recording and replay, exact queue carry-forward across
+continue-as-new, fetch-path stamp preservation and a legacy-discriminating
+runtime decision. Wrap every public test function for your provider. These
+validate provider behavior; positional contract choices live in engine tests.
+The CAN admission checks additionally cover two predecessor stamps with a
+delayed successor start, mixed stale completions, positional signals, instance
+cancellation, and malformed future completions. Include the duplicate-start,
+unregistered-backoff and pinned-handler wrappers. A duplicate client start must
+not hide a CAN wake or change an existing execution's handler version or input.
+Also wrap `poison_message::orchestration_ignore_attempt_preserves_hidden_start`
+and `poison_message::orchestration_delayed_abandon_preserves_unlocked_rows`:
+an abandon's attempt undo and delay must touch only the rows that fetch locked.
+
 Duroxide includes a comprehensive suite of validation tests that validate provider behavior. These tests verify critical correctness properties like atomicity, locking, error handling, queue semantics, and management capabilities.
 
 ### Quick Start
@@ -1089,4 +1103,3 @@ This generates `stress-test-results.md` with:
 ---
 
 **With this guide, you can thoroughly test your custom Duroxide provider!** 🎉
-

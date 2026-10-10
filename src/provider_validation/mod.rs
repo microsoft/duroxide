@@ -41,6 +41,8 @@ pub mod prune;
 #[cfg(feature = "provider-test")]
 pub mod queue_semantics;
 #[cfg(feature = "provider-test")]
+pub mod race_replay;
+#[cfg(feature = "provider-test")]
 pub mod sessions;
 #[cfg(feature = "provider-test")]
 pub mod tag_filtering;
