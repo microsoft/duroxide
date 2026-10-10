@@ -280,6 +280,139 @@ pub async fn test_continue_as_new_unregistered_backoff<F: ProviderFactory>(facto
     );
 }
 
+/// A poisoned continue-as-new successor is committed as its own execution: the
+/// poison ack creates execution 2 with a start row and the failure, and execution 1
+/// still ends in ContinuedAsNew.
+pub async fn test_continue_as_new_poisoned_successor_is_own_execution<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+    let instance = "provider-can-poisoned-successor";
+    provider
+        .enqueue_for_orchestrator(start_item(instance), None)
+        .await
+        .expect("seed start");
+    let (_, lock, _) = provider
+        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+        .await
+        .expect("seed fetch")
+        .expect("visible seed");
+    provider
+        .ack_orchestration_item(
+            &lock,
+            1,
+            vec![
+                Event::with_event_id(
+                    1,
+                    instance,
+                    1,
+                    None,
+                    EventKind::OrchestrationStarted {
+                        name: "PoisonedSuccessor".into(),
+                        version: "1.0.0".into(),
+                        input: "old".into(),
+                        parent_instance: None,
+                        parent_id: None,
+                        parent_execution_id: None,
+                        carry_forward_events: None,
+                        initial_custom_status: None,
+                    },
+                ),
+                Event::with_event_id(
+                    2,
+                    instance,
+                    1,
+                    None,
+                    EventKind::OrchestrationContinuedAsNew { input: "next".into() },
+                ),
+            ],
+            vec![],
+            vec![WorkItem::ContinueAsNew {
+                instance: instance.into(),
+                orchestration: "PoisonedSuccessor".into(),
+                input: "next".into(),
+                version: Some("1.0.0".into()),
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
+                carry_forward_events: vec![],
+                initial_custom_status: None,
+            }],
+            ExecutionMetadata {
+                status: Some("ContinuedAsNew".into()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("seed terminal and successor atomically");
+    // No handler is registered, so the successor's batch is poisoned after one attempt.
+    let runtime = Runtime::start_with_options(
+        provider.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder().build(),
+        RuntimeOptions {
+            max_attempts: 1,
+            orchestration_concurrency: 1,
+            dispatcher_min_poll_interval: Duration::from_millis(10),
+            unregistered_backoff: crate::runtime::UnregisteredBackoffConfig {
+                base_delay: Duration::from_millis(20),
+                max_delay: Duration::from_millis(20),
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = Client::new(provider.clone());
+    let result = client.wait_for_orchestration(instance, Duration::from_secs(10)).await;
+    client.enqueue_event(instance, "q", "late").await.expect("late input");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    runtime.shutdown(None).await;
+    assert!(matches!(
+        result.expect("poison must end the successor"),
+        OrchestrationStatus::Failed {
+            details: crate::ErrorDetails::Poison { .. },
+            ..
+        }
+    ));
+    let previous = provider
+        .read_with_execution(instance, 1)
+        .await
+        .expect("previous execution");
+    assert!(matches!(
+        previous.last().map(|e| &e.kind),
+        Some(EventKind::OrchestrationContinuedAsNew { .. })
+    ));
+    let successor = provider.read(instance).await.expect("latest execution");
+    assert_eq!(
+        successor,
+        provider
+            .read_with_execution(instance, 2)
+            .await
+            .expect("successor execution"),
+        "the poisoned successor must be the latest execution"
+    );
+    let kinds: Vec<&EventKind> = successor.iter().map(|e| &e.kind).collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                EventKind::OrchestrationStarted { .. },
+                EventKind::OrchestrationFailed {
+                    details: crate::ErrorDetails::Poison { .. }
+                }
+            ]
+        ),
+        "successor history: {successor:?}"
+    );
+    assert!(
+        provider
+            .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+            .await
+            .expect("inspect after runtime stopped")
+            .is_none(),
+        "a late input to the failed successor is acknowledged, not left waiting"
+    );
+}
+
 /// A duplicate start must not replace the durable CAN successor, even when it
 /// precedes that successor in queue order. A colliding parent must be notified.
 pub async fn test_continue_as_new_duplicate_start<F: ProviderFactory>(factory: &F) {

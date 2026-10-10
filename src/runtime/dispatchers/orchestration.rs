@@ -589,7 +589,8 @@ impl Runtime {
         // Extract metadata from history and work items
         let temp_history_mgr = HistoryManager::from_history(&item.history);
         let workitem_reader = WorkItemReader::from_messages(&item.messages, &temp_history_mgr, instance);
-        // The poison path records a CAN successor's failure after the CAN row.
+        // Runtimes before 0.1.31 poisoned a successor into the previous execution, after its
+        // CAN row. That instance is terminal.
         let terminal_after_can = temp_history_mgr.is_continued_as_new
             && item
                 .history
@@ -1256,12 +1257,21 @@ impl Runtime {
         lock_token: &str,
         attempt_count: u32,
     ) {
+        // Between executions the batch belongs to the successor, which has no history yet.
+        // It fails as its own execution, so the previous one still ends in ContinuedAsNew.
+        let latest = HistoryManager::from_history(&item.history);
+        let successor = latest.is_continued_as_new;
+        let execution_id = if successor {
+            item.execution_id + 1
+        } else {
+            item.execution_id
+        };
         let error = crate::ErrorDetails::Poison {
             attempt_count,
             max_attempts: self.options.max_attempts,
             message_type: crate::PoisonMessageType::Orchestration {
                 instance: item.instance.clone(),
-                execution_id: item.execution_id,
+                execution_id,
             },
             message: serde_json::to_string(&item.messages).unwrap_or_default(),
         };
@@ -1324,7 +1334,7 @@ impl Runtime {
         }
 
         // Create failure event and commit
-        let mut history_mgr = HistoryManager::from_history(&item.history);
+        let mut history_mgr = HistoryManager::from_history(if successor { &[] } else { &item.history });
 
         // Track parent info for sub-orchestration failure notification
         let mut parent_link: Option<(String, Option<u64>, u64)> = None;
@@ -1336,6 +1346,7 @@ impl Runtime {
                 item.messages
                     .iter()
                     .find_map(|msg| match msg {
+                        // A successor starts only from its CAN start, never from a duplicate.
                         WorkItem::StartOrchestration {
                             orchestration,
                             input,
@@ -1343,7 +1354,7 @@ impl Runtime {
                             parent_id,
                             parent_execution_id,
                             ..
-                        } => Some((
+                        } if !successor => Some((
                             orchestration.clone(),
                             input.clone(),
                             parent_instance.clone(),
@@ -1372,7 +1383,17 @@ impl Runtime {
                         )),
                         _ => None,
                     })
-                    .unwrap_or_else(|| (item.orchestration_name.clone(), String::new(), None, None, None, None));
+                    // A successor whose start is missing keeps the previous execution's parent.
+                    .unwrap_or_else(|| {
+                        (
+                            item.orchestration_name.clone(),
+                            String::new(),
+                            latest.parent_instance.clone(),
+                            latest.parent_id,
+                            latest.parent_execution_id,
+                            None,
+                        )
+                    });
 
             // Save parent link for notification
             if let (Some(pi), Some(pid)) = (&parent_instance, parent_id) {
@@ -1382,7 +1403,7 @@ impl Runtime {
             history_mgr.append(Event::with_event_id(
                 crate::INITIAL_EVENT_ID,
                 &item.instance,
-                item.execution_id,
+                execution_id,
                 None,
                 EventKind::OrchestrationStarted {
                     name: orchestration_name,
@@ -1411,7 +1432,7 @@ impl Runtime {
             }
         }
 
-        history_mgr.append_failed(&item.instance, item.execution_id, error.clone());
+        history_mgr.append_failed(&item.instance, execution_id, error.clone());
 
         let metadata = ExecutionMetadata {
             status: Some("Failed".to_string()),
@@ -1447,7 +1468,7 @@ impl Runtime {
         let _ = self
             .ack_orchestration_with_changes(
                 lock_token,
-                item.execution_id,
+                execution_id,
                 history_mgr.delta().to_vec(),
                 vec![],
                 orchestrator_items,

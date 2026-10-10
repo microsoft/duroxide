@@ -19,8 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A start that never becomes visible (for example one deleted by an unpatched
   worker) ends in poison after `max_attempts`, about five minutes with the
   defaults, instead of an endless wait.
-  A successor failure recorded after CAN makes the instance terminal, so later
-  inputs are acknowledged rather than waiting for a start already consumed.
+  A poisoned successor is recorded as its own failed execution (a start row and
+  the failure), so the previous execution still ends in CAN. A history written
+  by an earlier runtime, with the failure after the CAN row, is still terminal,
+  so later inputs are acknowledged rather than waiting for a start already
+  consumed.
   Stale completions for the previous execution wait with the other inputs and
   the successor discards them. This dispatcher correction is
   not version-gated and changes no existing recorded replay decision.

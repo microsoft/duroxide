@@ -257,6 +257,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continue_as_new_poisoned_successor_is_own_execution() {
+        duroxide::provider_validations::race_replay::test_continue_as_new_poisoned_successor_is_own_execution(
+            &SqliteTestFactory,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn duplicate_start_preserves_pinned_handler() {
         duroxide::provider_validations::race_replay::test_duplicate_start_preserves_pinned_handler(&SqliteTestFactory)
             .await;

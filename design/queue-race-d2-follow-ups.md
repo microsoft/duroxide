@@ -9,4 +9,4 @@ These items are not part of the queue-race fix and are tracked separately.
 | Dropped abandon futures | Await the pre-existing dropped `abandon_orchestration_item` futures, or remove them intentionally. |
 | Collision on poison | Notify a colliding start's parent when the same batch is consumed by poison handling. |
 | Schedule lookup | Replace the O(n) schedule-to-token lookup with a reverse map. |
-| Successor first-turn failure | Record a continue-as-new successor's first-turn failure and poison in execution N+1 with a valid start/history shape, not in execution N. |
+| Successor first-turn commit failure | When a successor's first-turn commit fails, the infrastructure-failure path still builds its failure from the previous execution's history and commits it under the successor's execution id (related to #58). Poison already records the successor as its own execution. |

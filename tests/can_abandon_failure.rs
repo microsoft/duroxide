@@ -58,6 +58,11 @@ async fn successor_first_turn_must_obey_poison_budget() {
         ),
         "CAN successor first-turn attempts must not be exempt from poison"
     );
+    let successor = assert_successor_failed_as_own_execution(provider.as_ref(), "CAN-first-turn-poison").await;
+    assert!(
+        matches!(&successor[0].kind, EventKind::OrchestrationStarted { input, .. } if input == "next"),
+        "the successor's start comes from its CAN start: {successor:?}"
+    );
     assert_late_inputs_are_drained(&client, provider.as_ref(), &runtime, "CAN-first-turn-poison").await;
 }
 
@@ -68,16 +73,6 @@ async fn assert_late_inputs_are_drained(
     instance: &str,
 ) {
     let before = provider.read(instance).await.expect("poisoned history");
-    assert!(
-        before
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::OrchestrationContinuedAsNew { .. }))
-    );
-    assert!(
-        before
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::OrchestrationFailed { .. }))
-    );
     client.enqueue_event(instance, "q", "late").await.expect("late queue");
     client
         .raise_event(instance, "signal", "late")
@@ -137,6 +132,7 @@ async fn unregistered_can_successor_poison_must_drain_late_inputs() {
             ..
         }
     ));
+    assert_successor_failed_as_own_execution(provider.as_ref(), instance).await;
     assert_late_inputs_are_drained(&client, provider.as_ref(), &runtime, instance).await;
 }
 
@@ -400,23 +396,265 @@ async fn missing_can_start_poisons_waiting_inputs_after_max_attempts() {
         max_attempts as usize,
         "each waiting fetch up to max_attempts defers with a counted attempt"
     );
-    let history = provider
+    assert_successor_failed_as_own_execution(provider.as_ref(), instance).await;
+    // The failed successor is terminal: later inputs are drained, not deferred forever.
+    assert_late_inputs_are_drained(&client, provider.as_ref(), &runtime, instance).await;
+}
+
+#[tokio::test]
+async fn missing_can_start_fails_successor_with_previous_parent_not_a_duplicate_start() {
+    let sqlite = Arc::new(SqliteProvider::new_in_memory().await.expect("store"));
+    let provider = Arc::new(PoisonInjectingProvider::new(sqlite));
+    let instance = "CAN-start-missing-child";
+    // The parent must exist: the provider links the child's instance row to it.
+    common::seed_history_turn(
+        provider.as_ref(),
+        WorkItem::StartOrchestration {
+            instance: "parent-orch".into(),
+            orchestration: "Parent".into(),
+            input: "".into(),
+            version: Some("1.0.0".into()),
+            execution_id: 1,
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
+        },
+        1,
+        vec![Event::with_event_id(
+            1,
+            "parent-orch",
+            1,
+            None,
+            EventKind::OrchestrationStarted {
+                name: "Parent".into(),
+                version: "1.0.0".into(),
+                input: "".into(),
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
+                carry_forward_events: None,
+                initial_custom_status: None,
+            },
+        )],
+        vec![],
+        ExecutionMetadata {
+            orchestration_name: Some("Parent".into()),
+            orchestration_version: Some("1.0.0".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    seed_can_execution(
+        provider.as_ref(),
+        instance,
+        "Transition",
+        Some(("parent-orch", 7)),
+        false,
+        late_input(instance),
+    )
+    .await;
+    // A duplicate client start waits with the input; it must not become the successor.
+    provider
+        .enqueue_for_orchestrator(
+            WorkItem::StartOrchestration {
+                instance: instance.into(),
+                orchestration: "Impostor".into(),
+                input: "duplicate".into(),
+                version: Some("1.0.0".into()),
+                execution_id: 1,
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("duplicate start");
+    let runtime = Runtime::start_with_options(
+        provider.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder().build(),
+        RuntimeOptions {
+            max_attempts: 1,
+            orchestration_concurrency: 1,
+            unregistered_backoff: UnregisteredBackoffConfig {
+                base_delay: Duration::from_millis(20),
+                max_delay: Duration::from_millis(20),
+            },
+            dispatcher_min_poll_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let result = Client::new(provider.clone())
+        .wait_for_orchestration(instance, Duration::from_secs(10))
+        .await
+        .expect("a missing start must end the wait");
+    runtime.shutdown(None).await;
+    assert!(matches!(
+        result,
+        OrchestrationStatus::Failed {
+            details: duroxide::ErrorDetails::Poison { .. },
+            ..
+        }
+    ));
+    let successor = assert_successor_failed_as_own_execution(provider.as_ref(), instance).await;
+    assert!(
+        matches!(
+            &successor[0].kind,
+            EventKind::OrchestrationStarted { name, parent_instance: Some(parent), parent_id: Some(7), .. }
+                if name == "Transition" && parent == "parent-orch"
+        ),
+        "the successor keeps the previous execution's name and parent, not the duplicate's: {successor:?}"
+    );
+}
+
+#[tokio::test]
+async fn poisoned_child_successor_fails_its_parent() {
+    let sqlite = Arc::new(SqliteProvider::new_in_memory().await.expect("store"));
+    let provider = Arc::new(PoisonInjectingProvider::new(sqlite));
+    let registry = OrchestrationRegistry::builder()
+        .register("Parent", |ctx: OrchestrationContext, _: String| async move {
+            ctx.schedule_sub_orchestration_with_id("Child", "poisoned-child", "")
+                .await
+        })
+        // The successor version is not registered, so its batch is poisoned.
+        .register_versioned("Child", "1.0.0", |ctx: OrchestrationContext, _: String| async move {
+            ctx.continue_as_new_versioned("9.9.9", "next").await
+        })
+        .build();
+    let runtime = Runtime::start_with_options(
+        provider.clone(),
+        ActivityRegistry::builder().build(),
+        registry,
+        RuntimeOptions {
+            max_attempts: 1,
+            orchestration_concurrency: 1,
+            unregistered_backoff: UnregisteredBackoffConfig {
+                base_delay: Duration::from_millis(20),
+                max_delay: Duration::from_millis(20),
+            },
+            dispatcher_min_poll_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = Client::new(provider.clone());
+    client
+        .start_orchestration("poisoned-child-parent", "Parent", "")
+        .await
+        .expect("start parent");
+    let result = client
+        .wait_for_orchestration("poisoned-child-parent", Duration::from_secs(10))
+        .await
+        .expect("the parent must hear about the poisoned child");
+    runtime.shutdown(None).await;
+    // A child's poison is a system error: it fails the parent with the child's details.
+    assert!(
+        matches!(
+            &result,
+            OrchestrationStatus::Failed {
+                details: duroxide::ErrorDetails::Poison {
+                    message_type: duroxide::PoisonMessageType::Orchestration { instance, execution_id: 2 },
+                    ..
+                },
+                ..
+            } if instance == "poisoned-child"
+        ),
+        "the parent must fail with the poison of the child's execution 2: {result:?}"
+    );
+    let successor = assert_successor_failed_as_own_execution(provider.as_ref(), "poisoned-child").await;
+    assert!(
+        matches!(
+            &successor[0].kind,
+            EventKind::OrchestrationStarted { parent_instance: Some(parent), .. } if parent == "poisoned-child-parent"
+        ),
+        "the child's execution 2 keeps its parent link: {successor:?}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_failure_after_can_stays_terminal() {
+    let sqlite = Arc::new(SqliteProvider::new_in_memory().await.expect("store"));
+    let provider = Arc::new(PoisonInjectingProvider::new(sqlite));
+    let instance = "CAN-legacy-poison";
+    // Runtimes before 0.1.31 recorded the successor's poison after the CAN row.
+    seed_can_execution(
+        provider.as_ref(),
+        instance,
+        "Transition",
+        None,
+        true,
+        late_input(instance),
+    )
+    .await;
+    let runtime = Runtime::start_with_options(
+        provider.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder().build(),
+        RuntimeOptions {
+            max_attempts: 3,
+            orchestration_concurrency: 1,
+            unregistered_backoff: UnregisteredBackoffConfig {
+                base_delay: Duration::from_millis(20),
+                max_delay: Duration::from_millis(20),
+            },
+            dispatcher_min_poll_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = Client::new(provider.clone());
+    assert_late_inputs_are_drained(&client, provider.as_ref(), &runtime, instance).await;
+    assert!(
+        provider.counted_abandon_delays().is_empty(),
+        "inputs of a terminal legacy instance are acknowledged, never deferred"
+    );
+    assert_eq!(
+        provider
+            .read_with_execution(instance, 1)
+            .await
+            .expect("legacy history")
+            .len(),
+        3
+    );
+}
+
+/// The previous execution still ends in ContinuedAsNew and the successor is its own
+/// execution: a start row and the poison failure.
+async fn assert_successor_failed_as_own_execution(provider: &PoisonInjectingProvider, instance: &str) -> Vec<Event> {
+    let previous = provider
         .read_with_execution(instance, 1)
         .await
-        .expect("poisoned history");
-    assert!(matches!(
-        history.last().map(|e| &e.kind),
-        Some(EventKind::OrchestrationFailed { .. })
-    ));
+        .expect("previous execution");
     assert!(
-        provider
-            .read_with_execution(instance, 2)
-            .await
-            .unwrap_or_default()
-            .is_empty()
+        matches!(
+            previous.last().map(|e| &e.kind),
+            Some(EventKind::OrchestrationContinuedAsNew { .. })
+        ),
+        "the previous execution must still end in ContinuedAsNew: {previous:?}"
     );
-    // Failed after CAN is terminal: later inputs are drained, not deferred forever.
-    assert_late_inputs_are_drained(&client, provider.as_ref(), &runtime, instance).await;
+    let successor = provider
+        .read_with_execution(instance, 2)
+        .await
+        .expect("successor execution");
+    let kinds: Vec<&EventKind> = successor.iter().map(|e| &e.kind).collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                EventKind::OrchestrationStarted { .. },
+                EventKind::OrchestrationFailed {
+                    details: duroxide::ErrorDetails::Poison {
+                        message_type: duroxide::PoisonMessageType::Orchestration { execution_id: 2, .. },
+                        ..
+                    }
+                }
+            ]
+        ),
+        "the successor must be a start row and its poison failure: {successor:?}"
+    );
+    successor
 }
 
 #[tokio::test]
@@ -578,6 +816,61 @@ fn late_input(instance: &str) -> WorkItem {
 }
 
 async fn seed_waiting_can(provider: &PoisonInjectingProvider, instance: &str, name: &str, waiting: WorkItem) {
+    seed_can_execution(provider, instance, name, None, false, waiting).await;
+}
+
+async fn seed_can_execution(
+    provider: &PoisonInjectingProvider,
+    instance: &str,
+    name: &str,
+    parent: Option<(&str, u64)>,
+    legacy_poison: bool,
+    waiting: WorkItem,
+) {
+    let mut events = vec![
+        Event::with_event_id(
+            1,
+            instance,
+            1,
+            None,
+            EventKind::OrchestrationStarted {
+                name: name.into(),
+                version: "1.0.0".into(),
+                input: "old".into(),
+                parent_instance: parent.map(|(p, _)| p.into()),
+                parent_id: parent.map(|(_, id)| id),
+                parent_execution_id: parent.map(|_| 1),
+                carry_forward_events: None,
+                initial_custom_status: None,
+            },
+        ),
+        Event::with_event_id(
+            2,
+            instance,
+            1,
+            None,
+            EventKind::OrchestrationContinuedAsNew { input: "next".into() },
+        ),
+    ];
+    if legacy_poison {
+        events.push(Event::with_event_id(
+            3,
+            instance,
+            1,
+            None,
+            EventKind::OrchestrationFailed {
+                details: duroxide::ErrorDetails::Poison {
+                    attempt_count: 11,
+                    max_attempts: 10,
+                    message_type: duroxide::PoisonMessageType::Orchestration {
+                        instance: instance.into(),
+                        execution_id: 1,
+                    },
+                    message: "[]".into(),
+                },
+            },
+        ));
+    }
     common::seed_history_turn(
         provider,
         WorkItem::StartOrchestration {
@@ -591,34 +884,10 @@ async fn seed_waiting_can(provider: &PoisonInjectingProvider, instance: &str, na
             parent_execution_id: None,
         },
         1,
-        vec![
-            Event::with_event_id(
-                1,
-                instance,
-                1,
-                None,
-                EventKind::OrchestrationStarted {
-                    name: name.into(),
-                    version: "1.0.0".into(),
-                    input: "old".into(),
-                    parent_instance: None,
-                    parent_id: None,
-                    parent_execution_id: None,
-                    carry_forward_events: None,
-                    initial_custom_status: None,
-                },
-            ),
-            Event::with_event_id(
-                2,
-                instance,
-                1,
-                None,
-                EventKind::OrchestrationContinuedAsNew { input: "next".into() },
-            ),
-        ],
+        events,
         vec![waiting],
         ExecutionMetadata {
-            status: Some("ContinuedAsNew".into()),
+            status: Some(if legacy_poison { "Failed" } else { "ContinuedAsNew" }.into()),
             ..Default::default()
         },
     )

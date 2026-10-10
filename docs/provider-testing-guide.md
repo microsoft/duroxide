@@ -386,7 +386,7 @@ validate provider behavior; positional contract choices live in engine tests.
 The CAN admission checks additionally cover two predecessor stamps with a
 delayed successor start, mixed stale completions, positional signals, instance
 cancellation, and malformed future completions. Include the duplicate-start,
-unregistered-backoff and pinned-handler wrappers. A duplicate client start must
+unregistered-backoff, poisoned-successor and pinned-handler wrappers. A duplicate client start must
 not hide a CAN wake or change an existing execution's handler version or input.
 Also wrap `poison_message::orchestration_ignore_attempt_preserves_hidden_start`
 and `poison_message::orchestration_delayed_abandon_preserves_unlocked_rows`:

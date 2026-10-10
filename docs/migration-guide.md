@@ -104,10 +104,11 @@ or still running. The exception is a running instance's own parent re-sending
 the same call (same parent instance, call id and a known, equal parent
 execution id), which is ignored as before.
 
-If the successor's first turn is poisoned, its failure can currently be
-recorded after CAN in the previous execution. This history is terminal:
-the poison transaction consumed the start, so later queue, signal and cancel
-inputs are acknowledged rather than deferred.
+If the successor's batch is poisoned, its failure is recorded as the
+successor's own execution: a start row and the failure. The previous execution
+still ends in CAN. Earlier runtimes recorded that failure after CAN in the
+previous execution; such a history is still terminal, so later queue, signal
+and cancel inputs are acknowledged rather than deferred.
 
 While a successor start stays hidden (for example behind an unregistered
 handler's backoff during a rolling upgrade), each waiting instance is fetched
