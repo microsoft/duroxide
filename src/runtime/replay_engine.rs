@@ -760,8 +760,16 @@ impl ReplayEngine {
                     ))));
                 }
             }
-            EventKind::KeyValueCleared { .. } => {
-                if let Some((_, action)) = emitted_actions.pop_front()
+            EventKind::KeyValueCleared { key } => {
+                // Older runtimes recorded a prune's clears in HashMap order. Clears of
+                // different keys commute, so match this one anywhere in the leading run.
+                if let Some(index) = emitted_actions
+                    .iter()
+                    .take_while(|(_, action)| matches!(action, crate::Action::ClearKeyValue { .. }))
+                    .position(|(_, action)| matches!(action, crate::Action::ClearKeyValue { key: k } if k == key))
+                {
+                    emitted_actions.remove(index);
+                } else if let Some((_, action)) = emitted_actions.pop_front()
                     && !action_matches_event_kind(&action, &event.kind)
                 {
                     return Err(TurnResult::Failed(nondeterminism_error(&format!(

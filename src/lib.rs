@@ -3442,7 +3442,10 @@ impl OrchestrationContext {
     ///
     /// Pure read from in-memory state — no provider call, no event emitted.
     pub fn get_kv_all_keys(&self) -> Vec<String> {
-        self.inner.lock().unwrap().kv_state.keys().cloned().collect()
+        let mut keys: Vec<String> = self.inner.lock().unwrap().kv_state.keys().cloned().collect();
+        // Key order, not HashMap order: callers may emit actions per key.
+        keys.sort_unstable();
+        keys
     }
 
     /// Return the number of KV entries.
@@ -3493,7 +3496,7 @@ impl OrchestrationContext {
     ///
     /// Returns the number of keys cleared.
     pub fn prune_kv_values_updated_before(&self, updated_before_ms: u64) -> usize {
-        let keys_to_clear: Vec<String> = {
+        let mut keys_to_clear: Vec<String> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .kv_metadata
@@ -3503,6 +3506,8 @@ impl OrchestrationContext {
                 .map(|(key, _)| key.clone())
                 .collect()
         };
+        // Key order, not HashMap order, so every replay emits the same clears.
+        keys_to_clear.sort_unstable();
         let count = keys_to_clear.len();
         for key in keys_to_clear {
             self.clear_kv_value(key);

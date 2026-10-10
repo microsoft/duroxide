@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finished; a running instance's own parent re-sending the same call (with a
   known parent execution id) is still ignored.
 
+- **KV key order** - `prune_kv_values_updated_before` clears keys in key order and
+  `get_kv_all_keys` returns them in key order, instead of `HashMap` order that
+  differed between replays (`nondeterministic: kv clear mismatch`, #57). Replay
+  accepts a run of `KeyValueCleared` rows in any order, so histories recorded by
+  older runtimes still replay.
+
 - **SQLite abandon affects only the locked rows** - `abandon_orchestration_item`
   now undoes the attempt increment and applies its delay only to the rows that
   fetch locked, matching PostgreSQL and the provider contract. Before, it
