@@ -288,52 +288,48 @@ ctx.continue_as_new_versioned("1.0.0", input).await
 
 ## Draining Stuck Orchestrations (Version Mismatch)
 
-After a major upgrade, some orchestrations may be pinned to an old duroxide version that no
-running node supports. These items sit in the queue indefinitely because the capability filter
-excludes them.
+An orchestration stays in the queue when no running node supports its pinned duroxide version.
+With the default range (`0.0.0` up to the node's own build version) every node supports all
+older versions, so stuck items are pinned to a version **newer** than every running node (for
+example after a runtime rollback), or the nodes run a narrowed range.
 
-To clear them, temporarily widen `supported_replay_versions` on one or more nodes:
+**Do not widen `supported_replay_versions` above the node's own build version.** History that
+deserializes is not necessarily replay-compatible. Duroxide 0.1.31 changed race-cancellation
+semantics without adding event types: a pre-0.1.31 node that admits a 0.1.31+ execution
+deserializes its history and replays it with the old rules, which can change recorded decisions
+(nondeterminism) or deliver a different message or signal.
+
+To clear the backlog:
+
+1. **Process the items on a compatible node.** Run at least one node whose build version is at
+   least the pinned version, with the default range.
+2. **Or abandon them explicitly.** Delete the affected instances through the client
+   (`delete_instance`, `delete_instance_bulk`; pass `force` for a running instance).
+   `cancel_instance` only queues a request that a compatible node must still process.
+3. **Restore a narrowed node** only down to older versions:
 
 ```rust
 let runtime = Runtime::builder()
     .with_provider(provider)
     .with_options(RuntimeOptions {
-        // Widen range to include all possible pinned versions
+        // Older versions only: the upper bound is this node's own build version.
         supported_replay_versions: Some(SemverRange::new(
             semver::Version::new(0, 0, 0),
-            semver::Version::new(99, 0, 0),
+            duroxide::providers::current_build_version(),
         )),
-        max_attempts: 5,
         ..Default::default()
     })
     .build()
     .await?;
 ```
 
-**What happens:**
-1. The wide range causes the provider filter to pass for all items, regardless of pinned version.
-2. The provider fetches the item and attempts to deserialize its history. If the history
-   contains unknown event types (from a newer duroxide version), deserialization fails at the
-   provider level with a permanent error. The item never reaches the runtime's replay engine.
-3. Each fetch cycle increments the item's `attempt_count`. The item remains in the queue with
-   repeated permanent errors, effectively preventing it from being processed.
-4. Items whose history deserializes successfully are processed normally by the replay engine.
-
-**After draining:** Revert `supported_replay_versions` to `None` (the default) or the
+**After draining:** revert `supported_replay_versions` to `None` (the default) or the
 appropriate range for your cluster.
 
-> **Note:** This approach is safe because items with truly incompatible history fail at
-> provider-level deserialization — they never reach the replay engine and are never silently
-> replayed with incorrect semantics. The items remain in the queue with escalating
-> `attempt_count` but are functionally drained (permanently erroring on every fetch).
-
-> **Current limitation:** The drain mechanism relies entirely on serde deserialization
-> failures for unknown `EventKind` variants. There is no runtime-level replay engine version
-> check — the `supported_replay_versions` range controls only which items are fetched, not
-> whether the replay engine can actually process them. If a future version introduces
-> semantic changes without adding new event types (i.e., history still deserializes but
-> replay behavior differs), the wide-range approach would not catch this. A built-in
-> replay-engine compatibility check may be added in a future phase.
+> **Limitation:** `supported_replay_versions` is not clamped to the build version; an override
+> replaces both the provider filter and the runtime-side check. Operators own that boundary.
+> Items whose history contains unknown event types still fail provider-level deserialization,
+> but that protects only against new event types, not against semantic changes such as 0.1.31.
 
 ---
 

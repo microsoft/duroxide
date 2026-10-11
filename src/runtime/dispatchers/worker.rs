@@ -702,7 +702,7 @@ async fn handle_activity_error(
 /// The poison message handling will eventually fail the activity if genuinely missing.
 async fn abandon_unregistered_activity(rt: &Arc<Runtime>, ctx: &ActivityWorkContext) {
     let backoff = rt.options.unregistered_backoff.delay(ctx.attempt_count);
-    let remaining_attempts = rt.options.max_attempts.saturating_sub(ctx.attempt_count);
+    let remaining_attempts = rt.options.attempts_until_poison(ctx.attempt_count);
 
     tracing::warn!(
         target: "duroxide::runtime",
@@ -966,6 +966,21 @@ async fn run_session_manager(rt: Arc<Runtime>, shutdown: Arc<std::sync::atomic::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attempts_until_poison_counts_the_poisoning_fetch() {
+        let options = crate::runtime::RuntimeOptions {
+            max_attempts: 10,
+            ..Default::default()
+        };
+        assert_eq!(options.attempts_until_poison(1), 10);
+        assert_eq!(options.attempts_until_poison(10), 1, "the next fetch poisons");
+        let widest = crate::runtime::RuntimeOptions {
+            max_attempts: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(widest.attempts_until_poison(u32::MAX), 1, "no overflow at the limit");
+    }
 
     #[test]
     fn tracker_starts_empty() {

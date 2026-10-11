@@ -8,6 +8,14 @@ internal pipeline instructions.
 
 ## Public Release Handoff
 
+Version 0.1.31 is reserved for the execution-pinned race-cancellation cutover.
+Never tag or publish 0.1.31 or a later version from a branch that lacks the
+queue, positional-wait, and exact continue-as-new carry-forward fixes.
+The initial execution stamp selects these semantics permanently. An old
+hotfix branch numbered 0.1.31+ would record decisions that corrected runtimes
+cannot replay with that stamp. The subsequent release preparation uses 0.1.32;
+the semantic threshold remains 0.1.31.
+
 GitHub Actions in this repository are limited to building and testing changes.
 
 1. Prepare a release pull request that updates the package version, changelog,

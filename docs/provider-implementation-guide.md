@@ -178,6 +178,12 @@ Let's trace what happens when an orchestration schedules an activity:
 
 ### Event History: The Append-Only Log
 
+Preserve every event's `duroxide_version` exactly on storage and retrieval.
+This includes `read`, `read_with_execution`, and the history returned by
+`fetch_orchestration_item`. Do not stamp stored events with the reader's build
+version. The first `OrchestrationStarted` stamp selects replay semantics for
+that execution; a provider that restamps fetch results changes its decisions.
+
 Every orchestration instance has an **event history**—a sequence of events that records everything that happened:
 
 ```
@@ -1133,6 +1139,12 @@ WHERE lock_token = token
 **Parameters:**
 - `delay`: Optional backoff before retry (e.g., 1 second for transient failures)
 - `ignore_attempt`: If true, don't count this attempt toward poison message detection
+
+Both the delay and the attempt undo apply **only to the rows this fetch locked**
+(`WHERE lock_token = token`). Rows that became visible after the fetch, such as a
+continue-as-new start, keep their visibility and attempt count. Validated by
+`poison_message::orchestration_delayed_abandon_preserves_unlocked_rows` and
+`poison_message::orchestration_ignore_attempt_preserves_hidden_start`.
 
 **Implementation:**
 ```rust
