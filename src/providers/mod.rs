@@ -1091,6 +1091,12 @@ pub enum WorkItem {
 /// All tests use the Provider trait directly (not runtime), so they're portable to new providers.
 /// See `docs/provider-implementation-guide.md` for detailed implementation guidance including instance locks.
 ///
+/// # Cancellation
+///
+/// Fetch futures can be dropped during shutdown; other in-flight calls can be dropped
+/// when the shutdown grace period expires. Release resources on drop, let unacknowledged
+/// locks expire, and preserve atomic acknowledgement even if cancellation races with a commit.
+///
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait Provider: Any + Send + Sync {
