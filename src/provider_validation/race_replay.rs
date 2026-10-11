@@ -218,10 +218,22 @@ pub async fn test_continue_as_new_unregistered_backoff<F: ProviderFactory>(facto
                             .iter()
                             .any(|item| matches!(item, WorkItem::ContinueAsNew { .. }))
                     );
-                    provider
-                        .abandon_orchestration_item(&lock, None, true)
-                        .await
-                        .expect("release competing inspection fetch");
+                    // The runtime fetches from the same store at the same time, so the
+                    // provider may report a retryable conflict (SQLite's shared-cache
+                    // "database is deadlocked"). A failed abandon leaves the lock in
+                    // place, so retry it.
+                    let mut attempt = 0u64;
+                    loop {
+                        match provider.abandon_orchestration_item(&lock, None, true).await {
+                            Ok(()) => break,
+                            Err(error) if error.retryable && attempt < 5 => {
+                                attempt += 1;
+                                tracing::warn!(%error, attempt, "Retrying release of competing inspection fetch");
+                                tokio::time::sleep(Duration::from_millis(10 * attempt)).await;
+                            }
+                            Err(error) => panic!("release competing inspection fetch: {error}"),
+                        }
+                    }
                 }
                 Err(error) if error.retryable => {
                     tracing::warn!(%error, "Retrying backoff-test visibility inspection");
