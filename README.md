@@ -4,8 +4,8 @@
 [![Crates.io](https://img.shields.io/crates/v/duroxide.svg)](https://crates.io/crates/duroxide)
 [![Documentation](https://docs.rs/duroxide/badge.svg)](https://docs.rs/duroxide)
 
-> **[Latest Release: v0.1.30](https://crates.io/crates/duroxide/0.1.30)** — Sub-orchestration parent-link and collision fixes, safer IDs, and UUID generation.
-> See [CHANGELOG.md](CHANGELOG.md#0130---2026-07-29) for release notes.
+> **[Latest Release: v0.1.32](https://crates.io/crates/duroxide/0.1.32)** — Queue and signal race fixes, exact continue-as-new carry-forward, no lost inputs between executions, deterministic KV key order, and a shutdown that stops every runtime task.
+> See [CHANGELOG.md](CHANGELOG.md#0132---2026-10-11) for release notes.
 >
 > **Release policy:** Official packages are published through Microsoft-managed
 > internal pipelines. Repository GitHub Actions are validation-only. See

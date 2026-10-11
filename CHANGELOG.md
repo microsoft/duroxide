@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-10-11
+
+**Release:** <https://crates.io/crates/duroxide/0.1.32>
+
 ### Fixed
 
 - **Continue-as-new admission window** - A CAN-terminal fetch that cannot
@@ -34,13 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handler name, version or input. A colliding sub-orchestration start now
   fails its parent when the target is still running, not only when it is
   finished; a running instance's own parent re-sending the same call (with a
-  known parent execution id) is still ignored.
+  known parent execution id) is still ignored. (#67)
 
 - **KV key order** - `prune_kv_values_updated_before` clears keys in key order and
   `get_kv_all_keys` returns them in key order, instead of `HashMap` order that
   differed between replays (`nondeterministic: kv clear mismatch`, #57). Replay
   accepts a run of `KeyValueCleared` rows in any order, so histories recorded by
-  older runtimes still replay.
+  older runtimes still replay. (#67)
 
 - **SQLite abandon affects only the locked rows** - `abandon_orchestration_item`
   now undoes the attempt increment and applies its delay only to the rows that
@@ -48,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   updated every visible row of the instance, so a delayed abandon could hide a
   continue-as-new start that became visible after the fetch, repeatedly while
   inputs kept arriving. New provider validation:
-  `orchestration_delayed_abandon_preserves_unlocked_rows`.
+  `orchestration_delayed_abandon_preserves_unlocked_rows`. (#67)
 
 - **Shared race cancellation cutover** - Positional waits now cancel at drop
   and discard stale signals assigned to a dropped slot. Continue-as-new
@@ -64,8 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order within each type, for every execution. Replay compares them as sets,
   so recorded histories are unaffected.
   Earlier executions preserve their original policy, including known defects.
-  Version 0.1.31 is reserved and must never be published without these fixes;
-  the subsequent release PR may use 0.1.32 and retains the same threshold.
+  Version 0.1.31 was reserved for this cutover and is not published. 0.1.32 is
+  the first release with these fixes; the execution threshold stays 0.1.31. (#67)
 
 - **Queued-event race replay** - Dropping an unresolved dequeue now
   excludes its subscription from FIFO matching immediately, including when the
@@ -81,34 +85,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changing race winners in otherwise valid old histories.
   The doc-hidden `bind_token` helper now applies a previously recorded dequeue
   drop when binding its token to a queue schedule only under V0131; contexts
-  default to Legacy.
+  default to Legacy. (#67)
 
 - `Runtime::shutdown` now actually stops the tasks its dispatchers spawn
   ([#44](https://github.com/microsoft/duroxide/issues/44)). Previously, aborting dispatcher
   supervisors detached their child tasks. Pollers blocked in provider calls could outlive
-  shutdown and retain pooled connections indefinitely.
+  shutdown and retain pooled connections indefinitely. (#65)
 - Shutdown retains task ownership if its caller is cancelled, and concurrent calls
   wait for the same tasks to finish. Cleanup includes activity invocation and lock-renewal
-  tasks, not just dispatcher pollers.
+  tasks, not just dispatcher pollers. (#65)
 - `Runtime::shutdown(Some(0))` now signals cancellation and aborts work before waiting
-  for task cleanup, without requiring the caller to enter a Tokio context.
+  for task cleanup, without requiring the caller to enter a Tokio context. (#65)
 - Dispatcher tasks now observe cancellation while parked in a long poll, an error backoff,
-  or the minimum-poll-interval sleep, instead of only between loop iterations.
+  or the minimum-poll-interval sleep, instead of only between loop iterations. (#65)
 - Lock-renewal loops (orchestration and activity) no longer stop the instant shutdown is
   signalled. They remain active through acknowledgement, preventing locks from expiring
-  while in-flight work drains.
+  while in-flight work drains. (#65)
 
 ### Changed
 
 - The public `TurnResult::ContinueAsNew` variant now includes
   `unconsumed_queue_arrivals`. External code constructing or exhaustively
   matching this variant must add the field or use `..` in its match.
-  This is a Rust source-compatibility change, not a persisted event-format change.
+  This is a Rust source-compatibility change, not a persisted event-format change. (#67)
 
 - **`timeout_ms` is now a grace-period limit, not a fixed delay.** Shutdown returns once
   all runtime-owned tasks stop, retaining its `()` return type. After the grace period it
   aborts remaining work and waits for cancellation cleanup, so blocking or non-yielding
-  user code can delay its return beyond that period. See [the migration guide](docs/migration-guide.md).
+  user code can delay its return beyond that period. See [the migration guide](docs/migration-guide.md). (#65)
 
 ## [0.1.30] - 2026-07-29
 
