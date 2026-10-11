@@ -44,9 +44,9 @@ replay-semantic compatibility.
 No release numbered 0.1.31 or later may omit this semantic cutover: its number
 is the recorded contract, not a runtime upgrade switch.
 
-Version 0.1.31 is reserved for the semantic cutover. The
-subsequent release PR uses 0.1.32, which still satisfies the
-same threshold. Never publish 0.1.31 from an older branch without these fixes.
+Version 0.1.31 was reserved for the semantic cutover and is not published.
+0.1.32 is the first release with these fixes; the execution threshold stays
+0.1.31. Never publish 0.1.31 from an older branch without these fixes.
 
 ### Positional signal contract
 
@@ -133,7 +133,7 @@ application-specific restart/recovery or let a healthy execution finish or
 continue as new on an upgraded runtime. The library provides no automatic
 in-place repair of a failed or hanging legacy history.
 
-## `Runtime::shutdown` waits for task cleanup (Unreleased)
+## `Runtime::shutdown` waits for task cleanup (0.1.32)
 
 The signature is unchanged: `shutdown(timeout_ms: Option<u64>)` still returns `()`.
 It stops fetching new work and lets in-flight work finish within the grace period,
@@ -156,7 +156,7 @@ an earlier abort. Dropping a shutdown future does not lose ownership of the task
 keep a runtime handle and call `shutdown` again to finish teardown. An interrupted
 shutdown is not evidence that it is safe to tear down dependent resources.
 
-## Reserved `sub::` instance-id marker (Unreleased)
+## Reserved `sub::` instance-id marker (0.1.30)
 
 The `sub::` marker is now reserved for runtime-generated sub-orchestration instance ids.
 `Client::start_orchestration` and `Client::start_orchestration_versioned` reject root
