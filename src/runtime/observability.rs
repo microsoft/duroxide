@@ -127,9 +127,10 @@ pub struct MetricsSnapshot {
     pub orch_application_errors: u64,
     pub orch_infrastructure_errors: u64,
     pub orch_configuration_errors: u64,
+    /// Confirmed poison acknowledgements.
     pub orch_poison: u64,
-    /// Poison dispositions that could NOT be committed (the ack failed), so the
-    /// orchestration was not terminated and its message will be redelivered.
+    /// Poison acknowledgements that returned an error after runtime retries.
+    /// The disposition may still have committed.
     pub orch_poison_failed: u64,
     pub activity_success: u64,
     pub activity_app_errors: u64,
@@ -463,18 +464,16 @@ impl MetricsProvider {
         self.activity_config_errors_atomic.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a confirmed orchestration poison acknowledgement.
     #[inline]
     pub fn record_orchestration_poison(&self) {
         self.orch_poison_atomic.fetch_add(1, Ordering::Relaxed);
         counter!("duroxide_orchestration_poison_total").increment(1);
     }
 
-    /// A poison disposition failed to commit.
+    /// Record a poison acknowledgement that returned an error after runtime retries.
     ///
-    /// The orchestration was NOT terminated: the ack carrying the poison marking,
-    /// the backoff, and the attempt-count increment did not commit, so the message
-    /// will be redelivered. Distinct from `record_orchestration_poison`, which
-    /// counts messages actually taken out of circulation.
+    /// The disposition may still have committed, for example if its response was lost.
     #[inline]
     pub fn record_orchestration_poison_failed(&self) {
         self.orch_poison_failed_atomic.fetch_add(1, Ordering::Relaxed);

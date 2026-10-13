@@ -48,9 +48,8 @@ pub struct PoisonInjectingProvider {
     successful_ignored_abandons: AtomicU32,
     counted_abandon_delays: std::sync::Mutex<Vec<Duration>>,
     orchestration_fetches: std::sync::Mutex<Vec<(String, String, u32)>>,
-    /// If true, every orchestration ack fails as if the lock lease had already
-    /// expired when the item was handed out.
-    expire_orchestration_lease: AtomicBool,
+    reject_orchestration_acks: AtomicBool,
+    fail_next_orchestration_ack_after_commit: AtomicBool,
 }
 
 impl PoisonInjectingProvider {
@@ -71,18 +70,20 @@ impl PoisonInjectingProvider {
             successful_ignored_abandons: AtomicU32::new(0),
             counted_abandon_delays: std::sync::Mutex::new(Vec::new()),
             orchestration_fetches: std::sync::Mutex::new(Vec::new()),
-            expire_orchestration_lease: AtomicBool::new(false),
+            reject_orchestration_acks: AtomicBool::new(false),
+            fail_next_orchestration_ack_after_commit: AtomicBool::new(false),
         }
     }
 
-    /// Make every orchestration ack fail with a non-retryable "Invalid lock token".
-    ///
-    /// This is what a provider does when the lock lease it handed out had already
-    /// expired -- the condition behind microsoft/duroxide#46. It is set on the
-    /// provider rather than per-call because the real defect is persistent: the
-    /// lease is dead on arrival on *every* delivery, so no retry ever succeeds.
-    pub fn expire_orchestration_lease(&self, expired: bool) {
-        self.expire_orchestration_lease.store(expired, Ordering::SeqCst);
+    /// Reject acks without modifying the underlying lease or committing changes.
+    pub fn reject_orchestration_acks(&self, reject: bool) {
+        self.reject_orchestration_acks.store(reject, Ordering::SeqCst);
+    }
+
+    /// Commit the next ack, then return a retryable error to simulate a lost response.
+    pub fn fail_next_orchestration_ack_after_commit(&self) {
+        self.fail_next_orchestration_ack_after_commit
+            .store(true, Ordering::SeqCst);
     }
 
     /// Next orchestration fetch will return this attempt_count instead of real one.
@@ -140,6 +141,9 @@ impl PoisonInjectingProvider {
         self.orchestration_skip_count.store(0, Ordering::SeqCst);
         self.activity_skip_count.store(0, Ordering::SeqCst);
         self.fail_orchestration_abandon.store(false, Ordering::SeqCst);
+        self.reject_orchestration_acks.store(false, Ordering::SeqCst);
+        self.fail_next_orchestration_ack_after_commit
+            .store(false, Ordering::SeqCst);
     }
 
     pub fn fail_orchestration_abandon_persistently(&self) {
@@ -267,7 +271,7 @@ impl Provider for PoisonInjectingProvider {
         metadata: ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
-        if self.expire_orchestration_lease.load(Ordering::SeqCst) {
+        if self.reject_orchestration_acks.load(Ordering::SeqCst) {
             return Err(ProviderError::permanent("ack_orchestration_item", "Invalid lock token"));
         }
         if self.fail_next_orchestration_ack.swap(false, Ordering::SeqCst) {
@@ -312,6 +316,15 @@ impl Provider for PoisonInjectingProvider {
         self.failure_commit_collision_notifications
             .fetch_add(collision_count, Ordering::SeqCst);
         self.collision_notices.lock().expect("notices lock").extend(notices);
+        if self
+            .fail_next_orchestration_ack_after_commit
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(ProviderError::retryable(
+                "ack_orchestration_item",
+                "injected response failure after commit",
+            ));
+        }
         Ok(())
     }
 
