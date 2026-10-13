@@ -1,7 +1,7 @@
 # Duroxide Metrics Specification
 
 **Version:** 2.0  
-**Last Updated:** 2026-01-25  
+**Last Updated:** 2026-10-13\
 **Status:** Current Implementation (metrics facade)
 
 This document provides a complete reference of all metrics emitted by duroxide via the `metrics` facade crate, organized by functional area with detailed label specifications.
@@ -32,7 +32,8 @@ This document provides a complete reference of all metrics emitted by duroxide v
 | `duroxide_activity_infrastructure_errors_total` | Counter | Activity | `activity_name` | ✅ `metrics_capture_activity_and_orchestration_outcomes` | ✅ Code Review | Infra-specific errors |
 | `duroxide_activity_configuration_errors_total` | Counter | Activity | `activity_name` | ✅ `test_error_classification_metrics` | ✅ Code Review | Config-specific errors |
 | **Poison Message** |
-| `duroxide_orchestration_poison_total` | Counter | Poison | _(none)_ | ✅ `test_poison_message_metrics` | ✅ Code Review | Orchestrations exceeding max_attempts |
+| `duroxide_orchestration_poison_total` | Counter | Poison | _(none)_ | ✅ `poison_acknowledgement_counters_are_exported` | ✅ Emitted | Confirmed poison acknowledgements, including propagated poison failures |
+| `duroxide_orchestration_poison_failed_total` | Counter | Poison | _(none)_ | ✅ `poison_acknowledgement_counters_are_exported` | ✅ Emitted | Poison acknowledgements returning an error after retry handling |
 | `duroxide_activity_poison_total` | Counter | Poison | _(none)_ | ✅ `test_poison_message_metrics` | ✅ Code Review | Activities exceeding max_attempts |
 | **Sub-Orchestration** |
 | `duroxide_suborchestration_calls_total` | Counter | Sub-Orchestration | `parent_orchestration`, `child_orchestration`, `outcome` | ✅ `test_sub_orchestration_metrics` | ❌ Not Called | Method defined in `observability.rs:701` but never called from runtime |
@@ -51,7 +52,7 @@ This document provides a complete reference of all metrics emitted by duroxide v
 | `duroxide.worker.dispatcher.items_fetched` | Counter | Internal | _(none)_ | ✅ Implicitly tested | ✅ Code Review | Recorded in dispatcher, no labels |
 | `duroxide.worker.dispatcher.execution_duration_ms` | Histogram | Internal | _(none)_ | ✅ Implicitly tested | ✅ Code Review | Recorded in dispatcher, no labels |
 
-**Test Location:** All tests are in `tests/observability_tests.rs`
+**Test Locations:** General metrics tests are in `tests/observability_tests.rs`. Poison acknowledgement and counter-export regressions are in `tests/poison_disposition_tests.rs`.
 
 **Export Status:**
 - **✅ Emitted** - Metric is properly emitted via `metrics` facade with correct labels (verified by code audit)
@@ -243,7 +244,7 @@ sum(rate(duroxide_orchestration_turns_bucket{le="100"}[5m]))
 
 **Purpose:** Track infrastructure issues separately for alerting
 
-**Note:** **Poison messages** (messages that exceed `max_attempts` and cannot be processed) are counted in this metric. When an orchestration message is detected as poison, this counter is incremented. See [Poison Message Handling](#poison-message-handling) for details.
+**Note:** Poison acknowledgement outcomes have separate counters. An acknowledgement error can additionally take the infrastructure-failure fallback path; a successful infrastructure fallback is not counted as a confirmed poison acknowledgement. See [Poison Message Handling](#poison-message-handling) for details.
 
 ---
 
@@ -776,7 +777,7 @@ let options = RuntimeOptions {
 
 ## Test Coverage
 
-All implemented metrics are validated in `tests/observability_tests.rs`. The test suite validates that metrics are recorded correctly via atomic counters.
+General metrics are validated in `tests/observability_tests.rs` via atomic counters. Additional poison acknowledgement, public snapshot compatibility, and counter-export regressions are in `tests/poison_disposition_tests.rs`.
 
 ### What Is Tested
 
@@ -820,20 +821,20 @@ All implemented metrics are validated in `tests/observability_tests.rs`. The tes
 
 ```bash
 # Run all metrics tests
-cargo nt -E 'test(/observability/)'
+cargo nt --test observability_tests --test poison_disposition_tests
 
 # Run with output
-cargo test --test observability_tests -- --nocapture
+cargo ntw --test observability_tests --test poison_disposition_tests
 
 # Run specific test
-cargo test test_sub_orchestration_metrics -- --nocapture
+cargo ntw --test observability_tests -E 'test(=test_sub_orchestration_metrics)'
 ```
 
 ### Test Architecture
 
-**Approach:** Tests use `MetricsProvider` with no external recorder. Metrics are emitted via the `metrics` facade (no-op if no recorder) and tracked internally via atomic counters.
+**Approach:** Most tests use `MetricsProvider` with no external recorder. Metrics are emitted via the `metrics` facade (no-op if no recorder) and tracked internally via atomic counters. Poison counter exports are also checked with `DebuggingRecorder`.
 
-**Validation Method:** Tests read atomic counters via `runtime.metrics_snapshot()` to verify metrics were recorded.
+**Validation Method:** Tests read atomic counters via `runtime.metrics_snapshot()` to verify metrics were recorded. The failed poison acknowledgement count is available separately through `MetricsProvider::orchestration_poison_failed()`, reached via the runtime's existing observability handle, so the public `MetricsSnapshot` layout remains unchanged.
 
 **Limitation:** This validates that metric recording code paths work but doesn't test the full export pipeline (labels, histogram buckets, export format). To validate export, install a real recorder (Prometheus, DebuggingRecorder, etc.).
 
@@ -848,13 +849,13 @@ To validate labels and histogram buckets, a full integration test would need to:
    - Histogram bucket distributions
    - Metric names follow Prometheus conventions
 
-This is currently **not implemented** but is simpler with the `metrics` facade than with direct OTel.
+Full collector integration is currently **not implemented**. Poison counter names, values, and empty label sets are covered by the `DebuggingRecorder` regression test.
 
 ---
 
 ## Poison Message Handling
 
-Duroxide implements poison message detection to handle messages that repeatedly fail to process. When a message is fetched more than `max_attempts` times (default: 10), it is marked as **poison** and immediately failed without executing user code.
+Duroxide implements poison message detection to handle messages that repeatedly fail to process. When a message is fetched more than `max_attempts` times (default: 10), the runtime attempts to fail it as **poison** without executing user code. An orchestration can also fail when an activity or child orchestration propagates `ErrorDetails::Poison`, without exceeding its own attempt budget.
 
 ### Dedicated Poison Metrics
 
@@ -862,28 +863,47 @@ Poison messages have dedicated metrics for direct observability:
 
 | Metric Name | Type | Description |
 |-------------|------|-------------|
-| `duroxide_orchestration_poison_total` | Counter | Count of orchestration items that exceeded max_attempts |
+| `duroxide_orchestration_poison_total` | Counter | Confirmed acknowledgements of orchestration poison failures |
+| `duroxide_orchestration_poison_failed_total` | Counter | Orchestration poison acknowledgements returning an error after retry handling |
 | `duroxide_activity_poison_total` | Counter | Count of activity items that exceeded max_attempts |
+
+The orchestration counters cover exceeded-attempt, corrupted-history, and propagated
+poison failures. Each final acknowledgement result increments one counter; retries
+within that acknowledgement are not counted separately. A redelivery can produce
+another acknowledgement outcome.
+
+An error does not prove the write failed to commit: its response may have been lost,
+or another dispatcher may have completed the work after lease expiry. The error log
+therefore reports that termination was not confirmed and the message may be
+redelivered. These are operational counters, not an exact ledger of durable
+terminations. Retry, backoff, and lease behavior are unchanged.
 
 ### Error Details
 
 When a poison message is detected, an `ErrorDetails::Poison` error is created containing:
 - `attempt_count` - Number of times the message was fetched
 - `max_attempts` - Configured maximum attempts
-- `message_type` - Whether it was an orchestration or activity
+- `message_type` - Orchestration, activity, or failed history deserialization
 - `message` - Serialized message content for debugging
+
+For propagated poison failures, the attempt count and maximum describe the original
+poisoned work, not the receiving orchestration's delivery count.
 
 ### Example Queries
 
 ```promql
-# Total poisoned orchestrations
+# Confirmed orchestration poison acknowledgements
 duroxide_orchestration_poison_total
+
+# Unconfirmed orchestration poison acknowledgements
+duroxide_orchestration_poison_failed_total
 
 # Total poisoned activities
 duroxide_activity_poison_total
 
-# Poison rate over time
+# Poison acknowledgement and activity poison rates over time
 rate(duroxide_orchestration_poison_total[5m])
+rate(duroxide_orchestration_poison_failed_total[5m])
 rate(duroxide_activity_poison_total[5m])
 ```
 
@@ -891,7 +911,7 @@ rate(duroxide_activity_poison_total[5m])
 
 ```rust
 RuntimeOptions {
-    max_attempts: 10,  // Default: 10. Messages exceeding this are poisoned.
+    max_attempts: 10,  // Default: 10. Poison disposition is attempted above this fetch count.
     ..Default::default()
 }
 ```
@@ -907,5 +927,5 @@ RuntimeOptions {
 
 ---
 
-**Document Status:** This specification reflects the **current implementation** as of 2025-12-13. Client metrics are defined but not yet instrumented. All implemented metrics have test coverage in `tests/observability_tests.rs`. Poison message handling was added in v1.1.
+**Document Status:** This specification describes the metrics facade. General metrics tests are in `tests/observability_tests.rs`; poison acknowledgement and counter-export regressions are in `tests/poison_disposition_tests.rs`.
 

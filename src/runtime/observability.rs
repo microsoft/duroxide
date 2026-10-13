@@ -129,9 +129,6 @@ pub struct MetricsSnapshot {
     pub orch_configuration_errors: u64,
     /// Confirmed poison acknowledgements.
     pub orch_poison: u64,
-    /// Poison acknowledgements that returned an error after runtime retries.
-    /// The disposition may still have committed.
-    pub orch_poison_failed: u64,
     pub activity_success: u64,
     pub activity_app_errors: u64,
     pub activity_infra_errors: u64,
@@ -627,6 +624,14 @@ impl MetricsProvider {
     // Snapshot for testing
     // ========================================================================
 
+    /// Number of poison acknowledgements that returned an error after runtime retries.
+    ///
+    /// The disposition may still have committed. This count is exposed separately
+    /// to preserve source compatibility for callers constructing [`MetricsSnapshot`].
+    pub fn orchestration_poison_failed(&self) -> u64 {
+        self.orch_poison_failed_atomic.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             orch_starts: self.orch_starts_atomic.load(Ordering::Relaxed),
@@ -636,7 +641,6 @@ impl MetricsProvider {
             orch_infrastructure_errors: self.orch_infrastructure_errors_atomic.load(Ordering::Relaxed),
             orch_configuration_errors: self.orch_configuration_errors_atomic.load(Ordering::Relaxed),
             orch_poison: self.orch_poison_atomic.load(Ordering::Relaxed),
-            orch_poison_failed: self.orch_poison_failed_atomic.load(Ordering::Relaxed),
             activity_success: self.activity_success_atomic.load(Ordering::Relaxed),
             activity_app_errors: self.activity_app_errors_atomic.load(Ordering::Relaxed),
             activity_infra_errors: self.activity_infra_errors_atomic.load(Ordering::Relaxed),

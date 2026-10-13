@@ -265,12 +265,21 @@ the provider. `duroxide_orchestration_poison_failed_total` counts those that ret
 an error after the runtime's retry handling. Each disposition contributes to one
 counter, not once per acknowledgement retry. Neither counter has labels.
 
+Both counters include failures propagated from poisoned activities or child
+orchestrations, not just orchestrations that exceed their own attempt budget.
+For propagated failures, the logged attempt count and maximum come from the
+original poison error.
+
 An acknowledgement error does not prove the disposition failed to commit: its
 response may have been lost, or another dispatcher may have completed the work
 after a lease expired. These counters describe observed acknowledgement outcomes,
 not an exact ledger of durable terminations. Repeated failures warrant investigation;
 the error log includes the instance, attempt count, configured maximum, and provider
 error. This reporting does not change retry, backoff, or lease behavior.
+
+For in-process diagnostics, the failed count is available through
+`MetricsProvider::orchestration_poison_failed()` on the runtime's existing
+observability handle. The public `MetricsSnapshot` layout is unchanged.
 
 **`duroxide_active_orchestrations`** (Gauge) 🆕
 - **Description**: Current number of orchestration instances that are actively running (not completed/failed)
