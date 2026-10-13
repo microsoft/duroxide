@@ -641,6 +641,17 @@ impl Provider for FilterBypassProvider {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkItemCall {
+    Ack {
+        token: String,
+        completion: Option<WorkItem>,
+    },
+    Abandon {
+        token: String,
+    },
+}
+
 /// A provider wrapper that can inject transient failures for testing
 /// error handling and retry logic.
 pub struct FailingProvider {
@@ -648,6 +659,7 @@ pub struct FailingProvider {
     fail_next_ack_work_item: AtomicBool,
     /// Number of remaining `ack_work_item` calls to fail with a *retryable* error
     retryable_ack_work_item_failures: AtomicU32,
+    work_item_calls: std::sync::Mutex<Vec<WorkItemCall>>,
     fail_next_ack_orchestration_item: AtomicBool,
     fail_next_fetch_orchestration_item: AtomicBool,
     fail_next_fetch_work_item: AtomicBool,
@@ -663,6 +675,7 @@ impl FailingProvider {
             inner,
             fail_next_ack_work_item: AtomicBool::new(false),
             retryable_ack_work_item_failures: AtomicU32::new(0),
+            work_item_calls: std::sync::Mutex::new(Vec::new()),
             fail_next_ack_orchestration_item: AtomicBool::new(false),
             fail_next_fetch_orchestration_item: AtomicBool::new(false),
             fail_next_fetch_work_item: AtomicBool::new(false),
@@ -677,8 +690,7 @@ impl FailingProvider {
 
     /// Fail the next `count` `ack_work_item` calls with a *retryable* error.
     ///
-    /// Unlike `fail_next_ack_work_item`, the underlying ack is not performed, so the
-    /// work item stays locked and the caller is expected to retry in place.
+    /// The underlying ack is not performed unless `set_ack_then_fail(true)` is set.
     pub fn fail_next_ack_work_item_retryable(&self, count: u32) {
         self.retryable_ack_work_item_failures.store(count, Ordering::SeqCst);
     }
@@ -686,6 +698,11 @@ impl FailingProvider {
     /// Number of injected retryable ack failures that have not been consumed yet.
     pub fn remaining_retryable_ack_failures(&self) -> u32 {
         self.retryable_ack_work_item_failures.load(Ordering::SeqCst)
+    }
+
+    /// Return work-item acknowledgement and abandonment calls in invocation order.
+    pub fn work_item_calls(&self) -> Vec<WorkItemCall> {
+        self.work_item_calls.lock().unwrap().clone()
     }
 
     pub fn fail_next_ack_orchestration_item(&self) {
@@ -814,26 +831,36 @@ impl Provider for FailingProvider {
     }
 
     async fn ack_work_item(&self, token: &str, completion: Option<WorkItem>) -> Result<(), ProviderError> {
-        if self
+        self.work_item_calls.lock().unwrap().push(WorkItemCall::Ack {
+            token: token.to_string(),
+            completion: completion.clone(),
+        });
+
+        let failure = if self
             .retryable_ack_work_item_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1).filter(|_| n > 0))
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                n.checked_sub(1).filter(|_| n > 0)
+            })
             .is_ok()
         {
-            return Err(ProviderError::retryable(
+            Some(ProviderError::retryable(
                 "ack_work_item",
                 "simulated transient lock contention",
-            ));
-        }
-
-        if self.fail_next_ack_work_item.swap(false, Ordering::SeqCst) {
-            // If ack_then_fail is set, do the actual ack first
-            if self.ack_then_fail.load(Ordering::SeqCst) {
-                self.inner.ack_work_item(token, completion).await?;
-            }
-            Err(ProviderError::permanent(
+            ))
+        } else if self.fail_next_ack_work_item.swap(false, Ordering::SeqCst) {
+            Some(ProviderError::permanent(
                 "ack_work_item",
                 "simulated infrastructure failure",
             ))
+        } else {
+            None
+        };
+
+        if let Some(error) = failure {
+            if self.ack_then_fail.load(Ordering::SeqCst) {
+                self.inner.ack_work_item(token, completion).await?;
+            }
+            Err(error)
         } else {
             self.inner.ack_work_item(token, completion).await
         }
@@ -849,6 +876,9 @@ impl Provider for FailingProvider {
         delay: Option<Duration>,
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
+        self.work_item_calls.lock().unwrap().push(WorkItemCall::Abandon {
+            token: token.to_string(),
+        });
         self.inner.abandon_work_item(token, delay, ignore_attempt).await
     }
 
