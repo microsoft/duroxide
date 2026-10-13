@@ -5,11 +5,16 @@
 #![allow(clippy::clone_on_ref_ptr)]
 #![allow(clippy::expect_used)]
 
+use common::fault_injection::{FailingProvider, WorkItemCall};
 use duroxide::EventKind;
+use duroxide::providers::sqlite::SqliteProvider;
+use duroxide::providers::{Provider, WorkItem};
 use duroxide::runtime;
 use duroxide::runtime::registry::{ActivityRegistry, OrchestrationRegistry};
 use duroxide::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 mod common;
 
@@ -334,80 +339,294 @@ async fn multiple_activities_reliability_after_crash() {
     }
 }
 
-/// Test that work items are abandoned and retried when ack_work_item fails.
-///
-/// This verifies the worker dispatcher calls abandon_work_item when ack fails,
-/// making the work item available for retry without waiting for lock expiration.
-#[tokio::test]
-async fn worker_abandon_on_ack_failure_enables_retry() {
-    use common::fault_injection::FailingProvider;
-    use duroxide::providers::sqlite::SqliteProvider;
-    use duroxide::runtime::RuntimeOptions;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::Duration;
+struct AckTest {
+    provider: Arc<FailingProvider>,
+    client: Client,
+    rt: Arc<runtime::Runtime>,
+    _db: tempfile::NamedTempFile,
+}
 
-    let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let failing_provider = Arc::new(FailingProvider::new(sqlite));
+impl AckTest {
+    async fn new(activities: ActivityRegistry) -> Self {
+        // WAL keeps exact call counts independent of shared-cache deadlocks.
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let sqlite = Arc::new(
+            SqliteProvider::new(&format!("sqlite:{}", db.path().display()), None)
+                .await
+                .unwrap(),
+        );
+        let provider = Arc::new(FailingProvider::new(sqlite));
+        let orchestrations = OrchestrationRegistry::builder()
+            .register("AckOrch", |ctx: OrchestrationContext, _input: String| async move {
+                ctx.schedule_activity("CountingActivity", "{}").await
+            })
+            .build();
+        let options = runtime::RuntimeOptions {
+            worker_concurrency: 1,
+            orchestration_concurrency: 1,
+            worker_lock_timeout: Duration::from_secs(2),
+            worker_lock_renewal_buffer: Duration::from_millis(500),
+            activity_cancellation_grace_period: Duration::ZERO,
+            ..Default::default()
+        };
+        let rt = runtime::Runtime::start_with_options(provider.clone(), activities, orchestrations, options).await;
+        let client = Client::new(provider.clone());
 
-    // Track how many times the activity executes
+        Self {
+            provider,
+            client,
+            rt,
+            _db: db,
+        }
+    }
+
+    async fn start(&self) {
+        self.client
+            .start_orchestration("ack-test", "AckOrch", "")
+            .await
+            .unwrap();
+    }
+
+    async fn finish(&self) -> runtime::OrchestrationStatus {
+        let status = self
+            .client
+            .wait_for_orchestration("ack-test", Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        // A commit can become visible before the worker finishes retrying its acknowledgement.
+        Arc::clone(&self.rt).shutdown(Some(10_000)).await;
+        status
+    }
+}
+
+fn counting_activity(result: Result<String, String>) -> (ActivityRegistry, Arc<AtomicU32>) {
     let execution_count = Arc::new(AtomicU32::new(0));
-    let exec_count_clone = execution_count.clone();
-
-    let activities = runtime::registry::ActivityRegistry::builder()
+    let counter = execution_count.clone();
+    let activities = ActivityRegistry::builder()
         .register("CountingActivity", move |_ctx: ActivityContext, _input: String| {
-            let count = exec_count_clone.clone();
+            let counter = counter.clone();
+            let result = result.clone();
             async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                Ok("done".to_string())
+                counter.fetch_add(1, Ordering::SeqCst);
+                result
             }
         })
         .build();
+    (activities, execution_count)
+}
 
-    let orchestrations = runtime::registry::OrchestrationRegistry::builder()
-        .register("AckFailOrch", |ctx: OrchestrationContext, _input: String| async move {
-            ctx.schedule_activity("CountingActivity", "{}").await
+#[tokio::test]
+async fn worker_abandon_on_ack_failure_enables_retry() {
+    let (activities, execution_count) = counting_activity(Ok("done".to_string()));
+    let test = AckTest::new(activities).await;
+    test.provider.fail_next_ack_work_item();
+    test.start().await;
+
+    assert!(matches!(
+        test.finish().await,
+        runtime::OrchestrationStatus::Completed { output, .. } if output == "done"
+    ));
+    assert_eq!(execution_count.load(Ordering::SeqCst), 2);
+
+    let calls = test.provider.work_item_calls();
+    let [
+        WorkItemCall::Ack { token, completion },
+        WorkItemCall::Abandon { token: abandoned },
+        WorkItemCall::Ack {
+            token: redelivered,
+            completion: retried_completion,
+        },
+    ] = calls.as_slice()
+    else {
+        panic!("Permanent failure must abandon without retrying the ack: {calls:?}");
+    };
+    assert_eq!(token, abandoned);
+    assert_ne!(token, redelivered);
+    assert_eq!(completion, retried_completion);
+}
+
+#[tokio::test]
+async fn worker_retries_retryable_ack_failure_without_reexecuting_activity() {
+    let (activities, execution_count) = counting_activity(Ok("done".to_string()));
+    let test = AckTest::new(activities).await;
+    test.provider.fail_next_ack_work_item_retryable(4);
+    test.start().await;
+
+    assert!(matches!(
+        test.finish().await,
+        runtime::OrchestrationStatus::Completed { output, .. } if output == "done"
+    ));
+    assert_eq!(test.provider.remaining_retryable_ack_failures(), 0);
+    assert_eq!(execution_count.load(Ordering::SeqCst), 1);
+
+    let calls = test.provider.work_item_calls();
+    assert_eq!(calls.len(), 5, "The fifth and final attempt must succeed");
+    assert!(matches!(
+        &calls[0],
+        WorkItemCall::Ack {
+            completion: Some(WorkItem::ActivityCompleted { result, .. }),
+            ..
+        } if result == "done"
+    ));
+    assert_eq!(calls, vec![calls[0].clone(); 5]);
+}
+
+#[tokio::test]
+async fn worker_abandons_after_retryable_ack_attempts_are_exhausted() {
+    let (activities, execution_count) = counting_activity(Ok("done".to_string()));
+    let test = AckTest::new(activities).await;
+    test.provider.fail_next_ack_work_item_retryable(5);
+    test.start().await;
+
+    assert!(matches!(
+        test.finish().await,
+        runtime::OrchestrationStatus::Completed { output, .. } if output == "done"
+    ));
+    assert_eq!(test.provider.remaining_retryable_ack_failures(), 0);
+    assert_eq!(execution_count.load(Ordering::SeqCst), 2);
+
+    let calls = test.provider.work_item_calls();
+    assert_eq!(calls.len(), 7, "Five attempts, abandon, then a successful redelivery");
+    let WorkItemCall::Ack { token, completion } = &calls[0] else {
+        panic!("Expected an acknowledgement: {calls:?}");
+    };
+    assert!(calls[..5].iter().all(|call| call == &calls[0]), "{calls:?}");
+    assert_eq!(calls[5], WorkItemCall::Abandon { token: token.clone() });
+    let WorkItemCall::Ack {
+        token: redelivered,
+        completion: retried_completion,
+    } = &calls[6]
+    else {
+        panic!("Expected acknowledgement after redelivery: {calls:?}");
+    };
+    assert_ne!(token, redelivered);
+    assert_eq!(completion, retried_completion);
+}
+
+#[tokio::test]
+async fn worker_retries_application_error_ack_without_reexecuting_activity() {
+    let (activities, execution_count) = counting_activity(Err("activity error".to_string()));
+    let test = AckTest::new(activities).await;
+    test.provider.fail_next_ack_work_item_retryable(3);
+    test.start().await;
+
+    assert!(matches!(
+        test.finish().await,
+        runtime::OrchestrationStatus::Failed { .. }
+    ));
+    assert_eq!(test.provider.remaining_retryable_ack_failures(), 0);
+    assert_eq!(execution_count.load(Ordering::SeqCst), 1);
+
+    let calls = test.provider.work_item_calls();
+    assert_eq!(calls.len(), 4);
+    assert!(matches!(
+        &calls[0],
+        WorkItemCall::Ack {
+            completion: Some(WorkItem::ActivityFailed {
+                details: ErrorDetails::Application {
+                    kind: AppErrorKind::ActivityFailed,
+                    message,
+                    retryable: false,
+                },
+                ..
+            }),
+            ..
+        } if message == "activity error"
+    ));
+    assert_eq!(calls, vec![calls[0].clone(); 4]);
+}
+
+#[tokio::test]
+async fn worker_retries_cancelled_activity_ack_without_completion() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let activity_entered = entered.clone();
+    let execution_count = Arc::new(AtomicU32::new(0));
+    let counter = execution_count.clone();
+    let activities = ActivityRegistry::builder()
+        .register("CountingActivity", move |_ctx: ActivityContext, _input: String| {
+            let entered = activity_entered.clone();
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                entered.notify_one();
+                std::future::pending::<Result<String, String>>().await
+            }
         })
         .build();
-
-    // Use short lock timeout - if abandon doesn't work, we'd have to wait for this to expire
-    let options = RuntimeOptions {
-        worker_lock_timeout: Duration::from_secs(30), // Long timeout - retry should happen via abandon, not expiry
-        ..Default::default()
-    };
-
-    let provider: Arc<dyn duroxide::providers::Provider> = failing_provider.clone();
-    let rt = runtime::Runtime::start_with_options(provider.clone(), activities, orchestrations, options).await;
-    let client = Client::new(provider.clone());
-
-    // Make the first ack_work_item fail (but the ack actually succeeds internally)
-    // This simulates a transient failure where the ack completed but we got an error
-    failing_provider.set_ack_then_fail(true);
-    failing_provider.fail_next_ack_work_item();
-
-    client
-        .start_orchestration("ack-fail-test", "AckFailOrch", "")
+    let test = AckTest::new(activities).await;
+    test.start().await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    test.provider.fail_next_ack_work_item_retryable(3);
+    test.client
+        .cancel_instance("ack-test", "test cancellation")
         .await
         .unwrap();
 
-    // Wait for completion
-    let status = client
-        .wait_for_orchestration("ack-fail-test", Duration::from_secs(5))
-        .await
-        .unwrap();
-
-    match status {
-        runtime::OrchestrationStatus::Completed { output, .. } => {
-            assert_eq!(output, "done");
+    assert!(matches!(
+        test.finish().await,
+        runtime::OrchestrationStatus::Failed {
+            details: ErrorDetails::Application {
+                kind: AppErrorKind::Cancelled { .. },
+                ..
+            },
+            ..
         }
-        other => panic!("Unexpected status: {other:?}"),
-    }
+    ));
+    assert_eq!(test.provider.remaining_retryable_ack_failures(), 0);
+    assert_eq!(execution_count.load(Ordering::SeqCst), 1);
 
-    // Activity should have executed at least once
-    // (may execute twice if retry happened - that's fine for this test)
-    assert!(
-        execution_count.load(Ordering::SeqCst) >= 1,
-        "Activity should execute at least once"
+    let calls = test.provider.work_item_calls();
+    assert_eq!(calls.len(), 5);
+    let WorkItemCall::Ack {
+        token,
+        completion: None,
+    } = &calls[0]
+    else {
+        panic!("Cancellation must acknowledge without a completion: {calls:?}");
+    };
+    assert!(calls[..4].iter().all(|call| call == &calls[0]), "{calls:?}");
+    // Cancellation deleted the queue entry, so the final ack fails permanently.
+    assert_eq!(calls[4], WorkItemCall::Abandon { token: token.clone() });
+}
+
+#[tokio::test]
+async fn worker_retryable_ack_error_after_commit_does_not_duplicate_completion() {
+    let (activities, execution_count) = counting_activity(Ok("done".to_string()));
+    let test = AckTest::new(activities).await;
+    test.provider.set_ack_then_fail(true);
+    test.provider.fail_next_ack_work_item_retryable(1);
+    test.start().await;
+
+    assert!(matches!(
+        test.finish().await,
+        runtime::OrchestrationStatus::Completed { output, .. } if output == "done"
+    ));
+    assert_eq!(test.provider.remaining_retryable_ack_failures(), 0);
+    assert_eq!(execution_count.load(Ordering::SeqCst), 1);
+
+    let calls = test.provider.work_item_calls();
+    assert_eq!(calls.len(), 3);
+    let WorkItemCall::Ack {
+        token,
+        completion: Some(WorkItem::ActivityCompleted { result, .. }),
+    } = &calls[0]
+    else {
+        panic!("Expected an activity completion: {calls:?}");
+    };
+    assert_eq!(result, "done");
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(calls[2], WorkItemCall::Abandon { token: token.clone() });
+
+    let history = test.provider.read("ack-test").await.unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::ActivityCompleted { .. }))
+            .count(),
+        1,
+        "An ambiguous commit must not produce duplicate activity completions"
     );
-
-    rt.shutdown(None).await;
 }
