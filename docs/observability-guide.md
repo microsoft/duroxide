@@ -192,6 +192,8 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_orchestration_history_size` | Histogram | Orchestration | orchestration_name | Detect history growth issues |
 | `duroxide_orchestration_turns` | Histogram | Orchestration | orchestration_name | Identify multi-turn orchestrations |
 | `duroxide_orchestration_continue_as_new_total` | Counter | Orchestration | orchestration_name, execution_id | Track CAN operations |
+| `duroxide_orchestration_poison_total` | Counter | Orchestration | _(none)_ | Confirmed poison acknowledgements |
+| `duroxide_orchestration_poison_failed_total` | Counter | Orchestration | _(none)_ | Poison acknowledgements that returned an error after retries |
 | `duroxide_active_orchestrations` | Gauge | Orchestration | _(none)_ | **Current** active count |
 | **Activity Execution** |
 | `duroxide_activity_executions_total` | Counter | Activity | activity_name, outcome, retry_attempt | Track success/failure rates |
@@ -255,6 +257,29 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 - **Description**: Continue-as-new operations performed
 - **Labels**: `orchestration_name`, `execution_id`
 - **Use**: Verify continue-as-new is working, identify long-running actors
+
+**Poison acknowledgement counters**
+
+`duroxide_orchestration_poison_total` counts poison acknowledgements confirmed by
+the provider. `duroxide_orchestration_poison_failed_total` counts those that return
+an error after the runtime's retry handling. Each disposition contributes to one
+counter, not once per acknowledgement retry. Neither counter has labels.
+
+Both counters include failures propagated from poisoned activities or child
+orchestrations, not just orchestrations that exceed their own attempt budget.
+For propagated failures, the logged attempt count and maximum come from the
+original poison error.
+
+An acknowledgement error does not prove the disposition failed to commit: its
+response may have been lost, or another dispatcher may have completed the work
+after a lease expired. These counters describe observed acknowledgement outcomes,
+not an exact ledger of durable terminations. Repeated failures warrant investigation;
+the error log includes the instance, attempt count, configured maximum, and provider
+error. This reporting does not change retry, backoff, or lease behavior.
+
+For in-process diagnostics, the failed count is available through
+`MetricsProvider::orchestration_poison_failed()` on the runtime's existing
+observability handle. The public `MetricsSnapshot` layout is unchanged.
 
 **`duroxide_active_orchestrations`** (Gauge) 🆕
 - **Description**: Current number of orchestration instances that are actively running (not completed/failed)

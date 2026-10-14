@@ -23,21 +23,25 @@ async fn external_duplicate_workitems_dedup() {
     };
     let orchestration_registry = OrchestrationRegistry::builder().register("WaitEvt", orch).build();
     let activity_registry = ActivityRegistry::builder().build();
-    let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
+    let rt =
+        runtime::Runtime::start_with_store(store.clone(), activity_registry.clone(), orchestration_registry.clone())
+            .await;
     let client = duroxide::Client::new(store.clone());
 
     let inst = "inst-ext-dup";
     client.start_orchestration(inst, "WaitEvt", "").await.unwrap();
     assert!(common::wait_for_subscription(store.clone(), inst, "Evt", 2_000).await);
 
-    // enqueue duplicate externals
+    // Both events must share a batch; a later batch would be discarded after completion.
+    rt.shutdown(None).await;
     let wi = WorkItem::ExternalRaised {
         instance: inst.to_string(),
         name: "Evt".to_string(),
         data: "ok".to_string(),
     };
-    let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
-    let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
+    store.enqueue_for_orchestrator(wi.clone(), None).await.unwrap();
+    store.enqueue_for_orchestrator(wi, None).await.unwrap();
+    let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
 
     // wait for completion
     let ok = common::wait_for_history(
@@ -55,7 +59,7 @@ async fn external_duplicate_workitems_dedup() {
     // Both external events are materialized in history (unconditional materialization).
     // Only the first is delivered to the subscription (causal check); the second
     // has no pending subscription slot and is a no-op at replay time.
-    let hist = store.read(inst).await.unwrap_or_default();
+    let hist = store.read(inst).await.unwrap();
     let external_events: Vec<&Event> = hist
         .iter()
         .filter(|e| matches!(&e.kind, EventKind::ExternalEvent { name, .. } if name == "Evt"))
@@ -246,7 +250,9 @@ async fn crash_after_dequeue_before_append_completion() {
     };
     let orchestration_registry = OrchestrationRegistry::builder().register("WaitEvt", orch).build();
     let activity_registry = ActivityRegistry::builder().build();
-    let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
+    let rt =
+        runtime::Runtime::start_with_store(store.clone(), activity_registry.clone(), orchestration_registry.clone())
+            .await;
     let client = duroxide::Client::new(store.clone());
 
     // Start orchestration and wait for subscription
@@ -254,17 +260,35 @@ async fn crash_after_dequeue_before_append_completion() {
     client.start_orchestration(inst, "WaitEvt", "").await.unwrap();
     assert!(common::wait_for_subscription(store.clone(), inst, "Evt", 2_000).await);
 
-    // Enqueue the external work item
+    // Keep both arrivals pending across the restart so the first cannot complete the turn early.
+    rt.shutdown(None).await;
+    let history_before_crash = store.read(inst).await.unwrap();
     let wi = WorkItem::ExternalRaised {
         instance: inst.to_string(),
         name: "Evt".to_string(),
         data: "ok".to_string(),
     };
-    let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
-    // Simulate crash-before-append by enqueuing duplicate before runtime gets to append
-    let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
+    store.enqueue_for_orchestrator(wi.clone(), None).await.unwrap();
+    store.enqueue_for_orchestrator(wi, None).await.unwrap();
 
-    // Wait for completion, ensure a single ExternalEvent recorded
+    // Simulate a dispatcher disappearing after fetch, without acknowledging or abandoning its lease.
+    let (fetched, _lock_token, attempt_count) = store
+        .fetch_orchestration_item(Duration::from_millis(100), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("the pending event batch should be available before the crash");
+    assert_eq!(fetched.instance, inst);
+    assert_eq!(fetched.messages.len(), 2);
+    assert_eq!(attempt_count, 1);
+    assert_eq!(
+        store.read(inst).await.unwrap(),
+        history_before_crash,
+        "fetching the batch must not append its events or completion"
+    );
+
+    let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
+
+    // Wait for completion; both arrivals in the batch must be recorded.
     let ok = common::wait_for_history(
         store.clone(),
         inst,
@@ -278,12 +302,19 @@ async fn crash_after_dequeue_before_append_completion() {
     assert!(ok, "timeout waiting for completion");
     // Both external events are materialized in history (unconditional materialization).
     // Only the first is delivered (causal check); the duplicate is a no-op at replay time.
-    let hist = store.read(inst).await.unwrap_or_default();
+    let hist = store.read(inst).await.unwrap();
     let evs: Vec<&Event> = hist
         .iter()
         .filter(|e| matches!(&e.kind, EventKind::ExternalEvent { .. }))
         .collect();
     assert_eq!(evs.len(), 2);
+    assert_eq!(
+        hist.iter()
+            .filter(|e| matches!(&e.kind, EventKind::OrchestrationCompleted { .. }))
+            .count(),
+        1,
+        "recovery must commit exactly one completion"
+    );
 
     rt.shutdown(None).await;
 }
