@@ -56,6 +56,9 @@ duroxide = "0.1"  # Core only — bring your own Provider
 
 ### Hello world
 
+The fallible lifecycle calls below are **unreleased**. Use the source build
+containing these changes; the published 0.1.32 crate does not have them.
+
 ```rust
 use std::sync::Arc;
 use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
@@ -82,7 +85,10 @@ let orchestrations = OrchestrationRegistry::builder()
     })
     .build();
 
-let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+let rt = runtime::Runtime::prepare(
+    store.clone(), activities, orchestrations, runtime::RuntimeOptions::default(),
+)?;
+Arc::clone(&rt).start_execution().await?;
 let client = Client::new(store);
 
 client.start_orchestration("inst-1", "HelloWorld", "Rust").await?;
@@ -91,10 +97,37 @@ match client.wait_for_orchestration("inst-1", std::time::Duration::from_secs(5))
     other => panic!("unexpected: {other:?}"),
 }
 
-rt.shutdown(None).await;
+rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await?;
 # Ok(())
 # }
 ```
+
+### Worker lifetime (unreleased)
+
+Use `Runtime::prepare` followed by `Arc::clone(&runtime).start_execution().await`
+to handle startup failures without panicking. Preparation does not dispatch or
+perform provider I/O. The legacy `start*` factories retain their panic-shaped
+startup contract, but partial startup work still has an owned rollback.
+
+Use `shutdown_with_grace(grace)` to observe actual cleanup with a typed result.
+It returns `Result<ShutdownOutcome, RuntimeShutdownError>`: `Drained`/`Forced`
+prove retirement of tracked native work and registered foreign cleanup. Grace is
+not a total wait limit: non-yielding work or a foreign tail can keep cleanup
+pending indefinitely. Concurrent native callers can shorten grace. Dropping a
+native waiter retains task ownership, but another call may be needed to drive
+force and finish shutdown.
+
+`request_shutdown()` promptly closes admission; `shutdown_until(deadline)` lets
+an adapter inherit an existing grace deadline. The language SDKs retain one
+cleanup future and separately bound their callers' waits. A stopped runtime
+cannot restart. Operational failures stay errors; inspect `is_quiescent()`
+rather than assuming an error proves retirement.
+
+Legacy `shutdown(None)` still returns `()` after cleanup, with one second of grace
+and no implicit total deadline. It logs operational failures. Native grace is not
+restricted by SDK nanosecond transport limits. See the
+[lifecycle guide](docs/ORCHESTRATION-GUIDE.md#worker-lifecycle-unreleased) for
+validation, provider I/O, and language-adapter boundaries.
 
 ### Surviving crashes
 

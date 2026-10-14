@@ -32,13 +32,16 @@
 //! 4. If the activity doesn't complete, it's aborted and the work item is dropped
 
 use crate::providers::WorkItem;
+use futures_util::FutureExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::{AbortOnDropHandle, TaskTracker};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
+use super::super::task_safety::{FailureKind, TaskRole, record_panic};
 use super::super::{Runtime, registry};
 
 // ============================================================================
@@ -206,7 +209,7 @@ impl Runtime {
                 session_owner_ids.push(session_owner.clone());
             }
 
-            let handle = self.task_tracker.spawn(async move {
+            let handle = self.clone().spawn_tracked(TaskRole::WorkerSlot, async move {
                 let mut consecutive_retryable_errors: u32 = 0;
 
                 loop {
@@ -269,7 +272,7 @@ impl Runtime {
         // Spawn a single session manager background task for heartbeat + cleanup
         let session_rt = Arc::clone(&self);
         let session_cancel = cancel.clone();
-        let session_handle = self.task_tracker.spawn(async move {
+        let session_handle = self.clone().spawn_tracked(TaskRole::SessionManager, async move {
             run_session_manager(session_rt, session_cancel, session_owner_ids).await;
         });
         worker_handles.push(session_handle);
@@ -473,7 +476,7 @@ async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::Activity
     let cancellation_token = CancellationToken::new();
 
     let manager_handle = spawn_activity_manager(
-        &rt.task_tracker,
+        rt,
         Arc::clone(&rt.history_store),
         ctx.lock_token.clone(),
         rt.options.worker_lock_timeout,
@@ -559,10 +562,10 @@ async fn run_activity_with_cancellation(
     let input = ctx.input.clone();
     // Abort-on-drop so the invocation cannot outlive this task if the worker is
     // aborted mid-activity during shutdown.
-    let mut activity_handle = AbortOnDropHandle::new(
-        rt.task_tracker
-            .spawn(async move { handler.invoke(activity_ctx, input).await }),
-    );
+    let mut activity_handle = AbortOnDropHandle::new(rt.clone().spawn_tracked(
+        TaskRole::ActivityInvocation,
+        invoke_activity(rt.clone(), handler, activity_ctx, input),
+    ));
 
     tokio::select! {
         joined = &mut activity_handle => {
@@ -621,6 +624,47 @@ async fn run_activity_with_cancellation(
             (result, ActivityOutcome::Cancelled)
         }
     }
+}
+
+async fn invoke_activity(
+    runtime: Arc<Runtime>,
+    handler: Arc<dyn crate::runtime::ActivityHandler>,
+    context: crate::ActivityContext,
+    input: String,
+) -> Result<String, String> {
+    let mut future = handler.invoke(context, input);
+    let result = AssertUnwindSafe(future.as_mut()).catch_unwind().await;
+    let mut failures = Vec::new();
+    let result = match result {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_string()))
+                .unwrap_or_else(|| "activity panicked".to_string());
+            // User panics remain durable application errors, not runtime failures.
+            if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+                record_panic(
+                    "activity-panic-payload",
+                    FailureKind::PanicPayloadPanicked,
+                    secondary,
+                    &mut failures,
+                );
+            }
+            Err(message)
+        }
+    };
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
+        record_panic(
+            "activity-invocation",
+            FailureKind::DestructionPanicked,
+            payload,
+            &mut failures,
+        );
+    }
+    runtime.record_faults(&failures);
+    result
 }
 
 // ============================================================================
@@ -806,7 +850,7 @@ fn calculate_renewal_interval(lock_timeout: Duration, buffer: Duration) -> Durat
 ///
 /// Handles: lock renewal, cancellation detection, and cancellation signaling.
 fn spawn_activity_manager(
-    task_tracker: &TaskTracker,
+    runtime: &Arc<Runtime>,
     store: Arc<dyn crate::providers::Provider>,
     token: String,
     lock_timeout: Duration,
@@ -834,7 +878,7 @@ fn spawn_activity_manager(
     // renewing may still be running, and releasing the lock early would let another
     // node steal the work item and execute it twice. The owning worker stops this
     // task instead (this handle aborts on drop).
-    AbortOnDropHandle::new(task_tracker.spawn(async move {
+    AbortOnDropHandle::new(runtime.clone().spawn_tracked(TaskRole::ActivityManager, async move {
         let mut interval = tokio::time::interval(renewal_interval);
         interval.tick().await; // Skip first immediate tick
 

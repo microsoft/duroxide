@@ -1018,6 +1018,15 @@ pub enum WorkItem {
 /// All tests use the Provider trait directly (not runtime), so they're portable to new providers.
 /// See `docs/provider-implementation-guide.md` for detailed implementation guidance including instance locks.
 ///
+/// # Runtime shutdown and polling
+///
+/// The runtime preserves configured long-poll timeouts and normal idle backoff.
+/// Shutdown can drop a pending fetch; after grace, it can also drop in-flight
+/// acknowledgement and renewal. Providers must release owned resources on drop,
+/// retain peek-lock recovery and keep acknowledgements atomic. Dropping a future
+/// does not guarantee rollback of a storage operation already submitted.
+/// Runtime cleanup cannot join detached work started internally by a provider.
+///
 /// Core provider trait for runtime orchestration operations.
 ///
 /// This trait defines the essential methods required for durable orchestration execution.

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Foreign-runtime lifecycle integration** - Fallible preparation/activation,
+  prompt stop acceptance and typed cleanup results extend the existing
+  `TaskTracker` ownership model. Registered foreign completion and pre-snapshot
+  finalization prevent native task completion from prematurely releasing foreign
+  work. Native shutdown retains grace-then-cleanup semantics; language adapters
+  own bounded observation and independent cleanup progress.
+
 ## [0.1.32] - 2026-10-11
 
 **Release:** <https://crates.io/crates/duroxide/0.1.32>
