@@ -4,8 +4,8 @@
 [![Crates.io](https://img.shields.io/crates/v/duroxide.svg)](https://crates.io/crates/duroxide)
 [![Documentation](https://docs.rs/duroxide/badge.svg)](https://docs.rs/duroxide)
 
-> **[Latest Release: v0.1.30](https://crates.io/crates/duroxide/0.1.30)** — Sub-orchestration parent-link and collision fixes, safer IDs, and UUID generation.
-> See [CHANGELOG.md](CHANGELOG.md#0130---2026-07-29) for release notes.
+> **[Latest Release: v0.1.32](https://crates.io/crates/duroxide/0.1.32)** — Queue and signal race fixes, exact continue-as-new carry-forward, no lost inputs between executions, deterministic KV key order, and a shutdown that stops every runtime task.
+> See [CHANGELOG.md](CHANGELOG.md#0132---2026-10-11) for release notes.
 >
 > **Release policy:** Official packages are published through Microsoft-managed
 > internal pipelines. Repository GitHub Actions are validation-only. See
@@ -57,7 +57,7 @@ duroxide = "0.1"  # Core only — bring your own Provider
 ### Hello world
 
 The fallible lifecycle calls below are **unreleased**. Use the source build
-containing these changes; the published 0.1.30 crate does not have them.
+containing these changes; the published 0.1.32 crate does not have them.
 
 ```rust
 use std::sync::Arc;
@@ -109,23 +109,23 @@ to handle startup failures without panicking. Preparation does not dispatch or
 perform provider I/O. The legacy `start*` factories retain their panic-shaped
 startup contract, but partial startup work still has an owned rollback.
 
-Prefer `shutdown_with_grace(grace)` or `shutdown_with_timeouts(grace, total)`.
-They return `Result<ShutdownOutcome, RuntimeShutdownError>`: `Drained`/`Forced`
-prove retirement of the runtime's owned execution tree and registered foreign
-cleanup. Idle workers can stop early. The first valid stop fixes the deadlines;
-force at grace expiry does not guarantee cleanup finishes before total. Dropping
-a waiter or observing timeout does not drop cleanup ownership.
+Use `shutdown_with_grace(grace)` to observe actual cleanup with a typed result.
+It returns `Result<ShutdownOutcome, RuntimeShutdownError>`: `Drained`/`Forced`
+prove retirement of tracked native work and registered foreign cleanup. Grace is
+not a total wait limit: non-yielding work or a foreign tail can keep cleanup
+pending indefinitely. Concurrent native callers can shorten grace. Dropping a
+native waiter retains task ownership, but another call may be needed to drive
+force and finish shutdown.
 
-`TimedOut` requires application/supervisor process termination even if a later
-observation proves cleanup. The SDK never kills the process and a stopped runtime
-cannot restart. `wait_for_shutdown_completion()` is an explicit, potentially
-indefinite observer of an already accepted stop, not an implicit disposal policy.
-An operational error remains an error; inspect `is_quiescent()` rather than
-assuming error means retirement.
+`request_shutdown()` promptly closes admission; `shutdown_until(deadline)` lets
+an adapter inherit an existing grace deadline. The language SDKs retain one
+cleanup future and separately bound their callers' waits. A stopped runtime
+cannot restart. Operational failures stay errors; inspect `is_quiescent()`
+rather than assuming an error proves retirement.
 
-Legacy `shutdown(None)` still returns `()`, with one second of grace and six
-seconds total. It logs bounded best-effort failures instead of using timeout as
-a panic policy; its ordinary return is **not** proof of quiescence. See the
+Legacy `shutdown(None)` still returns `()` after cleanup, with one second of grace
+and no implicit total deadline. It logs operational failures. Native grace is not
+restricted by SDK nanosecond transport limits. See the
 [lifecycle guide](docs/ORCHESTRATION-GUIDE.md#worker-lifecycle-unreleased) for
 validation, provider I/O, and language-adapter boundaries.
 

@@ -18,11 +18,12 @@ use crate::providers::{ExecutionMetadata, ProviderError, ScheduledActivityIdenti
 use crate::{Event, EventKind};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
+use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
-use super::super::invocation_scope::{CleanupAttachment, InvocationScope};
-use super::super::task_group::{TaskResult, TaskRole};
+use super::super::invocation_scope::InvocationGuard;
+use super::super::task_safety::TaskRole;
 use super::super::{HistoryManager, Runtime, WorkItemReader};
 
 /// Validate runtime limits on the history delta and fail the orchestration if any are exceeded.
@@ -274,62 +275,55 @@ fn calculate_renewal_interval(lock_timeout: Duration, buffer: Duration) -> Durat
 }
 
 /// Spawn a background task to renew the lock for an in-flight orchestration.
-async fn run_orchestration_lock_renewal_task(
-    rt: Arc<Runtime>,
+fn spawn_orchestration_lock_renewal_task(
+    runtime: &Arc<Runtime>,
+    store: Arc<dyn crate::providers::Provider>,
     token: String,
-    retired: CancellationToken,
-) -> TaskResult {
-    Arc::clone(&rt)
-        .own_task(TaskRole::OrchestrationRenewal, move |_| {
-            Box::pin(async move {
-                let lock_timeout = rt.options.orchestrator_lock_timeout;
-                let buffer = rt.options.orchestrator_lock_renewal_buffer;
-                let renewal_interval = calculate_renewal_interval(lock_timeout, buffer);
+    lock_timeout: Duration,
+    buffer: Duration,
+) -> AbortOnDropHandle<()> {
+    let renewal_interval = calculate_renewal_interval(lock_timeout, buffer);
 
-                tracing::debug!(
-                    target: "duroxide::runtime::dispatchers::orchestration",
-                    lock_token = %token,
-                    lock_timeout_secs = %lock_timeout.as_secs(),
-                    buffer_secs = %buffer.as_secs(),
-                    renewal_interval_secs = %renewal_interval.as_secs(),
-                    "Spawning orchestration lock renewal task"
-                );
+    tracing::debug!(
+        target: "duroxide::runtime::dispatchers::orchestration",
+        lock_token = %token,
+        lock_timeout_secs = %lock_timeout.as_secs(),
+        buffer_secs = %buffer.as_secs(),
+        renewal_interval_secs = %renewal_interval.as_secs(),
+        "Spawning orchestration lock renewal task"
+    );
 
-                #[cfg(feature = "test-hooks")]
-                rt.hooks()
-                    .checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(
-                        TaskRole::OrchestrationRenewal,
-                    ))
-                    .await;
+    // Deliberately does not observe the shutdown signal: the turn it is renewing may
+    // still be running, and releasing the lock early would let another node steal the
+    // item and execute it twice. The owning poller stops this task instead.
+    AbortOnDropHandle::new(
+        runtime
+            .clone()
+            .spawn_tracked(TaskRole::OrchestrationRenewal, async move {
                 let mut interval = tokio::time::interval(renewal_interval);
                 interval.tick().await; // Skip first immediate tick
 
                 loop {
-                    tokio::select! {
-                        biased;
-                        () = retired.cancelled() => break,
-                        () = rt.shutdown_state.force_signal().cancelled() => break,
-                        _ = interval.tick() => {
-                            match rt.history_store.renew_orchestration_item_lock(&token, lock_timeout).await {
-                                Ok(()) => {
-                                    tracing::trace!(
-                                        target: "duroxide::runtime::dispatchers::orchestration",
-                                        lock_token = %token,
-                                        extend_secs = %lock_timeout.as_secs(),
-                                        "Orchestration lock renewed"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        target: "duroxide::runtime::dispatchers::orchestration",
-                                        lock_token = %token,
-                                        error = %e,
-                                        "Failed to renew orchestration lock (may have been acked/abandoned)"
-                                    );
-                                    // Stop renewal - lock is gone or expired
-                                    break;
-                                }
-                            }
+                    interval.tick().await;
+
+                    match store.renew_orchestration_item_lock(&token, lock_timeout).await {
+                        Ok(()) => {
+                            tracing::trace!(
+                                target: "duroxide::runtime::dispatchers::orchestration",
+                                lock_token = %token,
+                                extend_secs = %lock_timeout.as_secs(),
+                                "Orchestration lock renewed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                target: "duroxide::runtime::dispatchers::orchestration",
+                                lock_token = %token,
+                                error = %e,
+                                "Failed to renew orchestration lock (may have been acked/abandoned)"
+                            );
+                            // Stop renewal - lock is gone or expired
+                            break;
                         }
                     }
                 }
@@ -339,19 +333,20 @@ async fn run_orchestration_lock_renewal_task(
                     lock_token = %token,
                     "Orchestration lock renewal task stopped"
                 );
-                Ok(())
-            })
-        })
-        .await
+            }),
+    )
 }
 
 impl Runtime {
-    /// Start the orchestration dispatcher with N concurrent workers
-    pub(in crate::runtime) async fn run_orchestration_dispatcher(self: Arc<Self>) -> TaskResult {
-        Arc::clone(&self).own_task(TaskRole::OrchestrationDispatcher, move |group| Box::pin(async move {
+    /// Start the orchestration dispatcher with N concurrent workers.
+    ///
+    /// Returns one handle per spawned worker. The caller must track them all: there is
+    /// no supervisor task, because aborting a supervisor would only detach its children.
+    pub(in crate::runtime) fn start_orchestration_dispatcher(self: Arc<Self>) -> Vec<JoinHandle<()>> {
         // EXECUTION: spawns N concurrent orchestration workers
         // Instance-level locking in provider prevents concurrent processing of same instance
         let concurrency = self.options.orchestration_concurrency;
+        let cancel = self.cancel.clone();
 
         // Build the capability filter once for all workers (immutable for this runtime's lifetime).
         let capability_filter = if let Some(ref custom_range) = self.options.supported_replay_versions {
@@ -378,178 +373,168 @@ impl Runtime {
             crate::providers::SemverRange::default_for_current_build()
         };
 
-            for worker_idx in 0..concurrency {
-                let rt = Arc::clone(&self);
-                let cap_filter = Some(capability_filter.clone());
-                let supported_range = runtime_supported_range.clone();
-                // Generate unique worker ID: orch-{index}-{runtime_id}
-                let worker_id = format!("orch-{worker_idx}-{}", rt.runtime_id);
-                group.spawn(TaskRole::OrchestrationSlot.name(), Arc::clone(&rt).own_task(
-                    TaskRole::OrchestrationSlot, move |_| Box::pin(async move {
-                    // debug!("Orchestration worker {} started", worker_id);
-                    let mut consecutive_retryable_errors = 0u32;
-                    loop {
-                        // Check shutdown flag before fetching
-                        if rt.is_stopping() {
-                            // debug!("Orchestration worker {} exiting", worker_id);
-                            break;
-                        }
+        let mut worker_handles = Vec::with_capacity(concurrency);
 
-                        let min_interval = rt.options.dispatcher_min_poll_interval;
-                        let poll_timeout = rt.options.dispatcher_long_poll_timeout;
-                        let start_time = std::time::Instant::now();
-                        let mut work_found = false;
+        for worker_idx in 0..concurrency {
+            let rt = Arc::clone(&self);
+            let cancel = cancel.clone();
+            let cap_filter = Some(capability_filter.clone());
+            let supported_range = runtime_supported_range.clone();
+            // Generate unique worker ID: orch-{index}-{runtime_id}
+            let worker_id = format!("orch-{worker_idx}-{}", rt.runtime_id);
+            let handle = self.clone().spawn_tracked(TaskRole::OrchestrationSlot, async move {
+                // debug!("Orchestration worker {} started", worker_id);
+                let mut consecutive_retryable_errors = 0u32;
+                loop {
+                    if cancel.is_cancelled() {
+                        // debug!("Orchestration worker {} exiting", worker_id);
+                        break;
+                    }
 
-                        match rt
-                            .history_store
-                            .fetch_orchestration_item(
-                                rt.options.orchestrator_lock_timeout,
-                                poll_timeout,
-                                cap_filter.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(Some((item, lock_token, attempt_count))) => {
-                                if rt.is_stopping() {
-                                    if rt.history_store.abandon_orchestration_item(&lock_token, None, true).await.is_err() {
-                                        warn!(target: "duroxide::runtime::lifecycle", category = "stop_abandon_orchestration_failed",
-                                            "Fetched orchestration could not be abandoned; lock-expiry recovery remains available");
-                                    }
-                                    break;
-                                }
-                                // Reset error counter on success
-                                consecutive_retryable_errors = 0;
+                    let min_interval = rt.options.dispatcher_min_poll_interval;
+                    let poll_timeout = rt.options.dispatcher_long_poll_timeout;
+                    let start_time = std::time::Instant::now();
+                    let mut work_found = false;
 
-                                // Runtime-side compatibility check (defense-in-depth).
-                                // Even if the provider filter missed this item (bug, provider ignoring filter),
-                                // we validate the pinned version before attempting replay.
-                                // The pinned version is extracted from the OrchestrationStarted event
-                                // (always event_id=1, always a known event type on any version).
-                                let pinned_version = item.history.iter().find_map(|e| {
-                                    if matches!(&e.kind, crate::EventKind::OrchestrationStarted { .. }) {
-                                        semver::Version::parse(&e.duroxide_version).ok()
-                                    } else {
-                                        None
-                                    }
-                                });
+                    // Only the fetch is raced against cancellation. Once an item is
+                    // locked, the turn runs to completion so it can be acked.
+                    let fetch = rt.history_store.fetch_orchestration_item(
+                        rt.options.orchestrator_lock_timeout,
+                        poll_timeout,
+                        cap_filter.as_ref(),
+                    );
 
-                                if let Some(pinned) = pinned_version
-                                    && !supported_range.contains(&pinned)
-                                {
-                                    tracing::warn!(
-                                        target: "duroxide::runtime",
-                                        instance = %item.instance,
-                                        pinned_version = %pinned,
-                                        supported_range = %format!(">={}, <={}", supported_range.min, supported_range.max),
-                                        attempt_count = attempt_count,
-                                        "Execution pinned at incompatible version, abandoning (runtime-side check)"
-                                    );
-                                    // Abandon with a short delay to prevent tight spin loops when
-                                    // a single runtime encounters incompatible items. The item still
-                                    // reaches max_attempts quickly (e.g., 10 × 1s = 10s) while
-                                    // avoiding CPU burn and starvation of compatible work items.
-                                    let _ = rt
-                                        .history_store
-                                        .abandon_orchestration_item(&lock_token, Some(Duration::from_secs(1)), false)
-                                        .await;
-                                    continue;
-                                }
-                                // pinned_version == None means no history yet (brand new instance)
-                                // — always compatible, proceed normally.
+                    let fetched = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        result = fetch => result,
+                    };
 
-                                Arc::clone(&rt).process_orchestration_owned(
-                                    item, lock_token, attempt_count, worker_id.clone(),
-                                ).await?;
+                    match fetched {
+                        Ok(Some((item, lock_token, attempt_count))) => {
+                            // Reset error counter on success
+                            consecutive_retryable_errors = 0;
 
-                                work_found = true;
-                            }
-                            Ok(None) => {
-                                // No work available - reset error counter
-                                consecutive_retryable_errors = 0;
-                            }
-                            Err(e) => {
-                                if e.is_retryable() {
-                                    // Exponential backoff for retryable errors (database locks, etc.)
-                                    consecutive_retryable_errors = consecutive_retryable_errors.saturating_add(1);
-                                    let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors.min(5))).min(3000);
-                                    warn!(
-                                        "Error fetching orchestration item (retryable, attempt {}): {:?}, backing off {}ms",
-                                        consecutive_retryable_errors, e, backoff_ms
-                                    );
-                                    rt.sleep_while_running(Duration::from_millis(backoff_ms)).await;
+                            // Runtime-side compatibility check (defense-in-depth).
+                            // Even if the provider filter missed this item (bug, provider ignoring filter),
+                            // we validate the pinned version before attempting replay.
+                            // The pinned version is extracted from the OrchestrationStarted event
+                            // (always event_id=1, always a known event type on any version).
+                            let pinned_version = item.history.iter().find_map(|e| {
+                                if matches!(&e.kind, crate::EventKind::OrchestrationStarted { .. }) {
+                                    semver::Version::parse(&e.duroxide_version).ok()
                                 } else {
-                                    // Permanent errors - log and continue with normal polling
-                                    warn!("Error fetching orchestration item (permanent): {:?}", e);
-                                    consecutive_retryable_errors = 0;
-                                    rt.sleep_while_running(Duration::from_millis(100)).await;
+                                    None
                                 }
+                            });
+
+                            if let Some(pinned) = pinned_version
+                                && !supported_range.contains(&pinned)
+                            {
+                                tracing::warn!(
+                                    target: "duroxide::runtime",
+                                    instance = %item.instance,
+                                    pinned_version = %pinned,
+                                    supported_range = %format!(">={}, <={}", supported_range.min, supported_range.max),
+                                    attempt_count = attempt_count,
+                                    "Execution pinned at incompatible version, abandoning (runtime-side check)"
+                                );
+                                // Abandon with a short delay to prevent tight spin loops when
+                                // a single runtime encounters incompatible items. The item still
+                                // reaches max_attempts quickly (e.g., 10 × 1s = 10s) while
+                                // avoiding CPU burn and starvation of compatible work items.
+                                let _ = rt
+                                    .history_store
+                                    .abandon_orchestration_item(&lock_token, Some(Duration::from_secs(1)), false)
+                                    .await;
                                 continue;
                             }
-                        }
+                            // pinned_version == None means no history yet (brand new instance)
+                            // — always compatible, proceed normally.
 
-                        // Enforce minimum polling interval to prevent hot loops
-                        if !work_found {
-                            let elapsed = start_time.elapsed();
-                            if elapsed < min_interval {
-                                let sleep_duration = min_interval - elapsed;
-                                rt.sleep_while_running(sleep_duration).await;
-                            } else {
-                                // Waited long enough (e.g. long poll timeout expired), yield to prevent starvation
-                                tokio::task::yield_now().await;
-                            }
-                        }
-                    }
-                    Ok(())
-                })));
-            }
-            #[cfg(feature = "test-hooks")]
-            self.hooks().checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(TaskRole::OrchestrationDispatcher)).await;
-            Ok(())
-        })).await
-    }
+                            // Spawn lock renewal task for this orchestration. Held as an
+                            // abort-on-drop guard so it cannot outlive this task if the
+                            // poller is aborted mid-turn.
+                            let _renewal_guard = spawn_orchestration_lock_renewal_task(
+                                &rt,
+                                Arc::clone(&rt.history_store),
+                                lock_token.clone(),
+                                rt.options.orchestrator_lock_timeout,
+                                rt.options.orchestrator_lock_renewal_buffer,
+                            );
 
-    async fn process_orchestration_owned(
-        self: Arc<Self>,
-        item: crate::providers::OrchestrationItem,
-        lock_token: String,
-        attempt_count: u32,
-        worker_id: String,
-    ) -> TaskResult {
-        Arc::clone(&self).own_work("orchestration-item", move |group| {
-            let retired = CancellationToken::new();
-            group.spawn_until_join(TaskRole::OrchestrationRenewal.name(), run_orchestration_lock_renewal_task(
-                Arc::clone(&self), lock_token.clone(), retired.clone(),
-            ), retired);
-            Box::pin(async move {
-                Arc::clone(&self).own_work("orchestration-turn", move |turn| {
-                    let scope = InvocationScope::new();
-                    #[cfg(feature = "test-hooks")]
-                    let scope = scope.with_hooks(self.hooks());
-                    let cleanup = scope.attachment();
-                    let cleanup_runtime = Arc::clone(&self);
-                    turn.retain_cleanup("invocation-cleanup",
-                        scope.retire_reporting(move |failures| cleanup_runtime.record_faults(failures)));
-                    Box::pin(async move {
-                        #[cfg(feature = "test-hooks")]
-                        {
-                            self.hooks().checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(TaskRole::OrchestrationSlot)).await;
+                            // TEST HOOK: Inject delay after spawning renewal task
+                            // This simulates slow processing to test lock renewal
+                            #[cfg(feature = "test-hooks")]
                             if let Some(delay) = crate::runtime::test_hooks::get_orch_processing_delay(&item.instance) {
+                                tracing::debug!(
+                                    instance = %item.instance,
+                                    delay_ms = delay.as_millis(),
+                                    "Test hook: injecting orchestration processing delay"
+                                );
                                 tokio::time::sleep(delay).await;
                             }
+
+                            // Process orchestration item atomically
+                            // Provider ensures no other worker has this instance locked
+                            rt.process_orchestration_item(item, &lock_token, attempt_count, &worker_id)
+                                .await;
+
+                            // Stop lock renewal now that the orchestration turn is complete.
+                            drop(_renewal_guard);
+
+                            work_found = true;
                         }
-                        if self.shutdown_state.force_signal().is_cancelled() {
-                            if self.history_store.abandon_orchestration_item(&lock_token, None, true).await.is_err() {
-                                warn!(target: "duroxide::runtime::lifecycle", category = "force_abandon_orchestration_failed",
-                                    "Forced orchestration could not be abandoned; lock-expiry recovery remains available");
+                        Ok(None) => {
+                            // No work available - reset error counter
+                            consecutive_retryable_errors = 0;
+                        }
+                        Err(e) => {
+                            let backoff = if e.is_retryable() {
+                                // Exponential backoff for retryable errors (database locks, etc.)
+                                consecutive_retryable_errors += 1;
+                                let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors)).min(3000);
+                                warn!(
+                                    "Error fetching orchestration item (retryable, attempt {}): {:?}, backing off {}ms",
+                                    consecutive_retryable_errors, e, backoff_ms
+                                );
+                                Duration::from_millis(backoff_ms)
+                            } else {
+                                // Permanent errors - log and continue with normal polling
+                                warn!("Error fetching orchestration item (permanent): {:?}", e);
+                                consecutive_retryable_errors = 0;
+                                Duration::from_millis(100)
+                            };
+
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Enforce minimum polling interval to prevent hot loops
+                    if !work_found {
+                        let elapsed = start_time.elapsed();
+                        if elapsed < min_interval {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(min_interval - elapsed) => {}
                             }
                         } else {
-                            self.process_orchestration_item(item, &lock_token, attempt_count, &worker_id, cleanup).await;
+                            // Waited long enough (e.g. long poll timeout expired), yield to prevent starvation
+                            tokio::task::yield_now().await;
                         }
-                        Ok(())
-                    })
-                }).await
-            })
-        }).await
+                    }
+                }
+            });
+            worker_handles.push(handle);
+        }
+
+        worker_handles
     }
 
     /// Process a single orchestration item atomically
@@ -559,7 +544,6 @@ impl Runtime {
         lock_token: &str,
         attempt_count: u32,
         worker_id: &str,
-        cleanup: CleanupAttachment,
     ) {
         // EXECUTION: builds deltas and commits via ack_orchestration_item
         let instance = &item.instance;
@@ -592,7 +576,7 @@ impl Runtime {
             // version capable of deserialising these events) a window to pick it up,
             // without the exponential growth that would slow down the poison path.
             let backoff = Duration::from_secs(1);
-            let remaining = self.options.max_attempts.saturating_sub(attempt_count);
+            let remaining = self.options.attempts_until_poison(attempt_count);
             warn!(
                 instance = %instance,
                 error = %error,
@@ -612,19 +596,51 @@ impl Runtime {
         // Extract metadata from history and work items
         let temp_history_mgr = HistoryManager::from_history(&item.history);
         let workitem_reader = WorkItemReader::from_messages(&item.messages, &temp_history_mgr, instance);
+        // Runtimes before 0.1.31 poisoned a successor into the previous execution, after its
+        // CAN row. That instance is terminal.
+        let terminal_after_can = temp_history_mgr.is_continued_as_new
+            && item
+                .history
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::OrchestrationFailed { .. }));
 
-        // Bail on truly terminal histories (Completed/Failed), or ContinuedAsNew without a CAN start message
-        if temp_history_mgr.is_completed
-            || temp_history_mgr.is_failed
-            || (temp_history_mgr.is_continued_as_new && !workitem_reader.is_continue_as_new)
-        {
-            warn!(instance = %instance, "Instance is terminal (completed/failed or CAN without start), acking batch without processing");
+        // Between executions nothing can run until the successor's start arrives. The start
+        // is committed with the CAN row, but this batch can miss it: the fetch cutoff preceded
+        // its visible_at, or a delayed abandon pushed it (for example an old worker without the
+        // successor's version). Keep every input and retry with the backoff and attempt budget
+        // of an unregistered handler. Successor replay drops stale completions; order against
+        // later arrivals is best effort, as with any delayed abandon.
+        if temp_history_mgr.is_continued_as_new && !terminal_after_can && !workitem_reader.is_continue_as_new {
+            let backoff = self.options.unregistered_backoff.delay(attempt_count);
+            let remaining_attempts = self.options.attempts_until_poison(attempt_count);
+            warn!(
+                instance = %instance,
+                attempt_count,
+                max_attempts = self.options.max_attempts,
+                remaining_attempts,
+                backoff_secs = %backoff.as_secs_f32(),
+                messages = item.messages.len(),
+                "CAN successor start not visible, abandoning instance inputs with {:.1}s backoff (will poison in {} more attempts)",
+                backoff.as_secs_f32(),
+                remaining_attempts
+            );
+            // If the abandon fails, the lock expires and the inputs are redelivered.
+            let _ = self
+                .history_store
+                .abandon_orchestration_item(lock_token, Some(backoff), false)
+                .await;
+            return;
+        }
+
+        // Bail on truly terminal histories (Completed/Failed)
+        if temp_history_mgr.is_completed || temp_history_mgr.is_failed || terminal_after_can {
+            warn!(instance = %instance, "Instance is terminal (completed/failed), acking batch without processing");
             // If this terminal instance receives a StartOrchestration for the same child id,
             // the incoming start is discarded here. When that start belongs to a different
             // scheduling parent than the terminal child originally recorded, notify the
             // incoming parent with SubOrchFailed so it does not wait forever for a child
             // start that was never accepted.
-            let orchestrator_items = self.terminal_collision_notifications(&item).await;
+            let orchestrator_items = self.terminal_collision_notifications(&item, &temp_history_mgr).await;
             let _ = self
                 .ack_orchestration_with_changes(
                     lock_token,
@@ -641,6 +657,11 @@ impl Runtime {
 
         // Extract version before moving temp_history_mgr
         let version = temp_history_mgr.version().unwrap_or_else(|| "unknown".to_string());
+        let collision_notifications = if !item.history.is_empty() {
+            self.terminal_collision_notifications(&item, &temp_history_mgr).await
+        } else {
+            Vec::new()
+        };
 
         // Decide execution id and history to use for this execution
         let (execution_id_to_use, mut history_mgr) = if workitem_reader.is_continue_as_new {
@@ -673,7 +694,6 @@ impl Runtime {
                         execution_id_to_use,
                         worker_id,
                         item.kv_snapshot.clone(),
-                        cleanup,
                     )
                     .await;
 
@@ -709,7 +729,7 @@ impl Runtime {
                     Err(OrchestrationProcessingError::UnregisteredOrchestration) => {
                         // Orchestration not registered - abandon with exponential backoff
                         let backoff = self.options.unregistered_backoff.delay(attempt_count);
-                        let remaining_attempts = self.options.max_attempts.saturating_sub(attempt_count);
+                        let remaining_attempts = self.options.attempts_until_poison(attempt_count);
 
                         tracing::warn!(
                             target: "duroxide::runtime",
@@ -971,6 +991,7 @@ impl Runtime {
         }
 
         // Robust ack with basic retry on any provider error
+        orchestrator_items.extend(collision_notifications.iter().cloned());
         match self
             .ack_orchestration_with_changes(
                 lock_token,
@@ -1017,7 +1038,7 @@ impl Runtime {
                         execution_id_for_ack,
                         failure_delta.clone(),
                         vec![],
-                        vec![],
+                        collision_notifications,
                         failure_metadata,
                         vec![], // cancelled_activities - none for failure commits
                     )
@@ -1030,15 +1051,11 @@ impl Runtime {
                     Err(e2) => {
                         // Failed to commit failure event - abandon lock
                         warn!(instance = %instance, error = %e2, "Failed to commit failure event, abandoning lock");
-                        if self
-                            .history_store
-                            .abandon_orchestration_item(lock_token, Some(std::time::Duration::from_millis(50)), false)
-                            .await
-                            .is_err()
-                        {
-                            warn!(target: "duroxide::runtime::lifecycle", category = "abandon_orchestration_failed",
-                                "Failed orchestration acknowledgment could not be abandoned; lock-expiry recovery remains available");
-                        }
+                        drop(self.history_store.abandon_orchestration_item(
+                            lock_token,
+                            Some(std::time::Duration::from_millis(50)),
+                            false,
+                        ));
                     }
                 }
             }
@@ -1054,7 +1071,6 @@ impl Runtime {
     ///
     /// Returns `Err(UnregisteredOrchestration)` if the handler is not found in the registry,
     /// which the caller should handle by abandoning with backoff for rolling deployment support.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) async fn resolve_and_execute_orchestration_handler(
         self: &Arc<Self>,
         instance: &str,
@@ -1063,7 +1079,6 @@ impl Runtime {
         execution_id: u64,
         worker_id: &str,
         kv_snapshot: std::collections::HashMap<String, crate::providers::KvEntry>,
-        cleanup: CleanupAttachment,
     ) -> Result<(Vec<WorkItem>, Vec<WorkItem>, Vec<ScheduledActivityIdentifier>), OrchestrationProcessingError> {
         let mut worker_items = Vec::new();
         let mut orchestrator_items = Vec::new();
@@ -1133,6 +1148,7 @@ impl Runtime {
         }
 
         // Run the atomic execution to get all changes, passing the resolved handler and version
+        let invocation = InvocationGuard::new(Arc::clone(self));
         let (_exec_history_delta, exec_worker_items, exec_orchestrator_items, exec_cancelled_activities, _result) =
             Arc::clone(self)
                 .run_single_execution_scoped(
@@ -1144,7 +1160,7 @@ impl Runtime {
                     handler,
                     resolved_version.to_string(),
                     kv_snapshot,
-                    cleanup,
+                    invocation.attachment(),
                 )
                 .await;
 
@@ -1222,25 +1238,17 @@ impl Runtime {
                     if attempts < max_attempts {
                         let backoff_ms = 10u64.saturating_mul(1 << attempts);
                         warn!(attempts, backoff_ms, error = %e, "ack_orchestration_item failed; retrying");
-                        tokio::select! {
-                            biased;
-                            () = self.shutdown_state.force_signal().cancelled() => {}
-                            () = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
-                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         attempts += 1;
                         continue;
                     } else {
                         warn!(attempts, error = %e, "Failed to ack_orchestration_item after max retries");
                         // Abandon the item to release lock
-                        if self
-                            .history_store
-                            .abandon_orchestration_item(lock_token, Some(std::time::Duration::from_millis(50)), false)
-                            .await
-                            .is_err()
-                        {
-                            warn!(target: "duroxide::runtime::lifecycle", category = "abandon_orchestration_failed",
-                                "Exhausted orchestration acknowledgment could not be abandoned; lock-expiry recovery remains available");
-                        }
+                        drop(self.history_store.abandon_orchestration_item(
+                            lock_token,
+                            Some(std::time::Duration::from_millis(50)),
+                            false,
+                        ));
                         return Err(e);
                     }
                 }
@@ -1258,12 +1266,21 @@ impl Runtime {
         lock_token: &str,
         attempt_count: u32,
     ) {
+        // Between executions the batch belongs to the successor, which has no history yet.
+        // It fails as its own execution, so the previous one still ends in ContinuedAsNew.
+        let latest = HistoryManager::from_history(&item.history);
+        let successor = latest.is_continued_as_new;
+        let execution_id = if successor {
+            item.execution_id + 1
+        } else {
+            item.execution_id
+        };
         let error = crate::ErrorDetails::Poison {
             attempt_count,
             max_attempts: self.options.max_attempts,
             message_type: crate::PoisonMessageType::Orchestration {
                 instance: item.instance.clone(),
-                execution_id: item.execution_id,
+                execution_id,
             },
             message: serde_json::to_string(&item.messages).unwrap_or_default(),
         };
@@ -1326,7 +1343,7 @@ impl Runtime {
         }
 
         // Create failure event and commit
-        let mut history_mgr = HistoryManager::from_history(&item.history);
+        let mut history_mgr = HistoryManager::from_history(if successor { &[] } else { &item.history });
 
         // Track parent info for sub-orchestration failure notification
         let mut parent_link: Option<(String, Option<u64>, u64)> = None;
@@ -1338,6 +1355,7 @@ impl Runtime {
                 item.messages
                     .iter()
                     .find_map(|msg| match msg {
+                        // A successor starts only from its CAN start, never from a duplicate.
                         WorkItem::StartOrchestration {
                             orchestration,
                             input,
@@ -1345,7 +1363,7 @@ impl Runtime {
                             parent_id,
                             parent_execution_id,
                             ..
-                        } => Some((
+                        } if !successor => Some((
                             orchestration.clone(),
                             input.clone(),
                             parent_instance.clone(),
@@ -1374,7 +1392,17 @@ impl Runtime {
                         )),
                         _ => None,
                     })
-                    .unwrap_or_else(|| (item.orchestration_name.clone(), String::new(), None, None, None, None));
+                    // A successor whose start is missing keeps the previous execution's parent.
+                    .unwrap_or_else(|| {
+                        (
+                            item.orchestration_name.clone(),
+                            String::new(),
+                            latest.parent_instance.clone(),
+                            latest.parent_id,
+                            latest.parent_execution_id,
+                            None,
+                        )
+                    });
 
             // Save parent link for notification
             if let (Some(pi), Some(pid)) = (&parent_instance, parent_id) {
@@ -1384,7 +1412,7 @@ impl Runtime {
             history_mgr.append(Event::with_event_id(
                 crate::INITIAL_EVENT_ID,
                 &item.instance,
-                item.execution_id,
+                execution_id,
                 None,
                 EventKind::OrchestrationStarted {
                     name: orchestration_name,
@@ -1413,7 +1441,7 @@ impl Runtime {
             }
         }
 
-        history_mgr.append_failed(&item.instance, item.execution_id, error.clone());
+        history_mgr.append_failed(&item.instance, execution_id, error.clone());
 
         let metadata = ExecutionMetadata {
             status: Some("Failed".to_string()),
@@ -1449,7 +1477,7 @@ impl Runtime {
         let _ = self
             .ack_orchestration_with_changes(
                 lock_token,
-                item.execution_id,
+                execution_id,
                 history_mgr.delta().to_vec(),
                 vec![],
                 orchestrator_items,
@@ -1481,8 +1509,14 @@ impl Runtime {
     /// the provider contract requires `ack_orchestration_item` to delete the batch, append
     /// history, and enqueue outbound work in a single transaction. A child's start is
     /// therefore consumed exactly once, before the child can reach a terminal state.
-    async fn terminal_collision_notifications(&self, item: &crate::providers::OrchestrationItem) -> Vec<WorkItem> {
+    /// `history` is the manager already built from `item.history` for this batch.
+    async fn terminal_collision_notifications(
+        &self,
+        item: &crate::providers::OrchestrationItem,
+        history: &HistoryManager,
+    ) -> Vec<WorkItem> {
         let mut notifications = Vec::new();
+        let terminal = history.is_completed || history.is_failed;
         for msg in &item.messages {
             if let WorkItem::StartOrchestration {
                 parent_instance: Some(parent_instance),
@@ -1491,11 +1525,24 @@ impl Runtime {
                 ..
             } = msg
             {
+                // Defensive: a parent enqueues a child's start once, in its atomic ack, so a
+                // correct provider never redelivers it to the running child. If one does,
+                // keep the base behaviour and ignore it. An unknown generation cannot prove
+                // it is the same call, so that case is notified.
+                if !terminal
+                    && history.parent_instance.as_ref() == Some(parent_instance)
+                    && history.parent_id == Some(*parent_id)
+                    && parent_execution_id.is_some()
+                    && history.parent_execution_id == *parent_execution_id
+                {
+                    continue;
+                }
+                let state = if terminal { " and is terminal" } else { "" };
                 warn!(
                     instance = %item.instance,
                     parent_instance = %parent_instance,
                     parent_id = %parent_id,
-                    "Sub-orchestration target instance id already exists and is terminal; notifying parent of failure"
+                    "Sub-orchestration target instance id already exists; notifying colliding parent of failure"
                 );
                 // Prefer the execution id stamped on the colliding start; fall back to a
                 // durable provider read for work items produced by older runtimes.
@@ -1509,8 +1556,8 @@ impl Runtime {
                     details: crate::ErrorDetails::Application {
                         kind: crate::AppErrorKind::OrchestrationFailed,
                         message: format!(
-                            "sub-orchestration instance id '{}' already exists and is terminal",
-                            item.instance
+                            "sub-orchestration instance id '{}' already exists{state}",
+                            item.instance,
                         ),
                         retryable: false,
                     },

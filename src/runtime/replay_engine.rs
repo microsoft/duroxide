@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{debug, warn};
 
+/// This version must not be released without the queue, positional and CAN cutover.
+pub(crate) const RACE_CANCELLATION_FIX_SINCE: semver::Version = semver::Version::new(0, 1, 31);
+
 /// Result of executing an orchestration turn
 #[derive(Debug)]
 pub enum TurnResult {
@@ -26,7 +29,12 @@ pub enum TurnResult {
     /// Orchestration failed with error details
     Failed(crate::ErrorDetails),
     /// Orchestration requested continue-as-new
-    ContinueAsNew { input: String, version: Option<String> },
+    ContinueAsNew {
+        input: String,
+        version: Option<String>,
+        /// New policy carries exact unread positions; None preserves legacy history counting.
+        unconsumed_queue_arrivals: Option<Vec<(String, String)>>,
+    },
     /// Orchestration was cancelled
     Cancelled(String),
 }
@@ -566,6 +574,23 @@ impl ReplayEngine {
         )
         .with_invocation_cleanup(cleanup.clone());
 
+        // This must be pinned for the whole execution, including its new turns.
+        // Applying the fix to old decisions can change a recorded race winner.
+        let race_cancellation_policy = match semver::Version::parse(&working_history[0].duroxide_version) {
+            Ok(version) if version >= RACE_CANCELLATION_FIX_SINCE => crate::RaceCancellationPolicy::V0131,
+            Ok(_) => crate::RaceCancellationPolicy::Legacy,
+            Err(error) => {
+                warn!(
+                    instance = %self.instance,
+                    version = %working_history[0].duroxide_version,
+                    %error,
+                    "Invalid pinned version; retaining legacy race cancellation semantics"
+                );
+                crate::RaceCancellationPolicy::Legacy
+            }
+        };
+        ctx.set_race_cancellation_policy(race_cancellation_policy);
+
         // Seed KV state from provider snapshot before orchestration code runs.
         if !self.kv_snapshot.is_empty() {
             let mut inner = ctx.inner.lock().expect("Mutex should not be poisoned");
@@ -635,10 +660,7 @@ impl ReplayEngine {
                             break;
                         }
                         Ok(None) => {}
-                        Err(err) => {
-                            cleanup.finalize();
-                            return err;
-                        }
+                        Err(err) => return err,
                     }
                     must_poll = false;
                 }
@@ -651,7 +673,6 @@ impl ReplayEngine {
                     &mut schedule_kinds,
                     &mut must_poll,
                 ) {
-                    cleanup.finalize();
                     return err;
                 }
             }
@@ -662,14 +683,13 @@ impl ReplayEngine {
                 match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
                     Ok(Some(result)) => output_opt = Some(result),
                     Ok(None) => {}
-                    Err(err) => {
-                        cleanup.finalize();
-                        return err;
-                    }
+                    Err(err) => return err,
                 }
             }
 
             {
+                // Legacy turns apply dropped queue cancellation here. In immediate
+                // mode these IDs were already marked at drop/bind; repeating is idempotent.
                 let cancelled_queue_waits = ctx.get_cancelled_queue_ids();
                 for schedule_id in cancelled_queue_waits {
                     ctx.mark_queue_subscription_cancelled(schedule_id);
@@ -679,18 +699,16 @@ impl ReplayEngine {
             self.convert_emitted_actions(&ctx, emitted_actions);
 
             if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt) {
-                cleanup.finalize();
                 return err;
             }
 
             if cleanup.finalize() {
-                // Foreign mutations admitted before the fence belong to this turn.
                 self.convert_emitted_actions(&ctx, ctx.drain_emitted_actions());
             }
             self.finalize_turn(&ctx, output_opt)
         }));
-        // Future destruction can emit cancellation bookkeeping; it must follow
-        // the replay decision and its cancellation snapshot, including early exits.
+        // Destruction may emit cancellation bookkeeping; it follows the durable
+        // decision, while foreign scheduling is fenced before that snapshot.
         cleanup.finalize();
         cleanup.destroy_driver(fut);
         match decision {
@@ -775,8 +793,16 @@ impl ReplayEngine {
                     ))));
                 }
             }
-            EventKind::KeyValueCleared { .. } => {
-                if let Some((_, action)) = emitted_actions.pop_front()
+            EventKind::KeyValueCleared { key } => {
+                // Older runtimes recorded a prune's clears in HashMap order. Clears of
+                // different keys commute, so match this one anywhere in the leading run.
+                if let Some(index) = emitted_actions
+                    .iter()
+                    .take_while(|(_, action)| matches!(action, crate::Action::ClearKeyValue { .. }))
+                    .position(|(_, action)| matches!(action, crate::Action::ClearKeyValue { key: k } if k == key))
+                {
+                    emitted_actions.remove(index);
+                } else if let Some((_, action)) = emitted_actions.pop_front()
                     && !action_matches_event_kind(&action, &event.kind)
                 {
                     return Err(TurnResult::Failed(nondeterminism_error(&format!(
@@ -1078,6 +1104,11 @@ impl ReplayEngine {
                 return TurnResult::ContinueAsNew {
                     input: input.clone(),
                     version: version.clone(),
+                    // New-policy executions carry exactly the unread arrivals; legacy
+                    // executions keep counting subscriptions from history.
+                    unconsumed_queue_arrivals: ctx
+                        .race_cancellation_fix_enabled()
+                        .then(|| ctx.unconsumed_queue_arrivals()),
                 };
             }
         }

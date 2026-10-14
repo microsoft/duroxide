@@ -23,6 +23,8 @@ mod kv;
 mod nondeterminism;
 mod panic_handling;
 mod partial_completion;
+mod positional_unbound_races;
+mod queue_races;
 mod replay_with_completions;
 mod sequential_progress;
 mod sub_orchestration;

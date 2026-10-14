@@ -23,7 +23,7 @@ use common::*;
 async fn lifecycle_fetch_and_ack_faults_preserve_orchestration_recovery_across_commit_boundaries() {
     use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
     use duroxide::runtime::{Runtime, RuntimeShutdownError};
-    use lifecycle_support::{Fixture, bounded, entered, options};
+    use lifecycle_support::{Fixture, bounded, entered, options, until};
     for operation in [
         ProviderOperation::FetchOrchestration,
         ProviderOperation::AcknowledgeOrchestration,
@@ -52,16 +52,11 @@ async fn lifecycle_fetch_and_ack_faults_preserve_orchestration_recovery_across_c
                 .unwrap();
             StdArc::clone(&runtime).start_execution().await.unwrap();
             entered(&held).await;
-            assert_eq!(
-                StdArc::clone(&runtime)
-                    .shutdown_with_timeouts(Duration::ZERO, Duration::from_millis(100))
-                    .await,
-                Err(RuntimeShutdownError::TimedOut),
-            );
             assert!(f.provider.active_operations() > 0);
             held.release();
+            until(|| f.hooks.hits(LifecyclePoint::ShutdownCoordinator) > 0).await;
             assert_eq!(
-                bounded(runtime.wait_for_shutdown_completion()).await,
+                bounded(runtime.shutdown_with_grace(Duration::ZERO)).await,
                 Err(RuntimeShutdownError::Failed { quiescent: true })
             );
             f.assert_retired();

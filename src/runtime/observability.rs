@@ -672,9 +672,9 @@ pub fn init_logging(config: &ObservabilityConfig) -> Result<(), String> {
 
 /// Observability handle for metrics and logging.
 ///
-/// Runtime-owned gauge polling is stopped and joined with the execution tree.
-/// An in-flight provider query is retained, even when a caller's shutdown wait
-/// times out. The application's global metrics recorder is not shut down here.
+/// Runtime-owned gauge polling is tracked through completion or destruction.
+/// Pending provider futures may be canceled; non-yielding frames must return.
+/// The application's global metrics recorder is not shut down here.
 pub struct ObservabilityHandle {
     metrics_provider: Arc<MetricsProvider>,
 }

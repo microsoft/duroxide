@@ -6,8 +6,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "test-hooks")]
-use super::task_group::protect_future;
-use super::task_group::{FailureKind, TaskFailure, TaskFuture, TaskResult, append_failures, record_panic};
+use super::task_safety::protect_future;
+use super::task_safety::{FailureKind, TaskFailure, TaskFuture, TaskResult, append_failures, record_panic};
 use futures_util::FutureExt;
 #[cfg(any(test, feature = "test-hooks"))]
 use tokio_util::sync::CancellationToken;
@@ -47,8 +47,61 @@ struct State {
     hooks: Option<super::test_hooks::LifecycleHooks>,
 }
 
-/// Only the slot owner can close/retire the scope; handlers receive an attachment.
+/// Handlers receive an attachment; the turn guard owns retirement.
 pub(super) struct InvocationScope(Arc<Mutex<State>>);
+
+pub(super) struct InvocationGuard {
+    scope: Option<InvocationScope>,
+    runtime: Arc<super::Runtime>,
+}
+
+impl InvocationGuard {
+    pub fn new(runtime: Arc<super::Runtime>) -> Self {
+        let scope = InvocationScope::new();
+        #[cfg(feature = "test-hooks")]
+        let scope = scope.with_hooks(runtime.hooks());
+        Self {
+            scope: Some(scope),
+            runtime,
+        }
+    }
+
+    pub fn attachment(&self) -> CleanupAttachment {
+        self.scope.as_ref().expect("live invocation scope").attachment()
+    }
+}
+
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        let scope = self.scope.take().expect("invocation retires once");
+        scope.attachment().finalize();
+        let has_cleanup = {
+            let mut state = scope.0.lock().unwrap();
+            state.closed = true;
+            state.attached || !state.failures.is_empty()
+        };
+        if !has_cleanup {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let executor = runtime
+            .lifecycle
+            .lock()
+            .unwrap()
+            .executor
+            .clone()
+            .expect("executing turn has an executor");
+        let tracker = runtime.task_tracker.clone();
+        // Registration occurs before the parent can leave the tracker. This cleanup
+        // is deliberately not an abortable dispatcher child.
+        tracker.spawn_on(
+            async move {
+                let _ = scope.retire_reporting(|failures| runtime.record_faults(failures)).await;
+            },
+            &executor,
+        );
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct CleanupAttachment(Option<Arc<Mutex<State>>>);
@@ -81,8 +134,8 @@ impl InvocationScope {
             #[cfg(feature = "test-hooks")]
             let _guard = hooks.as_ref().map(|hooks| hooks.track_cleanup());
             #[cfg(feature = "test-hooks")]
-            if let Some(hooks) = hooks {
-                let report = protect_future(
+            if let Some(hooks) = hooks
+                && let Err(errors) = protect_future(
                     "invocation-cleanup-hook",
                     async {
                         hooks
@@ -92,9 +145,10 @@ impl InvocationScope {
                     },
                     &CancellationToken::new(),
                 )
-                .await;
-                report_faults(&report.failures);
-                failures.extend(report.failures);
+                .await
+            {
+                report_faults(&errors);
+                failures.extend(errors);
             }
             match AssertUnwindSafe(cleanup.as_mut()).catch_unwind().await {
                 Ok(Ok(())) => {}
@@ -244,7 +298,7 @@ impl CleanupAttachment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::task_group::{FailureKind, TaskFailure, run_owned};
+    use crate::runtime::task_safety::{FailureKind, TaskFailure};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::oneshot;
 
@@ -283,10 +337,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn cancellation_of_invocation_body_cannot_drop_its_attachment() {
-        let scope = InvocationScope::new();
+        let runtime = super::super::Runtime::start_with_options(
+            Arc::new(crate::providers::sqlite::SqliteProvider::new_in_memory().await.unwrap()),
+            super::super::registry::ActivityRegistry::builder().build(),
+            crate::OrchestrationRegistry::builder().build(),
+            super::super::RuntimeOptions {
+                orchestration_concurrency: 0,
+                worker_concurrency: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+        let scope = InvocationGuard::new(runtime.clone());
         let attachment = scope.attachment();
-        let stop = CancellationToken::new();
         let (release, held) = oneshot::channel();
         let (entered, started) = oneshot::channel();
         attachment
@@ -296,15 +361,28 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let parent = tokio::spawn(run_owned("slot", stop.clone(), move |group| {
-            group.retain_cleanup("turn-retirement", scope.retire());
-            Box::pin(std::future::pending())
-        }));
-        stop.cancel();
+        let (body_entered, body_started) = oneshot::channel();
+        let parent = tokio::spawn(async move {
+            let _scope = scope;
+            body_entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        body_started.await.unwrap();
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
         started.await.unwrap();
-        assert!(!parent.is_finished());
+        assert!(
+            runtime
+                .clone()
+                .shutdown_with_grace(std::time::Duration::ZERO)
+                .now_or_never()
+                .is_none()
+        );
         release.send(()).unwrap();
-        assert_eq!(parent.await.unwrap(), Ok(()));
+        assert_eq!(
+            runtime.shutdown_with_grace(std::time::Duration::ZERO).await,
+            Ok(super::super::ShutdownOutcome::Forced)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

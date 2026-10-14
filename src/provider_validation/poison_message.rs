@@ -14,6 +14,206 @@ use crate::providers::{TagFilter, WorkItem};
 
 use super::ExecutionMetadata;
 
+/// Ignoring a fetched input's attempt must not erase an unseen start's budget.
+pub async fn orchestration_ignore_attempt_preserves_hidden_start(factory: &dyn ProviderFactory) {
+    let provider = factory.create_provider().await;
+    let instance = "ignore-attempt-hidden-start";
+    // Persist the execution first: non-start inputs for an uncreated instance
+    // are correctly discarded by providers and cannot probe attempt isolation.
+    provider
+        .enqueue_for_orchestrator(super::start_item(instance), None)
+        .await
+        .expect("seed");
+    let (_, seed_lock, _) = provider
+        .fetch_orchestration_item(factory.lock_timeout(), Duration::ZERO, None)
+        .await
+        .expect("seed fetch")
+        .expect("seed visible");
+    let start = super::Event::with_event_id(
+        1,
+        instance,
+        1,
+        None,
+        super::EventKind::OrchestrationStarted {
+            name: "TestOrch".into(),
+            version: "1.0.0".into(),
+            input: "".into(),
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
+            carry_forward_events: None,
+            initial_custom_status: None,
+        },
+    );
+    provider
+        .ack_orchestration_item(
+            &seed_lock,
+            1,
+            vec![start],
+            vec![],
+            vec![],
+            ExecutionMetadata {
+                orchestration_name: Some("TestOrch".into()),
+                orchestration_version: Some("1.0.0".into()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("persist execution");
+    provider
+        .enqueue_for_orchestrator(super::start_item(instance), None)
+        .await
+        .expect("start");
+    let (_, first, count) = provider
+        .fetch_orchestration_item(factory.lock_timeout(), Duration::ZERO, None)
+        .await
+        .expect("fetch")
+        .expect("visible start");
+    assert_eq!(count, 1);
+    provider
+        .abandon_orchestration_item(&first, None, false)
+        .await
+        .expect("retain first attempt");
+    let (_, second, count) = provider
+        .fetch_orchestration_item(factory.lock_timeout(), Duration::ZERO, None)
+        .await
+        .expect("fetch")
+        .expect("visible start");
+    assert_eq!(count, 2);
+    provider
+        .abandon_orchestration_item(&second, Some(Duration::from_secs(1)), false)
+        .await
+        .expect("hide unregistered start with its two attempts");
+    provider
+        .enqueue_for_orchestrator(
+            WorkItem::QueueMessage {
+                instance: instance.into(),
+                name: "q".into(),
+                data: "w".into(),
+            },
+            None,
+        )
+        .await
+        .expect("input");
+    let (batch, input_lock, count) = provider
+        .fetch_orchestration_item(factory.lock_timeout(), Duration::ZERO, None)
+        .await
+        .expect("fetch input")
+        .expect("visible input");
+    assert_eq!(batch.messages.len(), 1, "start must remain hidden");
+    assert!(matches!(batch.messages[0], WorkItem::QueueMessage { .. }));
+    assert_eq!(count, 1);
+    provider
+        .abandon_orchestration_item(&input_lock, None, true)
+        .await
+        .expect("ignore only input attempt");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (_, lock, count) = provider
+        .fetch_orchestration_item(factory.lock_timeout(), Duration::ZERO, None)
+        .await
+        .expect("fetch together")
+        .expect("both visible");
+    assert_eq!(count, 3, "the hidden start must retain both attempts before this fetch");
+    provider
+        .ack_orchestration_item(&lock, 1, vec![], vec![], vec![], ExecutionMetadata::default(), vec![])
+        .await
+        .expect("cleanup");
+}
+
+/// A delayed abandon must delay only the rows that fetch locked. A row that became
+/// visible after the fetch (for example a continue-as-new start) keeps its visibility.
+pub async fn orchestration_delayed_abandon_preserves_unlocked_rows(factory: &dyn ProviderFactory) {
+    let provider = factory.create_provider().await;
+    let instance = "delayed-abandon-unlocked-rows";
+    // Persist the execution first: inputs for an uncreated instance are discarded.
+    provider
+        .enqueue_for_orchestrator(super::start_item(instance), None)
+        .await
+        .expect("seed");
+    let (_, seed_lock, _) = provider
+        .fetch_orchestration_item(factory.lock_timeout(), Duration::ZERO, None)
+        .await
+        .expect("seed fetch")
+        .expect("seed visible");
+    let start = super::Event::with_event_id(
+        1,
+        instance,
+        1,
+        None,
+        super::EventKind::OrchestrationStarted {
+            name: "TestOrch".into(),
+            version: "1.0.0".into(),
+            input: "".into(),
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
+            carry_forward_events: None,
+            initial_custom_status: None,
+        },
+    );
+    provider
+        .ack_orchestration_item(
+            &seed_lock,
+            1,
+            vec![start],
+            vec![],
+            vec![],
+            ExecutionMetadata {
+                orchestration_name: Some("TestOrch".into()),
+                orchestration_version: Some("1.0.0".into()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("persist execution");
+    let message = |data: &str| WorkItem::QueueMessage {
+        instance: instance.into(),
+        name: "q".into(),
+        data: data.into(),
+    };
+    provider
+        .enqueue_for_orchestrator(message("locked"), None)
+        .await
+        .expect("first input");
+    let (batch, lock, _) = provider
+        .fetch_orchestration_item(factory.lock_timeout(), Duration::ZERO, None)
+        .await
+        .expect("fetch")
+        .expect("first input visible");
+    assert_eq!(batch.messages.len(), 1);
+    // Arrives while the first batch is locked, so this fetch never locked it.
+    provider
+        .enqueue_for_orchestrator(message("unlocked"), None)
+        .await
+        .expect("second input");
+    provider
+        .abandon_orchestration_item(&lock, Some(Duration::from_secs(5)), false)
+        .await
+        .expect("delayed abandon");
+    let (batch, lock, _) = provider
+        .fetch_orchestration_item(factory.lock_timeout(), Duration::ZERO, None)
+        .await
+        .expect("fetch after abandon")
+        .expect("a row the abandoned fetch did not lock must stay visible");
+    assert_eq!(
+        batch.messages.len(),
+        1,
+        "only the unlocked row is visible: {:?}",
+        batch.messages
+    );
+    assert!(
+        matches!(&batch.messages[0], WorkItem::QueueMessage { data, .. } if data == "unlocked"),
+        "the delayed row must stay hidden: {:?}",
+        batch.messages
+    );
+    provider
+        .ack_orchestration_item(&lock, 1, vec![], vec![], vec![], ExecutionMetadata::default(), vec![])
+        .await
+        .expect("cleanup");
+}
+
 /// Test that orchestration item attempt_count is 1 on first fetch
 pub async fn orchestration_attempt_count_starts_at_one(factory: &dyn ProviderFactory) {
     let provider = factory.create_provider().await;

@@ -25,7 +25,7 @@
 ### Minimum Viable Orchestration
 
 The fallible lifecycle in this example is **unreleased**, requiring a matching
-source build rather than published 0.1.30.
+source build rather than published 0.1.32.
 
 ```rust
 use duroxide::{ActivityContext, OrchestrationContext, OrchestrationRegistry, Client};
@@ -99,9 +99,7 @@ Prefer typed shutdown over the legacy unit return:
 use std::time::Duration;
 use duroxide::runtime::ShutdownOutcome;
 
-let outcome = runtime.shutdown_with_timeouts(
-    Duration::from_secs(30), Duration::from_secs(35),
-).await?;
+let outcome = runtime.shutdown_with_grace(Duration::from_secs(30)).await?;
 match outcome {
     ShutdownOutcome::Drained => println!("Execution drained"),
     ShutdownOutcome::Forced => println!("Forced execution and registered cleanup retired"),
@@ -111,41 +109,40 @@ match outcome {
 ```
 
 This is execution quiescence, not disposal of independently retained provider or
-Client Arcs. Runtime-owned dispatcher/slot children and registered foreign cleanup
+Client Arcs. Tracked native tasks, their destruction and registered foreign cleanup
 must all retire before success. Independent provider token-refresh tasks and
 arbitrary application-detached tasks are outside that barrier.
 
-The first accepted stop owns both deadlines, including already-entered startup.
-Repeated calls validate arguments but cannot renew them. Total must be at least
-grace; durations must fit an unsigned 64-bit nanosecond interval and checked
-monotonic deadlines, including timer rounding headroom. Positive sub-millisecond
-precision is retained. These checks also apply to unused/repeated paths.
-`shutdown_with_grace` derives total as grace plus five seconds with checked
-addition. A never-started runtime can prove immediate `Drained` even with zero
-total; a published actual completion/error wins over expired waiting.
+Each native caller supplies a grace period. Concurrent callers wait for the same
+tracked work, and a shorter call may force an earlier abort. Native grace is not
+restricted by SDK nanosecond transport limits. A duration beyond the clock's
+representable future waits for natural cleanup without a force timer, never
+immediate force. Positive sub-millisecond precision is retained. A never-started runtime can
+prove immediate `Drained`, including with zero grace.
 
 During grace, new work admission stops and admitted work may finish. On expiry,
-force is requested and **joined**, not assumed to finish synchronously. Provider
-I/O already entered may not be safely cancellable, so it remains retained. Normal
-configured polling timeouts are not capped to implement shutdown.
+force is requested and cleanup is **awaited**, not assumed complete. Pending
+provider fetches can be canceled on stop; acknowledgement and renewal futures
+can be dropped after grace. Providers must release resources on drop, preserve
+peek-lock recovery and keep acknowledgements atomic. Cancellation does not prove
+that an already-submitted database operation rolled back. Configured polling
+timeouts are unchanged.
 
-At total expiry, `RuntimeShutdownError::TimedOut` ends ordinary waiting but
-preserves all cleanup ownership. The application/supervisor must terminate the
-worker process; the runtime does not. Genuine late completion does not erase
-that obligation. `Failed { quiescent }` is an operational failure, not a timeout
-or manufactured success; `is_quiescent()` reports whether retirement was proven.
+Native cleanup has no implicit total deadline. Blocking/non-yielding code or
+registered foreign work can keep it pending. `Failed { quiescent }` is an
+operational failure, not manufactured success; `is_quiescent()` reports whether
+retirement was proven. Dropping a shutdown future preserves task ownership, but
+another call may be needed to drive force and finish cleanup.
 
-`request_shutdown_until(grace_deadline, total_deadline)` only accepts stop and
-returns promptly. It performs no provider call or join and never renews expired
-inherited deadlines. To intentionally wait beyond the first total, call
-`wait_for_shutdown_completion()` on an already-stopping runtime. It can wait
-indefinitely; dropping that observer affects neither cleanup nor other waiters.
+`request_shutdown()` accepts stop without provider I/O or joins.
+`shutdown_until(grace_deadline)` uses an existing absolute grace deadline, without
+restarting it during SDK startup handoff. SDKs retain this native future on their
+executor and separately impose first-caller-owned total/cancellation budgets.
+Ending an SDK wait does not end native cleanup or authorize freeing callbacks.
 
-Legacy `shutdown(None)` is bounded, logged best effort: omitted grace is one
-second (six seconds total), and `Some(0)` is zero grace (five seconds total).
-It does **not** panic solely because the bounded wait failed. Because it returns
-`()`, ordinary return cannot tell success from incomplete cleanup. New control
-code should use the typed methods and surface the termination requirement.
+Legacy `shutdown(None)` retains the unit return and one-second grace;
+`Some(0)` requests immediate force. Both still await actual cleanup without a
+total limit. Operational failures are logged rather than becoming shutdown-timeout panics.
 
 ### Foreign invocations and replay retirement
 
@@ -157,11 +154,15 @@ accepting cleanup that it cannot await.
 
 The optional `register_invocation_cleanup_with_finalization` notification closes
 foreign scheduling/mutation admission before the durable turn snapshot. The
-runtime destroys the driver and awaits foreign retirement only after capturing
+runtime destroys the driver and tracks foreign retirement only after capturing
 the durable decision, so teardown-induced cancellation does not become persisted
 orchestration failure. Finalization must be prompt: no I/O or waiting for foreign
 work in the notification. Ordinary replay completion, dehydration, failure, and
 continue-as-new retire a turn; they are not automatically forced runtime shutdown.
+
+Turn retirement transfers registered cleanup into the runtime's task tracker
+before the native turn can leave it. This cleanup is not an abortable dispatcher
+child, so aborting native work cannot drop a still-live foreign completion.
 
 A cleanup `Ok` **or** `Err` must mean foreign work has actually ended; a cleanup
 error is still a lifecycle failure. A panicking completion cannot certify that

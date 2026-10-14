@@ -1,4 +1,7 @@
 [toolchain]
-channel = "stable"
+# Before changing this version, check Microsoft's internal Rust availability:
+# msrustup toolchain available --all-channels=prod
+# After changing this version, also update the internal pipelines to match.
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

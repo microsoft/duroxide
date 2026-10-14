@@ -19,7 +19,7 @@ mod lifecycle_support;
 async fn lifecycle_fetch_and_ack_faults_preserve_activity_redelivery_at_commit_boundaries() {
     use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
     use duroxide::runtime::{Runtime, RuntimeShutdownError};
-    use lifecycle_support::{Fixture, bounded, entered, options};
+    use lifecycle_support::{Fixture, bounded, entered, options, until};
     use std::time::Duration;
     for operation in [ProviderOperation::FetchActivity, ProviderOperation::AcknowledgeActivity] {
         for after_commit in [false, true] {
@@ -69,16 +69,11 @@ async fn lifecycle_fetch_and_ack_faults_preserve_activity_redelivery_at_commit_b
             let runtime = f.prepare(activity.clone(), registry.clone(), config);
             Arc::clone(&runtime).start_execution().await.unwrap();
             entered(&held).await;
-            assert_eq!(
-                Arc::clone(&runtime)
-                    .shutdown_with_timeouts(Duration::ZERO, Duration::from_millis(100))
-                    .await,
-                Err(RuntimeShutdownError::TimedOut)
-            );
             assert!(f.provider.active_operations() > 0);
             held.release();
+            until(|| f.hooks.hits(LifecyclePoint::ShutdownCoordinator) > 0).await;
             assert_eq!(
-                bounded(runtime.wait_for_shutdown_completion()).await,
+                bounded(runtime.shutdown_with_grace(Duration::ZERO)).await,
                 Err(RuntimeShutdownError::Failed { quiescent: true })
             );
             f.assert_retired();

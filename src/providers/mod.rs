@@ -1021,10 +1021,11 @@ pub enum WorkItem {
 /// # Runtime shutdown and polling
 ///
 /// The runtime preserves configured long-poll timeouts and normal idle backoff.
-/// It interrupts its own sleeps, not a started provider operation: this trait does
-/// not promise that dropping an operation rolls back a transaction or commit.
-/// A finite shutdown wait can therefore time out while provider I/O remains owned.
-/// Actual runtime completion is published only after those operations return.
+/// Shutdown can drop a pending fetch; after grace, it can also drop in-flight
+/// acknowledgement and renewal. Providers must release owned resources on drop,
+/// retain peek-lock recovery and keep acknowledgements atomic. Dropping a future
+/// does not guarantee rollback of a storage operation already submitted.
+/// Runtime cleanup cannot join detached work started internally by a provider.
 ///
 /// Core provider trait for runtime orchestration operations.
 ///
@@ -1098,6 +1099,12 @@ pub enum WorkItem {
 ///
 /// All tests use the Provider trait directly (not runtime), so they're portable to new providers.
 /// See `docs/provider-implementation-guide.md` for detailed implementation guidance including instance locks.
+///
+/// # Cancellation
+///
+/// Fetch futures can be dropped during shutdown; other in-flight calls can be dropped
+/// when the shutdown grace period expires. Release resources on drop, let unacknowledged
+/// locks expire, and preserve atomic acknowledgement even if cancellation races with a commit.
 ///
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]

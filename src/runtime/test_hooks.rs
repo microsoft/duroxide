@@ -81,8 +81,8 @@ pub fn clear_orch_processing_delay() {
     *guard = None;
 }
 
-/// The nine runtime-owned task roles; counters are scoped to a single hook instance.
-pub use super::task_group::TaskRole as LifecycleTask;
+/// The seven tracked native task roles; counters are scoped to a single runtime.
+pub use super::task_safety::TaskRole as LifecycleTask;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProviderOperation {
@@ -117,6 +117,7 @@ pub enum LifecyclePoint {
 pub struct LifecycleGate {
     entered: CancellationToken,
     released: CancellationToken,
+    blocking: bool,
 }
 
 impl LifecycleGate {
@@ -146,7 +147,7 @@ pub enum HookError {
 struct LifecycleState {
     gates: HashMap<LifecyclePoint, LifecycleGate>,
     faults: HashMap<LifecyclePoint, String>,
-    counts: [LifecycleCounts; 9],
+    counts: [LifecycleCounts; 7],
     hits: HashMap<LifecyclePoint, usize>,
     cleanup: LifecycleCounts,
 }
@@ -163,11 +164,27 @@ impl LifecycleHooks {
     /// # Errors
     /// Returns `AlreadyArmed` rather than replacing a gate with live waiters.
     pub fn hold(&self, point: LifecyclePoint) -> Result<LifecycleGate, HookError> {
+        self.hold_with_mode(point, false)
+    }
+
+    /// Hold a native frame that task cancellation cannot preempt.
+    /// Requires a multi-threaded Tokio executor.
+    ///
+    /// # Errors
+    /// Returns `AlreadyArmed` rather than replacing a gate with live waiters.
+    pub fn hold_blocking(&self, point: LifecyclePoint) -> Result<LifecycleGate, HookError> {
+        self.hold_with_mode(point, true)
+    }
+
+    fn hold_with_mode(&self, point: LifecyclePoint, blocking: bool) -> Result<LifecycleGate, HookError> {
         let mut state = self.0.lock().unwrap();
         if state.gates.contains_key(&point) {
             return Err(HookError::AlreadyArmed);
         }
-        let gate = LifecycleGate::default();
+        let gate = LifecycleGate {
+            blocking,
+            ..Default::default()
+        };
         state.gates.insert(point, gate.clone());
         Ok(gate)
     }
@@ -199,7 +216,13 @@ impl LifecycleHooks {
         };
         if let Some(gate) = gate {
             gate.entered.cancel();
-            gate.released.cancelled().await;
+            if gate.blocking {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(gate.released.cancelled());
+                });
+            } else {
+                gate.released.cancelled().await;
+            }
         }
         if let Some(message) = fail {
             panic!("{message}");
@@ -231,7 +254,7 @@ impl LifecycleHooks {
         self.0.lock().unwrap().cleanup
     }
 
-    pub fn counts(&self) -> [LifecycleCounts; 9] {
+    pub fn counts(&self) -> [LifecycleCounts; 7] {
         self.0.lock().unwrap().counts
     }
 
@@ -291,7 +314,7 @@ mod lifecycle_tests {
             gate.entered().await;
             assert_eq!(first.counts()[task as usize].active, 1);
             assert_eq!(first.reset(), Err(HookError::TasksActive));
-            assert_eq!(independent.counts(), [LifecycleCounts::default(); 9]);
+            assert_eq!(independent.counts(), [LifecycleCounts::default(); 7]);
             gate.release();
             child.await.unwrap();
             assert_eq!(
@@ -302,12 +325,9 @@ mod lifecycle_tests {
                     active: 0
                 }
             );
-            if let Some(parent) = task.parent() {
-                assert_ne!(task, parent);
-            }
         }
         first.reset().unwrap();
-        assert_eq!(first.counts(), [LifecycleCounts::default(); 9]);
+        assert_eq!(first.counts(), [LifecycleCounts::default(); 7]);
     }
 
     #[tokio::test]

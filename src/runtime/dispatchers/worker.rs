@@ -32,15 +32,16 @@
 //! 4. If the activity doesn't complete, it's aborted and the work item is dropped
 
 use crate::providers::WorkItem;
+use futures_util::FutureExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
-use super::super::task_group::{
-    FailureKind, TaskFailure, TaskGroup, TaskResult, TaskRole, protect_future_observing_panic,
-};
+use super::super::task_safety::{FailureKind, TaskRole, record_panic};
 use super::super::{Runtime, registry};
 
 // ============================================================================
@@ -164,103 +165,119 @@ impl Runtime {
     /// Start the worker dispatcher with N concurrent workers for executing activities.
     ///
     /// Each worker runs in a loop, fetching and processing activity work items.
-    /// Workers share the same activity registry and admission signal.
-    pub(in crate::runtime) async fn run_work_dispatcher(self: Arc<Self>) -> TaskResult {
-        Arc::clone(&self).own_task(TaskRole::WorkDispatcher, move |group| Box::pin(async move {
+    /// Workers share the same activity registry and cancellation token.
+    ///
+    /// Returns one handle per spawned task (workers plus the session manager). The caller
+    /// must track them all: there is no supervisor task, because aborting a supervisor
+    /// would only detach its children.
+    pub(in crate::runtime) fn start_work_dispatcher(
+        self: Arc<Self>,
+        activities: Arc<registry::ActivityRegistry>,
+    ) -> Vec<JoinHandle<()>> {
         let concurrency = self.options.worker_concurrency;
-            let mut session_owner_ids: Vec<String> = Vec::new();
+        let cancel = self.cancel.clone();
 
-            // Tracks distinct active sessions across all worker slots in this
-            // runtime. When distinct_count() reaches max_sessions_per_runtime,
-            // ALL slots stop claiming new sessions by switching to non-session mode.
-            let session_tracker = Arc::new(SessionTracker::new());
+        let mut worker_handles = Vec::with_capacity(concurrency + 1);
+        let mut session_owner_ids: Vec<String> = Vec::new();
 
-            // Derive per-slot identities:
-            //   worker_id      – unique per slot, used for logging/tracing
-            //   session_owner  – identity used for session lock claims
-            //
-            // With a stable worker_node_id all slots share the same session
-            // owner so any idle slot can serve any owned session.
-            // Without one, each slot gets an ephemeral identity.
-            let stable_node_id = self.options.worker_node_id.clone();
+        // Tracks distinct active sessions across all worker slots in this
+        // runtime. When distinct_count() reaches max_sessions_per_runtime,
+        // ALL slots stop claiming new sessions by switching to non-session mode.
+        let session_tracker = Arc::new(SessionTracker::new());
 
-            for worker_idx in 0..concurrency {
-                let rt = Arc::clone(&self);
-                let activities = Arc::clone(&self.activity_registry);
-                let session_tracker_clone = Arc::clone(&session_tracker);
+        // Derive per-slot identities:
+        //   worker_id      – unique per slot, used for logging/tracing
+        //   session_owner  – identity used for session lock claims
+        //
+        // With a stable worker_node_id all slots share the same session
+        // owner so any idle slot can serve any owned session.
+        // Without one, each slot gets an ephemeral identity.
+        let stable_node_id = self.options.worker_node_id.clone();
 
-                let suffix = stable_node_id.as_deref().unwrap_or(&self.runtime_id);
-                let worker_id = format!("work-{worker_idx}-{suffix}");
-                let session_owner = stable_node_id.clone().unwrap_or_else(|| worker_id.clone());
+        for worker_idx in 0..concurrency {
+            let rt = Arc::clone(&self);
+            let activities = Arc::clone(&activities);
+            let cancel = cancel.clone();
+            let session_tracker_clone = Arc::clone(&session_tracker);
 
-                // Collect unique session owner IDs for the session manager
-                if !session_owner_ids.contains(&session_owner) {
-                    session_owner_ids.push(session_owner.clone());
-                }
+            let suffix = stable_node_id.as_deref().unwrap_or(&self.runtime_id);
+            let worker_id = format!("work-{worker_idx}-{suffix}");
+            let session_owner = stable_node_id.clone().unwrap_or_else(|| worker_id.clone());
 
-                group.spawn(TaskRole::WorkerSlot.name(), Arc::clone(&rt).own_task(TaskRole::WorkerSlot, move |_| Box::pin(async move {
-                    let mut consecutive_retryable_errors: u32 = 0;
+            // Collect unique session owner IDs for the session manager
+            if !session_owner_ids.contains(&session_owner) {
+                session_owner_ids.push(session_owner.clone());
+            }
 
-                    loop {
-                        if rt.is_stopping() {
-                            break;
+            let handle = self.clone().spawn_tracked(TaskRole::WorkerSlot, async move {
+                let mut consecutive_retryable_errors: u32 = 0;
+
+                loop {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+
+                    let min_interval = rt.options.dispatcher_min_poll_interval;
+                    let start_time = std::time::Instant::now();
+
+                    let work_found = match process_next_work_item(
+                        &rt,
+                        &activities,
+                        &cancel,
+                        &worker_id,
+                        &session_owner,
+                        &session_tracker_clone,
+                    )
+                    .await
+                    {
+                        Ok(found) => {
+                            consecutive_retryable_errors = 0;
+                            found
                         }
-
-                        let min_interval = rt.options.dispatcher_min_poll_interval;
-                        let start_time = std::time::Instant::now();
-
-                        let work_found = match process_next_work_item(
-                            &rt,
-                            &activities,
-                            &worker_id,
-                            &session_owner,
-                            &session_tracker_clone,
-                        )
-                        .await
-                        {
-                            Ok(found) => {
-                                consecutive_retryable_errors = 0;
-                                found
-                            }
-                            Err(e) if e.is_retryable() => {
+                        Err(e) => {
+                            let backoff = if e.is_retryable() {
                                 // Exponential backoff for retryable errors (database locks, etc.)
-                                consecutive_retryable_errors = consecutive_retryable_errors.saturating_add(1);
-                                let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors.min(5))).min(3000);
+                                consecutive_retryable_errors += 1;
+                                let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors)).min(3000);
                                 warn!(
                                     "Error fetching work item (retryable, attempt {}): {:?}, backing off {}ms",
                                     consecutive_retryable_errors, e, backoff_ms
                                 );
-                                rt.sleep_while_running(Duration::from_millis(backoff_ms)).await;
-                                continue;
-                            }
-                            Err(e) => {
+                                Duration::from_millis(backoff_ms)
+                            } else {
                                 // Permanent errors - log and continue with normal polling
                                 warn!("Error fetching work item (permanent): {:?}", e);
                                 consecutive_retryable_errors = 0;
-                                rt.sleep_while_running(Duration::from_millis(100)).await;
-                                continue;
+                                Duration::from_millis(100)
+                            };
+
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(backoff) => {}
                             }
-                        };
-
-                        // Enforce minimum polling interval to prevent hot loops
-                        if !work_found {
-                            enforce_min_poll_interval(start_time, min_interval, &rt).await;
+                            continue;
                         }
-                    }
-                    Ok(())
-                })));
-            }
+                    };
 
-            // Spawn a single session manager background task for heartbeat + cleanup
-            let session_rt = Arc::clone(&self);
-            let workers_retired = CancellationToken::new();
-            group.spawn_until_join(TaskRole::SessionManager.name(),
-                run_session_manager(session_rt, workers_retired.clone(), session_owner_ids),
-                workers_retired);
-            #[cfg(feature = "test-hooks")]
-            self.hooks().checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(TaskRole::WorkDispatcher)).await;
-            Ok(())
-        })).await
+                    // Enforce minimum polling interval to prevent hot loops
+                    if !work_found && !enforce_min_poll_interval(start_time, min_interval, &cancel).await {
+                        break;
+                    }
+                }
+            });
+            worker_handles.push(handle);
+        }
+
+        // Spawn a single session manager background task for heartbeat + cleanup
+        let session_rt = Arc::clone(&self);
+        let session_cancel = cancel.clone();
+        let session_handle = self.clone().spawn_tracked(TaskRole::SessionManager, async move {
+            run_session_manager(session_rt, session_cancel, session_owner_ids).await;
+        });
+        worker_handles.push(session_handle);
+
+        worker_handles
     }
 }
 
@@ -273,6 +290,7 @@ impl Runtime {
 async fn process_next_work_item(
     rt: &Arc<Runtime>,
     activities: &Arc<registry::ActivityRegistry>,
+    cancel: &CancellationToken,
     worker_id: &str,
     session_worker_id: &str,
     session_tracker: &Arc<SessionTracker>,
@@ -289,24 +307,25 @@ async fn process_next_work_item(
         })
     };
 
-    let (item, token, attempt_count) = match rt
-        .history_store
-        .fetch_work_item(
-            rt.options.worker_lock_timeout,
-            rt.options.dispatcher_long_poll_timeout,
-            session_config.as_ref(),
-            &rt.options.worker_tag_filter,
-        )
-        .await?
-    {
+    // Only the fetch is raced against cancellation. Once an item is locked, the
+    // activity runs to completion so it can be acked.
+    let fetch = rt.history_store.fetch_work_item(
+        rt.options.worker_lock_timeout,
+        rt.options.dispatcher_long_poll_timeout,
+        session_config.as_ref(),
+        &rt.options.worker_tag_filter,
+    );
+
+    let fetched = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(false),
+        result = fetch => result?,
+    };
+
+    let (item, token, attempt_count) = match fetched {
         Some(result) => result,
         None => return Ok(false),
     };
-
-    if rt.is_stopping() {
-        abandon_for_runtime_stop(rt, &token).await;
-        return Ok(true);
-    }
 
     let item_serialized = serde_json::to_string(&item).unwrap_or_default();
 
@@ -368,9 +387,7 @@ async fn process_next_work_item(
                 handle_poison_message(rt, &ctx).await;
             } else {
                 // Execute activity with cancellation support
-                if let Err(failures) = execute_activity(rt, activities, ctx).await {
-                    rt.record_faults(&failures);
-                }
+                execute_activity(rt, activities, ctx).await;
             }
         }
         other => {
@@ -383,14 +400,25 @@ async fn process_next_work_item(
 }
 
 /// Enforce minimum polling interval to prevent hot loops.
-async fn enforce_min_poll_interval(start_time: std::time::Instant, min_interval: Duration, rt: &Runtime) {
+///
+/// Returns `false` if cancellation was signalled while waiting, meaning the caller
+/// should stop polling.
+async fn enforce_min_poll_interval(
+    start_time: std::time::Instant,
+    min_interval: Duration,
+    cancel: &CancellationToken,
+) -> bool {
     let elapsed = start_time.elapsed();
     if elapsed < min_interval {
-        let sleep_duration = min_interval - elapsed;
-        rt.sleep_while_running(sleep_duration).await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(min_interval - elapsed) => {}
+        }
     } else {
         tokio::task::yield_now().await;
     }
+    true
 }
 
 // ============================================================================
@@ -441,75 +469,58 @@ async fn handle_poison_message(rt: &Arc<Runtime>, ctx: &ActivityWorkContext) {
 // ============================================================================
 
 /// Execute an activity with full cancellation support.
-async fn execute_activity(
-    rt: &Arc<Runtime>,
-    activities: &Arc<registry::ActivityRegistry>,
-    ctx: ActivityWorkContext,
-) -> TaskResult {
-    let rt = Arc::clone(rt);
-    let activities = Arc::clone(activities);
-    Arc::clone(&rt)
-        .own_work("activity-item", move |group| {
-            Box::pin(async move {
-                let cancellation_token = CancellationToken::new();
-                let retired = CancellationToken::new();
-                group.spawn_until_join(
-                    TaskRole::ActivityManager.name(),
-                    run_activity_manager(
-                        Arc::clone(&rt),
-                        ctx.lock_token.clone(),
-                        retired.clone(),
-                        cancellation_token.clone(),
-                    ),
-                    retired,
-                );
-                #[cfg(feature = "test-hooks")]
-                rt.hooks()
-                    .checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(
-                        TaskRole::WorkerSlot,
-                    ))
-                    .await;
+async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::ActivityRegistry>, ctx: ActivityWorkContext) {
+    // Distinct from the runtime shutdown signal: cancelling this token means
+    // "the orchestration is terminal, discard the result", which is not what a
+    // runtime shutdown implies.
+    let cancellation_token = CancellationToken::new();
 
-                let activity_ctx = build_activity_context(&rt, &ctx, cancellation_token.clone()).await;
-                if rt.shutdown_state.force_signal().is_cancelled() {
-                    abandon_for_runtime_stop(&rt, &ctx.lock_token).await;
-                    return Ok(());
-                }
+    let manager_handle = spawn_activity_manager(
+        rt,
+        Arc::clone(&rt.history_store),
+        ctx.lock_token.clone(),
+        rt.options.worker_lock_timeout,
+        rt.options.worker_lock_renewal_buffer,
+        rt.options.activity_cancellation_grace_period,
+        cancellation_token.clone(),
+    );
 
-                tracing::debug!(
-                    target: "duroxide::runtime",
-                    instance_id = %ctx.instance,
-                    execution_id = %ctx.execution_id,
-                    activity_name = %ctx.activity_name,
-                    activity_id = %ctx.activity_id,
-                    worker_id = %ctx.worker_id,
-                    activity_tag = ?ctx.tag,
-                    "Activity started"
-                );
+    let activity_ctx = build_activity_context(rt, &ctx, cancellation_token.clone()).await;
 
-                let start_time = std::time::Instant::now();
+    tracing::debug!(
+        target: "duroxide::runtime",
+        instance_id = %ctx.instance,
+        execution_id = %ctx.execution_id,
+        activity_name = %ctx.activity_name,
+        activity_id = %ctx.activity_id,
+        worker_id = %ctx.worker_id,
+        activity_tag = ?ctx.tag,
+        "Activity started"
+    );
 
-                match activities.resolve_handler(&ctx.activity_name) {
-                    Some((_version, handler)) => {
-                        run_activity_with_cancellation(
-                            &rt,
-                            &ctx,
-                            handler,
-                            activity_ctx,
-                            cancellation_token,
-                            group,
-                            start_time,
-                        )
-                        .await?;
-                    }
-                    None => {
-                        abandon_unregistered_activity(&rt, &ctx).await;
-                    }
-                }
-                Ok(())
-            })
-        })
-        .await
+    let start_time = std::time::Instant::now();
+
+    let (ack_result, outcome) = match activities.resolve_handler(&ctx.activity_name) {
+        Some((_version, handler)) => {
+            run_activity_with_cancellation(
+                rt,
+                &ctx,
+                handler,
+                activity_ctx,
+                cancellation_token,
+                manager_handle,
+                start_time,
+            )
+            .await
+        }
+        None => {
+            abandon_unregistered_activity(rt, &ctx).await;
+            // Early return after abandonment - no ack_result needed since we abandoned
+            return;
+        }
+    };
+
+    handle_activity_outcome(rt, &ctx, ack_result, outcome).await;
 }
 
 /// Build the ActivityContext with orchestration metadata.
@@ -545,87 +556,29 @@ async fn run_activity_with_cancellation(
     handler: Arc<dyn crate::runtime::ActivityHandler>,
     activity_ctx: crate::ActivityContext,
     cancellation_token: CancellationToken,
-    group: &mut TaskGroup,
+    _manager_handle: AbortOnDropHandle<()>,
     start_time: std::time::Instant,
-) -> TaskResult {
+) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
     let input = ctx.input.clone();
-    let (send, mut completion) = oneshot::channel();
-    let activity_rt = Arc::clone(rt);
-    let activity = group.spawn_leaf(
-        TaskRole::ActivityInvocation.name(),
-        Arc::clone(&activity_rt).own_task(TaskRole::ActivityInvocation, move |_| {
-            Box::pin(async move {
-                #[cfg(feature = "test-hooks")]
-                activity_rt
-                    .hooks()
-                    .checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(
-                        TaskRole::ActivityInvocation,
-                    ))
-                    .await;
-                let mut output = None;
-                let mut panic_message = None;
-                let report = protect_future_observing_panic(
-                    "activity-callback",
-                    async {
-                        output = Some(handler.invoke(activity_ctx, input).await);
-                        Ok(())
-                    },
-                    &CancellationToken::new(),
-                    |payload| {
-                        panic_message = Some(
-                            payload
-                                .downcast_ref::<String>()
-                                .cloned()
-                                .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_string()))
-                                .unwrap_or_else(|| "non-string panic payload".to_string()),
-                        );
-                    },
-                )
-                .await;
-                if !report.failures.is_empty() {
-                    if report
-                        .failures
-                        .iter()
-                        .all(|failure| failure.kind == FailureKind::PollPanicked)
-                    {
-                        output = Some(Err(format!(
-                            "activity callback panicked: {}",
-                            panic_message.expect("poll panic captured its application message")
-                        )));
-                    } else {
-                        return Err(report.failures);
-                    }
-                }
-                // The parent still joins the leaf before acknowledging any result.
-                let _ = send.send(output.expect("completed callback has an outcome"));
-                Ok(())
-            })
-        }),
-    );
+    // Abort-on-drop so the invocation cannot outlive this task if the worker is
+    // aborted mid-activity during shutdown.
+    let mut activity_handle = AbortOnDropHandle::new(rt.clone().spawn_tracked(
+        TaskRole::ActivityInvocation,
+        invoke_activity(rt.clone(), handler, activity_ctx, input),
+    ));
 
-    let (ack_result, outcome) = tokio::select! {
-        biased;
-        result = &mut completion => {
-            if let Err(failures) = group.join(activity).await {
-                abandon_for_runtime_stop(rt, &ctx.lock_token).await;
-                return Err(failures);
-            }
-            match result {
+    tokio::select! {
+        joined = &mut activity_handle => {
+            // Keep the renewal guard until acknowledgement finishes, not just invocation.
+            // Handle normal activity completion (success, error, or panic)
+            match joined {
                 Ok(Ok(result)) => handle_activity_success(rt, ctx, result, start_time).await,
                 Ok(Err(error)) => handle_activity_error(rt, ctx, error, start_time).await,
-                Err(_) => {
-                    abandon_for_runtime_stop(rt, &ctx.lock_token).await;
-                    return Err(vec![TaskFailure { task: "activity-invocation-result", kind: FailureKind::Operation }]);
-                }
+                Err(join_error) => handle_activity_error(rt, ctx, join_error.to_string(), start_time).await,
             }
-        },
-        () = rt.shutdown_state.force_signal().cancelled() => {
-            group.abort_leaves();
-            let joined = group.join(activity).await;
-            abandon_for_runtime_stop(rt, &ctx.lock_token).await;
-            return joined;
-        },
-        () = cancellation_token.cancelled() => {
+        }
+        _ = cancellation_token.cancelled() => {
+            // Handle cancellation: wait grace period, then drop result
             let grace = rt.options.activity_cancellation_grace_period;
 
             tracing::info!(
@@ -640,22 +593,18 @@ async fn run_activity_with_cancellation(
                 "Orchestration terminated, waiting for activity grace period"
             );
 
-            let runtime_forced = tokio::select! {
-                biased;
-                () = rt.shutdown_state.force_signal().cancelled() => true,
-                _ = &mut completion => false,
-                () = tokio::time::sleep(grace) => {
-                    group.abort_leaves();
-                    false
-                },
-            };
-            if runtime_forced {
-                group.abort_leaves();
-            }
-            let joined = group.join(activity).await;
-            if runtime_forced || joined.is_err() {
-                abandon_for_runtime_stop(rt, &ctx.lock_token).await;
-                return joined;
+            // Wait for activity to finish within grace period, or abort it
+            let finished_in_time = tokio::time::timeout(grace, &mut activity_handle).await.is_ok();
+            if !finished_in_time {
+                tracing::debug!(
+                    target: "duroxide::runtime",
+                    instance_id = %ctx.instance,
+                    activity_name = %ctx.activity_name,
+                    activity_id = %ctx.activity_id,
+                    "Activity did not finish within grace period; aborting"
+                );
+                activity_handle.abort();
+                let _ = activity_handle.await;
             }
 
             // Record metrics and ack (drop result since orchestration is terminal)
@@ -674,16 +623,48 @@ async fn run_activity_with_cancellation(
             }
             (result, ActivityOutcome::Cancelled)
         }
-    };
-    handle_activity_outcome(rt, ctx, ack_result, outcome).await;
-    Ok(())
+    }
 }
 
-async fn abandon_for_runtime_stop(rt: &Runtime, token: &str) {
-    if rt.history_store.abandon_work_item(token, None, true).await.is_err() {
-        warn!(target: "duroxide::runtime::lifecycle", category = "stop_abandon_activity_failed",
-            "Unfinished activity could not be abandoned; lock-expiry recovery remains available");
+async fn invoke_activity(
+    runtime: Arc<Runtime>,
+    handler: Arc<dyn crate::runtime::ActivityHandler>,
+    context: crate::ActivityContext,
+    input: String,
+) -> Result<String, String> {
+    let mut future = handler.invoke(context, input);
+    let result = AssertUnwindSafe(future.as_mut()).catch_unwind().await;
+    let mut failures = Vec::new();
+    let result = match result {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_string()))
+                .unwrap_or_else(|| "activity panicked".to_string());
+            // User panics remain durable application errors, not runtime failures.
+            if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+                record_panic(
+                    "activity-panic-payload",
+                    FailureKind::PanicPayloadPanicked,
+                    secondary,
+                    &mut failures,
+                );
+            }
+            Err(message)
+        }
+    };
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
+        record_panic(
+            "activity-invocation",
+            FailureKind::DestructionPanicked,
+            payload,
+            &mut failures,
+        );
     }
+    runtime.record_faults(&failures);
+    result
 }
 
 // ============================================================================
@@ -783,7 +764,7 @@ async fn handle_activity_error(
 /// The poison message handling will eventually fail the activity if genuinely missing.
 async fn abandon_unregistered_activity(rt: &Arc<Runtime>, ctx: &ActivityWorkContext) {
     let backoff = rt.options.unregistered_backoff.delay(ctx.attempt_count);
-    let remaining_attempts = rt.options.max_attempts.saturating_sub(ctx.attempt_count);
+    let remaining_attempts = rt.options.attempts_until_poison(ctx.attempt_count);
 
     tracing::warn!(
         target: "duroxide::runtime",
@@ -868,77 +849,72 @@ fn calculate_renewal_interval(lock_timeout: Duration, buffer: Duration) -> Durat
 /// Spawn a background task to manage an in-flight activity.
 ///
 /// Handles: lock renewal, cancellation detection, and cancellation signaling.
-async fn run_activity_manager(
-    rt: Arc<Runtime>,
+fn spawn_activity_manager(
+    runtime: &Arc<Runtime>,
+    store: Arc<dyn crate::providers::Provider>,
     token: String,
-    retired: CancellationToken,
+    lock_timeout: Duration,
+    buffer: Duration,
+    grace_period: Duration,
     cancellation_token: CancellationToken,
-) -> TaskResult {
-    Arc::clone(&rt)
-        .own_task(TaskRole::ActivityManager, move |_| {
-            Box::pin(async move {
-                let lock_timeout = rt.options.worker_lock_timeout;
-                let buffer = rt.options.worker_lock_renewal_buffer;
-                let renewal_interval = calculate_renewal_interval(lock_timeout, buffer);
+) -> AbortOnDropHandle<()> {
+    let renewal_interval = calculate_renewal_interval(lock_timeout, buffer);
 
-                tracing::debug!(
-                    target: "duroxide::runtime::worker",
-                    lock_token = %token,
-                    lock_timeout_secs = %lock_timeout.as_secs(),
-                    renewal_interval_secs = %renewal_interval.as_secs(),
-                    "Spawning activity manager"
-                );
+    tracing::debug!(
+        target: "duroxide::runtime::worker",
+        lock_token = %token,
+        lock_timeout_secs = %lock_timeout.as_secs(),
+        renewal_interval_secs = %renewal_interval.as_secs(),
+        grace_period_secs = %grace_period.as_secs(),
+        "Spawning activity manager"
+    );
 
-                #[cfg(feature = "test-hooks")]
-                rt.hooks()
-                    .checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(
-                        TaskRole::ActivityManager,
-                    ))
-                    .await;
-                let mut interval = tokio::time::interval(renewal_interval);
-                interval.tick().await; // Skip first immediate tick
+    // Note: grace_period is passed but not used here - the grace period waiting
+    // is handled by handle_activity_cancellation() after this task signals cancellation.
+    // This task's only jobs are: (1) renew locks, (2) detect terminal state and signal.
+    let _ = grace_period;
 
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = retired.cancelled() => break,
-                        () = rt.shutdown_state.force_signal().cancelled() => break,
-                        _ = interval.tick() => {}
-                    }
+    // Deliberately does not observe the runtime shutdown signal: the activity it is
+    // renewing may still be running, and releasing the lock early would let another
+    // node steal the work item and execute it twice. The owning worker stops this
+    // task instead (this handle aborts on drop).
+    AbortOnDropHandle::new(runtime.clone().spawn_tracked(TaskRole::ActivityManager, async move {
+        let mut interval = tokio::time::interval(renewal_interval);
+        interval.tick().await; // Skip first immediate tick
 
-                    match rt.history_store.renew_work_item_lock(&token, lock_timeout).await {
-                        Ok(()) => {
-                            // Lock renewed successfully - orchestration is still running
-                            tracing::trace!(
-                                target: "duroxide::runtime::worker",
-                                lock_token = %token,
-                                extend_secs = %lock_timeout.as_secs(),
-                                "Work item lock renewed"
-                            );
-                        }
-                        Err(e) => {
-                            // Lock renewal failed - activity was cancelled (lock stolen) or lock expired
-                            tracing::info!(
-                                target: "duroxide::runtime::worker",
-                                lock_token = %token,
-                                error = %e,
-                                "Lock renewal failed, signaling activity cancellation (lock was stolen or expired)"
-                            );
-                            cancellation_token.cancel();
-                            break;
-                        }
-                    }
+        loop {
+            interval.tick().await;
+
+            match store.renew_work_item_lock(&token, lock_timeout).await {
+                Ok(()) => {
+                    // Lock renewed successfully - orchestration is still running
+                    tracing::trace!(
+                        target: "duroxide::runtime::worker",
+                        lock_token = %token,
+                        extend_secs = %lock_timeout.as_secs(),
+                        "Work item lock renewed"
+                    );
                 }
+                Err(e) => {
+                    // Lock renewal failed - activity was cancelled (lock stolen) or lock expired
+                    tracing::info!(
+                        target: "duroxide::runtime::worker",
+                        lock_token = %token,
+                        error = %e,
+                        "Lock renewal failed, signaling activity cancellation (lock was stolen or expired)"
+                    );
+                    cancellation_token.cancel();
+                    break;
+                }
+            }
+        }
 
-                tracing::debug!(
-                    target: "duroxide::runtime::worker",
-                    lock_token = %token,
-                    "Activity manager stopped"
-                );
-                Ok(())
-            })
-        })
-        .await
+        tracing::debug!(
+            target: "duroxide::runtime::worker",
+            lock_token = %token,
+            "Activity manager stopped"
+        );
+    }))
 }
 
 // ============================================================================
@@ -948,108 +924,108 @@ async fn run_activity_manager(
 /// Background task that periodically:
 /// 1. Renews session locks for all non-idle sessions owned by this runtime's workers
 /// 2. Cleans up orphaned session rows (expired locks, no pending work items)
-async fn run_session_manager(rt: Arc<Runtime>, retired: CancellationToken, worker_ids: Vec<String>) -> TaskResult {
-    Arc::clone(&rt)
-        .own_task(TaskRole::SessionManager, move |_| {
-            Box::pin(async move {
-                #[cfg(feature = "test-hooks")]
-                rt.hooks()
-                    .checkpoint(crate::runtime::test_hooks::LifecyclePoint::ParentWork(
-                        TaskRole::SessionManager,
-                    ))
-                    .await;
-                let renewal_interval =
-                    calculate_renewal_interval(rt.options.session_lock_timeout, rt.options.session_lock_renewal_buffer);
-                let cleanup_interval = rt.options.session_cleanup_interval;
+async fn run_session_manager(rt: Arc<Runtime>, cancel: CancellationToken, worker_ids: Vec<String>) {
+    let renewal_interval =
+        calculate_renewal_interval(rt.options.session_lock_timeout, rt.options.session_lock_renewal_buffer);
+    let cleanup_interval = rt.options.session_cleanup_interval;
 
-                let mut renewal_ticker = tokio::time::interval(renewal_interval);
-                renewal_ticker.tick().await; // Skip immediate first tick
+    let mut renewal_ticker = tokio::time::interval(renewal_interval);
+    renewal_ticker.tick().await; // Skip immediate first tick
 
-                let mut cleanup_ticker = tokio::time::interval(cleanup_interval);
-                cleanup_ticker.tick().await; // Skip immediate first tick
+    let mut cleanup_ticker = tokio::time::interval(cleanup_interval);
+    cleanup_ticker.tick().await; // Skip immediate first tick
 
-                // Pre-compute the &str slice for the batched provider call
-                let owner_refs: Vec<&str> = worker_ids.iter().map(|s| s.as_str()).collect();
+    // Pre-compute the &str slice for the batched provider call
+    let owner_refs: Vec<&str> = worker_ids.iter().map(|s| s.as_str()).collect();
 
-                tracing::debug!(
-                    target: "duroxide::runtime::worker",
-                    renewal_interval_secs = %renewal_interval.as_secs(),
-                    cleanup_interval_secs = %cleanup_interval.as_secs(),
-                    worker_count = %worker_ids.len(),
-                    "Session manager started"
-                );
+    tracing::debug!(
+        target: "duroxide::runtime::worker",
+        renewal_interval_secs = %renewal_interval.as_secs(),
+        cleanup_interval_secs = %cleanup_interval.as_secs(),
+        worker_count = %worker_ids.len(),
+        "Session manager started"
+    );
 
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = retired.cancelled() => break,
-                        () = rt.shutdown_state.force_signal().cancelled() => break,
-                        _ = renewal_ticker.tick() => {
-                            // Single batched call for all worker IDs
-                            match rt.history_store.renew_session_lock(
-                                &owner_refs,
-                                rt.options.session_lock_timeout,
-                                rt.options.session_idle_timeout,
-                            ).await {
-                                Ok(count) => {
-                                    if count > 0 {
-                                        tracing::trace!(
-                                            target: "duroxide::runtime::worker",
-                                            sessions_renewed = %count,
-                                            "Session locks renewed"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "duroxide::runtime::worker",
-                                        error = %e,
-                                        "Session lock renewal failed"
-                                    );
-                                }
-                            }
-                        }
-                        _ = cleanup_ticker.tick() => {
-                            if rt.is_stopping() {
-                                continue;
-                            }
-                            match rt.history_store.cleanup_orphaned_sessions(
-                                rt.options.session_idle_timeout,
-                            ).await {
-                                Ok(count) => {
-                                    if count > 0 {
-                                        tracing::debug!(
-                                            target: "duroxide::runtime::worker",
-                                            sessions_cleaned = %count,
-                                            "Orphaned sessions cleaned up"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "duroxide::runtime::worker",
-                                        error = %e,
-                                        "Session cleanup failed"
-                                    );
-                                }
-                            }
+    loop {
+        tokio::select! {
+            biased;
+            // Cancellation is observed directly rather than via a polling ticker, so
+            // shutdown is prompt even when renewal/cleanup intervals are minutes long.
+            _ = cancel.cancelled() => break,
+            _ = renewal_ticker.tick() => {
+                // Single batched call for all worker IDs
+                match rt.history_store.renew_session_lock(
+                    &owner_refs,
+                    rt.options.session_lock_timeout,
+                    rt.options.session_idle_timeout,
+                ).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::trace!(
+                                target: "duroxide::runtime::worker",
+                                sessions_renewed = %count,
+                                "Session locks renewed"
+                            );
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "duroxide::runtime::worker",
+                            error = %e,
+                            "Session lock renewal failed"
+                        );
+                    }
                 }
+            }
+            _ = cleanup_ticker.tick() => {
+                match rt.history_store.cleanup_orphaned_sessions(
+                    rt.options.session_idle_timeout,
+                ).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::debug!(
+                                target: "duroxide::runtime::worker",
+                                sessions_cleaned = %count,
+                                "Orphaned sessions cleaned up"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "duroxide::runtime::worker",
+                            error = %e,
+                            "Session cleanup failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
-                tracing::debug!(
-                    target: "duroxide::runtime::worker",
-                    "Session manager stopped"
-                );
-                Ok(())
-            })
-        })
-        .await
+    tracing::debug!(
+        target: "duroxide::runtime::worker",
+        "Session manager stopped"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attempts_until_poison_counts_the_poisoning_fetch() {
+        let options = crate::runtime::RuntimeOptions {
+            max_attempts: 10,
+            ..Default::default()
+        };
+        assert_eq!(options.attempts_until_poison(1), 10);
+        assert_eq!(options.attempts_until_poison(10), 1, "the next fetch poisons");
+        let widest = crate::runtime::RuntimeOptions {
+            max_attempts: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(widest.attempts_until_poison(u32::MAX), 1, "no overflow at the limit");
+    }
 
     #[test]
     fn tracker_starts_empty() {

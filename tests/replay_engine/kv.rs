@@ -1178,3 +1178,90 @@ fn kv_clear_single_snapshot_key_then_rmw() {
     let result = execute(&mut engine, Arc::new(ClearSingleRmwHandler));
     assert_completed(&result, "session=gone,counter=4");
 }
+
+/// Between two activities, sets six keys in reverse order, lists them, then prunes
+/// them all. The second activity keeps the turn open, so replay checks the KV rows.
+struct ListAndPruneHandler;
+
+#[async_trait]
+impl OrchestrationHandler for ListAndPruneHandler {
+    async fn invoke(&self, ctx: OrchestrationContext, _input: String) -> Result<String, String> {
+        ctx.schedule_activity("Go", "").await?;
+        for key in ["f", "e", "d", "c", "b", "a"] {
+            ctx.set_kv_value(key, "x");
+        }
+        let keys = ctx.get_kv_all_keys().join(",");
+        let pruned = ctx.prune_kv_values_updated_before(u64::MAX);
+        ctx.schedule_activity("Done", format!("{keys}|{pruned}")).await
+    }
+}
+
+/// #57: listing and pruning use key order, not HashMap order, and a run of clears
+/// recorded in another order by an older runtime still replays.
+#[test]
+fn prune_and_key_listing_use_key_order_and_accept_recorded_clear_order() {
+    let summary = "a,b,c,d,e,f|6";
+    let rows = |delta: &[Event]| -> Vec<String> {
+        delta
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::KeyValueSet { key, .. } => Some(format!("set {key}")),
+                EventKind::KeyValueCleared { key } => Some(format!("clear {key}")),
+                EventKind::ActivityScheduled { name, input, .. } => Some(format!("{name} {input}")),
+                _ => None,
+            })
+            .collect()
+    };
+    let started = vec![
+        started_event(1),
+        activity_scheduled(2, "Go", ""),
+        activity_completed(3, 2, "ok"),
+    ];
+    let mut expected: Vec<String> = ["f", "e", "d", "c", "b", "a"]
+        .iter()
+        .map(|k| format!("set {k}"))
+        .collect();
+    expected.extend(["a", "b", "c", "d", "e", "f"].iter().map(|k| format!("clear {k}")));
+    expected.push(format!("Done {summary}"));
+    for _ in 0..8 {
+        let mut engine = create_engine(started.clone());
+        assert_continue(&execute(&mut engine, Arc::new(ListAndPruneHandler)));
+        assert_eq!(
+            rows(engine.history_delta()),
+            expected,
+            "keys listed and cleared in key order"
+        );
+    }
+    let mut history = started;
+    for (index, key) in ["f", "e", "d", "c", "b", "a"].into_iter().enumerate() {
+        history.push(Event::with_event_id(
+            4 + index as u64,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueSet {
+                key: key.to_string(),
+                value: "x".to_string(),
+                last_updated_at_ms: 0,
+            },
+        ));
+    }
+    // An older runtime recorded the clears in HashMap order.
+    for (index, key) in ["c", "f", "a", "e", "b", "d"].into_iter().enumerate() {
+        history.push(Event::with_event_id(
+            10 + index as u64,
+            TEST_INSTANCE,
+            TEST_EXECUTION_ID,
+            None,
+            EventKind::KeyValueCleared { key: key.to_string() },
+        ));
+    }
+    history.push(activity_scheduled(16, "Done", summary));
+    let mut engine = create_engine(history);
+    assert_continue(&execute(&mut engine, Arc::new(ListAndPruneHandler)));
+    assert!(
+        rows(engine.history_delta()).is_empty(),
+        "replay must match every recorded row: {:?}",
+        engine.history_delta()
+    );
+}

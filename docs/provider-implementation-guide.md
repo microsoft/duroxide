@@ -178,6 +178,12 @@ Let's trace what happens when an orchestration schedules an activity:
 
 ### Event History: The Append-Only Log
 
+Preserve every event's `duroxide_version` exactly on storage and retrieval.
+This includes `read`, `read_with_execution`, and the history returned by
+`fetch_orchestration_item`. Do not stamp stored events with the reader's build
+version. The first `OrchestrationStarted` stamp selects replay semantics for
+that execution; a provider that restamps fetch results changes its decisions.
+
 Every orchestration instance has an **event history**—a sequence of events that records everything that happened:
 
 ```
@@ -333,27 +339,29 @@ async fn fetch_work_item(
 - Add **long-polling** if your storage backend supports blocking reads (BLPOP, LISTEN/NOTIFY, change streams)
 - The runtime works correctly with either approach
 
-### Shutdown and in-flight provider work (unreleased)
+#### Cancellation during shutdown
 
-The owned lifecycle does **not** change `fetch_*` polling arguments, cap configured
-long polls, or require a new provider cancellation-safety contract. Runtime-owned
-idle/retry sleeps can be interrupted at stop without changing normal polling.
-Once provider I/O has begun, its owner retains and awaits it instead of dropping
-the future at an unknown transaction/acknowledgment boundary.
+The runtime races `fetch_orchestration_item()` and `fetch_work_item()` against its shutdown
+signal, so **the future returned by a fetch method may be dropped at any await point**. This
+matters most for long-polling providers, which can sit inside a fetch for tens of seconds.
+After the shutdown grace period, other in-flight provider calls, including acknowledgement
+and lock renewal, may also be dropped.
 
-Consequently an unresponsive provider can keep startup rollback or forced cleanup
-alive after an ordinary shutdown wait reaches its finite total deadline.
-`TimedOut` means the wait ended, not that the I/O was canceled or the provider was
-freed. The application/supervisor owns process termination; the runtime keeps
-cleanup ownership and never terminates the process itself. A later completion
-can release resources without making the timed-out worker reusable.
+Your implementation must therefore:
 
-Runtime `Drained`/`Forced` certifies retirement of its owned execution tree and
-registered foreign cleanup. It does not dispose all external provider/Client Arcs
-or independent provider tasks, such as token-refresh loops. Those retain their
-own lifetime policy. Provider authors should keep their existing cancellation
-and transaction guarantees explicit rather than treating a caller's finite wait
-as permission to discard an operation.
+- Release any connection, transaction, or listener it holds when the future is dropped. In
+  practice this means relying on RAII guards rather than explicit cleanup after the final
+  `await`, since code after a drop point never runs.
+- Preserve the peek-lock contract: an item is not removed until acknowledgement.
+  If a fetch acquired a lock before being dropped, the item must become available again
+  after `lock_timeout`, even if the runtime never received its lock token.
+- Keep acknowledgement atomic. Cancellation can race with a commit: dropping a future
+  does not guarantee that a storage operation already submitted was rolled back. Either
+  the full acknowledgement commits, or the unacknowledged item remains available for
+  recovery after lock expiry. Activities must remain safe for at-least-once execution.
+
+Shutdown waits for runtime-owned tasks to finish dropping their futures. It cannot clean up
+connections leaked by the provider or detached tasks spawned internally by the provider.
 
 ---
 
@@ -1155,6 +1163,12 @@ WHERE lock_token = token
 **Parameters:**
 - `delay`: Optional backoff before retry (e.g., 1 second for transient failures)
 - `ignore_attempt`: If true, don't count this attempt toward poison message detection
+
+Both the delay and the attempt undo apply **only to the rows this fetch locked**
+(`WHERE lock_token = token`). Rows that became visible after the fetch, such as a
+continue-as-new start, keep their visibility and attempt count. Validated by
+`poison_message::orchestration_delayed_abandon_preserves_unlocked_rows` and
+`poison_message::orchestration_ignore_attempt_preserves_hidden_start`.
 
 **Implementation:**
 ```rust

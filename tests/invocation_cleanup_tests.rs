@@ -20,7 +20,6 @@ use duroxide::runtime::replay_engine::TurnResult;
 use duroxide::runtime::test_hooks::{LifecyclePoint, LifecycleTask, ProviderOperation};
 use duroxide::runtime::{InvocationCleanupError, RuntimeShutdownError, ShutdownOutcome};
 use duroxide::{Event, EventKind, OrchestrationContext, OrchestrationRegistry};
-use futures_util::FutureExt;
 use support::{Fixture, SECRET, bounded, entered, options, until};
 use tokio_util::sync::CancellationToken;
 
@@ -144,13 +143,9 @@ async fn captured_turn(turn: Turn, attach: bool, force: bool) -> Vec<Event> {
     } else {
         Duration::from_secs(3)
     };
-    let total = if force {
-        Duration::from_millis(300)
-    } else {
-        Duration::from_secs(4)
-    };
     let now = Instant::now();
-    runtime.request_shutdown_until(now + grace, now + total).unwrap();
+    runtime.request_shutdown();
+    let mut shutdown = tokio::spawn(runtime.shutdown_until(now + grace));
     before_ack.release();
     until(|| {
         f.hooks.hits(LifecyclePoint::ProviderCommit(
@@ -161,7 +156,6 @@ async fn captured_turn(turn: Turn, attach: bool, force: bool) -> Vec<Event> {
     if attach {
         bounded(foreign.cleanup_entered.cancelled()).await;
         assert_eq!(f.hooks.cleanup_counts().active, 1);
-        assert_eq!(f.hooks.counts()[LifecycleTask::OrchestrationSlot as usize].active, 1);
         let ctx = foreign.contexts.lock().unwrap()[0].clone();
         assert_eq!(ctx.instance_id(), "turn");
         assert_eq!(ctx.execution_id(), 1);
@@ -169,11 +163,12 @@ async fn captured_turn(turn: Turn, attach: bool, force: bool) -> Vec<Event> {
             ctx.register_invocation_cleanup(async { Ok(()) }),
             Err(InvocationCleanupError::Closed)
         );
-        assert!(runtime.wait_for_shutdown_completion().now_or_never().is_none());
+        assert!(!shutdown.is_finished());
         if force {
-            assert_eq!(
-                Arc::clone(&runtime).shutdown_with_timeouts(grace, total).await,
-                Err(RuntimeShutdownError::TimedOut)
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), &mut shutdown)
+                    .await
+                    .is_err()
             );
             assert!(now.elapsed() < Duration::from_secs(1));
             assert_eq!(f.hooks.cleanup_counts().active, 1);
@@ -182,7 +177,7 @@ async fn captured_turn(turn: Turn, attach: bool, force: bool) -> Vec<Event> {
     let before = f.inner.read_with_execution("turn", 1).await.unwrap();
     foreign.release.cancel();
     assert_eq!(
-        bounded(runtime.wait_for_shutdown_completion()).await,
+        bounded(shutdown).await.unwrap(),
         Ok(if force {
             ShutdownOutcome::Forced
         } else {
@@ -258,10 +253,8 @@ async fn admitted_orchestration_and_foreign_retirement_finish_within_grace_and_k
         .await
         .unwrap();
     entered(&ack).await;
-    let now = Instant::now();
-    runtime
-        .request_shutdown_until(now + Duration::from_secs(4), now + Duration::from_secs(5))
-        .unwrap();
+    runtime.request_shutdown();
+    let shutdown = tokio::spawn(runtime.shutdown_with_grace(Duration::from_secs(4)));
     f.client()
         .start_orchestration("not-admitted", "flow", "")
         .await
@@ -273,12 +266,9 @@ async fn admitted_orchestration_and_foreign_retirement_finish_within_grace_and_k
     ack.release();
     bounded(foreign.cleanup_entered.cancelled()).await;
     assert_eq!(f.hooks.cleanup_counts().active, 1);
-    assert!(runtime.wait_for_shutdown_completion().now_or_never().is_none());
+    assert!(!shutdown.is_finished());
     foreign.release.cancel();
-    assert_eq!(
-        bounded(runtime.wait_for_shutdown_completion()).await,
-        Ok(ShutdownOutcome::Drained)
-    );
+    assert_eq!(bounded(shutdown).await.unwrap(), Ok(ShutdownOutcome::Drained));
     assert_eq!(f.hooks.hits(LifecyclePoint::ForceRequested), 0);
     assert_eq!(
         f.hooks.hits(LifecyclePoint::ProviderCommit(
@@ -297,9 +287,6 @@ async fn admitted_orchestration_and_foreign_retirement_finish_within_grace_and_k
 #[tokio::test]
 async fn driver_destruction_failure_does_not_drop_its_retained_foreign_cleanup() {
     let f = Fixture::new().await;
-    let ack = f.hold(LifecyclePoint::ProviderEnter(
-        ProviderOperation::AcknowledgeOrchestration,
-    ));
     let foreign = MockForeign::default();
     let mut config = options();
     config.worker_concurrency = 0;
@@ -310,23 +297,17 @@ async fn driver_destruction_failure_does_not_drop_its_retained_foreign_cleanup()
     );
     Arc::clone(&runtime).start_execution().await.unwrap();
     f.client().start_orchestration("drop-fault", "flow", "").await.unwrap();
-    entered(&ack).await;
-    let now = Instant::now();
-    runtime
-        .request_shutdown_until(now, now + Duration::from_millis(100))
-        .unwrap();
-    ack.release();
     bounded(foreign.cleanup_entered.cancelled()).await;
-    assert_eq!(
-        Arc::clone(&runtime)
-            .shutdown_with_timeouts(Duration::ZERO, Duration::from_millis(100))
-            .await,
-        Err(RuntimeShutdownError::TimedOut)
+    let mut shutdown = tokio::spawn(runtime.shutdown_with_grace(Duration::ZERO));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err()
     );
     assert_eq!(f.hooks.cleanup_counts().active, 1);
     foreign.release.cancel();
     assert_eq!(
-        bounded(runtime.wait_for_shutdown_completion()).await,
+        bounded(shutdown).await.unwrap(),
         Err(RuntimeShutdownError::Failed { quiescent: true })
     );
     f.assert_retired();
@@ -355,12 +336,10 @@ async fn foreign_cleanup_error_is_an_operational_failure_not_success_or_raw_erro
         .await
         .unwrap();
     bounded(foreign.cleanup_entered.cancelled()).await;
-    let now = Instant::now();
-    runtime
-        .request_shutdown_until(now + Duration::from_secs(1), now + Duration::from_secs(2))
-        .unwrap();
+    runtime.request_shutdown();
+    let shutdown = tokio::spawn(runtime.shutdown_with_grace(Duration::from_secs(1)));
     foreign.release.cancel();
-    let error = bounded(runtime.wait_for_shutdown_completion()).await.unwrap_err();
+    let error = bounded(shutdown).await.unwrap().unwrap_err();
     assert_eq!(error, RuntimeShutdownError::Failed { quiescent: true });
     assert!(!format!("{error:?}: {error}").contains("sentinel"));
     f.assert_retired();
@@ -369,9 +348,6 @@ async fn foreign_cleanup_error_is_an_operational_failure_not_success_or_raw_erro
 #[tokio::test]
 async fn fault_in_foreign_retirement_hook_does_not_discard_registered_completion() {
     let f = Fixture::new().await;
-    let ack = f.hold(LifecyclePoint::ProviderEnter(
-        ProviderOperation::AcknowledgeOrchestration,
-    ));
     let foreign = MockForeign::default();
     f.hooks.fail_once(LifecyclePoint::ForeignCleanup).unwrap();
     let mut config = options();
@@ -383,23 +359,17 @@ async fn fault_in_foreign_retirement_hook_does_not_discard_registered_completion
     );
     Arc::clone(&runtime).start_execution().await.unwrap();
     f.client().start_orchestration("hook-error", "flow", "").await.unwrap();
-    entered(&ack).await;
-    let now = Instant::now();
-    runtime
-        .request_shutdown_until(now, now + Duration::from_millis(100))
-        .unwrap();
-    ack.release();
     bounded(foreign.cleanup_entered.cancelled()).await;
-    assert_eq!(
-        Arc::clone(&runtime)
-            .shutdown_with_timeouts(Duration::ZERO, Duration::from_millis(100))
-            .await,
-        Err(RuntimeShutdownError::TimedOut)
+    let mut shutdown = tokio::spawn(runtime.shutdown_with_grace(Duration::ZERO));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err()
     );
     assert_eq!(f.hooks.cleanup_counts().active, 1);
     foreign.release.cancel();
     assert_eq!(
-        bounded(runtime.wait_for_shutdown_completion()).await,
+        bounded(shutdown).await.unwrap(),
         Err(RuntimeShutdownError::Failed { quiescent: true })
     );
     f.assert_retired();
@@ -408,9 +378,6 @@ async fn fault_in_foreign_retirement_hook_does_not_discard_registered_completion
 #[tokio::test]
 async fn panicking_foreign_completion_cannot_certify_quiescence_or_release_the_runtime() {
     let f = Fixture::new().await;
-    let ack = f.hold(LifecyclePoint::ProviderEnter(
-        ProviderOperation::AcknowledgeOrchestration,
-    ));
     let completion_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     struct BrokenCompletion(Arc<std::sync::atomic::AtomicBool>);
     impl std::future::Future for BrokenCompletion {
@@ -454,19 +421,14 @@ async fn panicking_foreign_completion_cannot_certify_quiescence_or_release_the_r
         .start_orchestration("broken-completion", "broken-completion", "")
         .await
         .unwrap();
-    entered(&ack).await;
-    let now = Instant::now();
-    runtime
-        .request_shutdown_until(now, now + Duration::from_millis(100))
-        .unwrap();
-    ack.release();
-    let error = Arc::clone(&runtime)
-        .shutdown_with_timeouts(Duration::ZERO, Duration::from_millis(100))
-        .await
-        .unwrap_err();
-    assert_eq!(error, RuntimeShutdownError::TimedOut);
-    assert!(error.to_string().contains("terminate"));
-    assert!(runtime.wait_for_shutdown_completion().now_or_never().is_none());
+    until(|| f.hooks.cleanup_counts().active == 1).await;
+    let mut shutdown = tokio::spawn(Arc::clone(&runtime).shutdown_with_grace(Duration::ZERO));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert!(!shutdown.is_finished());
     assert!(!external_finished.is_cancelled());
     assert!(
         !completion_dropped.load(Ordering::SeqCst),

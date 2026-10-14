@@ -27,8 +27,8 @@ mod lifecycle_support;
 
 #[tokio::test]
 async fn runtime_force_interrupts_instance_cancellation_grace_without_acknowledging_unfinished_work() {
+    use duroxide::runtime::ShutdownOutcome;
     use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
-    use duroxide::runtime::{RuntimeShutdownError, ShutdownOutcome};
     use lifecycle_support::{Fixture, bounded, options};
     use tokio_util::sync::CancellationToken;
     let f = Fixture::new().await;
@@ -67,10 +67,7 @@ async fn runtime_force_interrupts_instance_cancellation_grace_without_acknowledg
         .await
         .unwrap();
     bounded(cancelled.cancelled()).await;
-    let result = Arc::clone(&runtime)
-        .shutdown_with_timeouts(Duration::ZERO, Duration::from_secs(1))
-        .await;
-    assert_ne!(result, Err(RuntimeShutdownError::TimedOut));
+    let result = bounded(runtime.shutdown_with_grace(Duration::ZERO)).await;
     assert_eq!(result, Ok(ShutdownOutcome::Forced));
     assert_eq!(
         f.hooks
