@@ -262,6 +262,7 @@ async fn crash_after_dequeue_before_append_completion() {
 
     // Keep both arrivals pending across the restart so the first cannot complete the turn early.
     rt.shutdown(None).await;
+    let history_before_crash = store.read(inst).await.unwrap();
     let wi = WorkItem::ExternalRaised {
         instance: inst.to_string(),
         name: "Evt".to_string(),
@@ -269,6 +270,22 @@ async fn crash_after_dequeue_before_append_completion() {
     };
     store.enqueue_for_orchestrator(wi.clone(), None).await.unwrap();
     store.enqueue_for_orchestrator(wi, None).await.unwrap();
+
+    // Simulate a dispatcher disappearing after fetch, without acknowledging or abandoning its lease.
+    let (fetched, _lock_token, attempt_count) = store
+        .fetch_orchestration_item(Duration::from_millis(100), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("the pending event batch should be available before the crash");
+    assert_eq!(fetched.instance, inst);
+    assert_eq!(fetched.messages.len(), 2);
+    assert_eq!(attempt_count, 1);
+    assert_eq!(
+        store.read(inst).await.unwrap(),
+        history_before_crash,
+        "fetching the batch must not append its events or completion"
+    );
+
     let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
 
     // Wait for completion; both arrivals in the batch must be recorded.
@@ -291,6 +308,13 @@ async fn crash_after_dequeue_before_append_completion() {
         .filter(|e| matches!(&e.kind, EventKind::ExternalEvent { .. }))
         .collect();
     assert_eq!(evs.len(), 2);
+    assert_eq!(
+        hist.iter()
+            .filter(|e| matches!(&e.kind, EventKind::OrchestrationCompleted { .. }))
+            .count(),
+        1,
+        "recovery must commit exactly one completion"
+    );
 
     rt.shutdown(None).await;
 }
