@@ -24,6 +24,9 @@
 
 ### Minimum Viable Orchestration
 
+The fallible lifecycle in this example is **unreleased**, requiring a matching
+source build rather than published 0.1.32.
+
 ```rust
 use duroxide::{ActivityContext, OrchestrationContext, OrchestrationRegistry, Client};
 use duroxide::runtime::{self, registry::ActivityRegistry};
@@ -53,11 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register("HelloWorld", orchestration)
         .build();
     
-    let rt = runtime::Runtime::start_with_store(
+    let rt = runtime::Runtime::prepare(
         store.clone(), 
         activities, 
-        orchestrations
-    ).await;
+        orchestrations,
+        runtime::RuntimeOptions::default(),
+    )?;
+    Arc::clone(&rt).start_execution().await?;
     
     // 5. Start an instance
     let client = Client::new(store);
@@ -71,10 +76,186 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("Result: {:?}", status);
     
-    rt.shutdown(None).await;
+    rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await?;
     Ok(())
 }
 ```
+
+### Worker lifecycle (unreleased)
+
+`Runtime::prepare` validates configuration and returns an `Arc` without starting work.
+It does not call the provider. `start_execution` requires a Tokio executor.
+It returns after activation, not after worker shutdown.
+
+Keep an `Arc` before you await startup. A failed or dropped startup wait does not
+discard partially started work. The runtime retains that work until rollback ends.
+After the runtime accepts stop, it cannot start or restart.
+The legacy `start`, `start_with_store`, and `start_with_options` factories still
+panic on startup failure. Their rollback also retains ownership of partially started work.
+
+Prefer typed shutdown over the legacy unit return:
+
+```rust
+# async fn stop(runtime: std::sync::Arc<duroxide::runtime::Runtime>)
+#     -> Result<(), duroxide::runtime::RuntimeShutdownError> {
+use std::time::Duration;
+use duroxide::runtime::ShutdownOutcome;
+
+let outcome = runtime.shutdown_with_grace(Duration::from_secs(30)).await?;
+match outcome {
+    ShutdownOutcome::Drained => println!("Execution drained"),
+    ShutdownOutcome::Forced => println!("Forced execution and registered cleanup retired"),
+}
+# Ok(())
+# }
+```
+
+**Quiescence** means that all tracked native tasks, task destruction, and registered
+foreign cleanup have ended. Both successful outcomes confirm this condition.
+They do not dispose independent provider or Client Arcs.
+The runtime does not wait for independent provider token-refresh tasks or detached application tasks.
+
+```mermaid
+flowchart TD
+    Stop["Accept stop: close new work admission"] --> Grace["Let admitted work finish during grace"]
+    Grace -->|Work finishes| Cleanup["Wait for tracked tasks and registered foreign cleanup"]
+    Grace -->|Grace expires| Force["Abort remaining async tasks"]
+    Force --> Cleanup
+    Cleanup --> Result["Return Drained, Forced, or a cleanup error"]
+    Cleanup -.-> Pending["A blocked task or foreign callback can keep cleanup pending"]
+```
+
+The diagram shows native shutdown. A language SDK can stop waiting before this
+cleanup operation finishes.
+
+Each native caller supplies a grace period. Concurrent callers wait for the same
+tracked work. A shorter grace can cause an earlier abort, but only before shutdown completes.
+A late force decision cannot change a completed `Drained` result to `Forced`.
+
+SDK nanosecond transport limits do not restrict native grace.
+If a duration exceeds the clock's range, the runtime waits for cleanup without a force timer.
+It does not force immediately. Native grace preserves positive durations shorter
+than one millisecond. A runtime that never started can return `Drained` immediately,
+including with zero grace.
+
+Stop prevents new work. During grace, admitted work can finish.
+When grace expires, the runtime requests force and **waits for cleanup**.
+It does not assume that force completed cleanup.
+
+Stop can cancel a pending provider fetch. After grace, the runtime can also drop
+acknowledgement and renewal futures. Providers must release resources on drop,
+preserve peek-lock recovery, and keep acknowledgements atomic.
+Cancellation does not prove that a submitted database operation rolled back.
+Configured polling timeouts do not change.
+
+Native cleanup has no total deadline. Blocking code or registered foreign work
+can keep it pending indefinitely. `Failed { quiescent }` is still an error.
+Use `is_quiescent()` to check whether all owned work and cleanup have ended.
+Dropping a shutdown future preserves task ownership. Another call may be
+necessary to request force and finish cleanup.
+
+`request_shutdown()` accepts stop without provider I/O or waiting for tasks.
+`shutdown_until(grace_deadline)` uses an existing absolute grace deadline.
+It does not restart grace when an SDK finishes its startup handoff.
+The SDK keeps this native future running on its executor. Separately, the SDK
+uses the first caller's total deadline and cancellation rules to limit ordinary waits.
+Ending an SDK wait does not end native cleanup or permit callback release.
+
+Legacy `shutdown(None)` retains the unit return and one-second grace;
+`Some(0)` requests immediate force. Both wait for actual cleanup without a total limit.
+They log operational failures instead of raising shutdown-timeout panics.
+
+### Fault shutdown and recovery
+
+An internal lifecycle fault stops the affected Runtime.
+This policy covers internal execution, destruction, finalization, and registered-cleanup faults.
+The runtime stops accepting work and requests zero-grace shutdown.
+This can interrupt unrelated work already admitted by the same worker.
+There is no selective catch-and-continue mode.
+
+Ordinary activity and orchestration errors still affect only that operation.
+This includes ordinary panics while polling a handler.
+Rust activity panic history keeps the actual task-panic message from Tokio.
+Normal returned `Result` errors do not change.
+
+Zero grace requests force. It does not complete cleanup immediately.
+The runtime retains native code that does not yield and foreign work that has not ended.
+This retention can last indefinitely. The runtime does not kill the process or
+stop other Runtime instances in that process.
+
+An SDK wait deadline does not cancel cleanup or permit resource release.
+The application or supervisor remains responsible for process termination after
+an incomplete SDK shutdown. Later cleanup does not remove that obligation.
+
+A stopped or failed Runtime cannot restart.
+After cleanup completes, native recovery can use a new worker. Do not resume work
+on the failed worker. Unacknowledged work follows existing provider rules for
+lease expiry, recovery, retry, and poison handling.
+Recovery can take time and consume retry attempts. Committed history stays committed.
+Retried activities can repeat external effects. Use the application's existing idempotency protections.
+Shutdown does not roll back transactions, compensate external effects, or guarantee exactly-once execution.
+
+### Foreign invocations and replay retirement
+
+An adapter must call `OrchestrationContext::register_invocation_cleanup`
+**before starting foreign work**. If registration fails, return that error without
+starting the foreign work. Runtime-owned asynchronous replay supports registration.
+Standalone and synchronous replay reject it because they cannot wait for that cleanup.
+
+Use `register_invocation_cleanup_with_finalization` when the adapter must close
+foreign scheduling and state changes before the durable turn snapshot.
+The finalization callback must return promptly. Do not perform I/O or wait for
+foreign work in that callback.
+
+The runtime attempts the turn decision before it destroys the driver and tracks
+foreign cleanup. Thus, cancellation during teardown does not become a new persisted
+orchestration failure. Ordinary completion, dehydration, failure, and continue-as-new
+retire a turn. They do not automatically force runtime shutdown.
+
+Normal finalization includes actions that the turn already accepted.
+The existing rules still apply to scheduling and continue-as-new.
+
+A **detected finalization failure before the snapshot** rejects the new durable
+batch from that attempt. This includes failure while destroying the callback's
+captured data. The runtime does not attempt to acknowledge that batch's history,
+actions, or detached starts. It stops under the fault policy above and retains
+outstanding foreign cleanup. An ordinary failed application turn would not provide
+this guarantee. Previously committed history remains unchanged.
+
+```mermaid
+flowchart TD
+    Finalize["Finalize before the durable snapshot"] --> Valid{"Finalization succeeded?"}
+    Valid -->|Yes| Normal["Keep normal turn rules for accepted actions"]
+    Valid -->|No| Reject["Reject this attempt's new batch; stop this Runtime"]
+    Normal --> Retain["Retain foreign cleanup until the registered work ends"]
+    Reject --> Retain
+```
+
+The failure path does not erase earlier commits. The normal path does not add a
+transaction or compensation guarantee for external effects.
+
+If the outer engine panics while building a decision, the runtime catches that panic.
+It finalizes and destroys the driver outside active unwinding, then resumes the panic.
+It does not wait for foreign completion first.
+
+A later driver or cleanup failure does not rewrite a valid decision or undo a committed acknowledgement.
+Shutdown can race an acknowledgement already in progress.
+There is no additional provider transaction or compensation guarantee for external effects.
+
+Before a native turn leaves the task tracker, it transfers registered cleanup
+to independent ownership in that tracker. Dispatcher abort cannot cancel this
+cleanup or drop a foreign completion that is still active.
+
+A cleanup `Ok` **or** `Err` must mean that foreign work has ended.
+A cleanup error still causes a lifecycle failure.
+If the completion panics, the runtime cannot prove that work ended and must retain ownership.
+This contract does not cover unregistered continuations.
+The .NET adapter registers its handler root and SDK continuations.
+The Node and Python adapters do not provide that additional guarantee.
+
+Production [retirement diagnostics](observability-guide.md#pending-foreign-retirements-unreleased)
+report pending foreign completions separately from durable workload metrics.
+A zero count is never permission to release resources.
 
 ---
 
@@ -2284,11 +2465,13 @@ async fn test_full_workflow() {
         .register("TestOrch", orch)
         .build();
     
-    let rt = runtime::Runtime::start_with_store(
+    let rt = runtime::Runtime::prepare(
         store.clone(),
         activities,
         orchestrations,
-    ).await;
+        runtime::RuntimeOptions::default(),
+    ).unwrap();
+    Arc::clone(&rt).start_execution().await.unwrap();
     
     let client = Client::new(store);
     client.start_orchestration("test-1", "TestOrch", "input").await.unwrap();
@@ -2304,7 +2487,7 @@ async fn test_full_workflow() {
         _ => panic!("Expected completion"),
     }
     
-    rt.shutdown(None).await;
+    rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await.unwrap();
 }
 ```
 
@@ -2693,4 +2876,3 @@ async fn fast_updates(ctx: OrchestrationContext, items_json: String) -> Result<(
 ---
 
 **You now have everything needed to build production-grade durable workflows!** 🎉
-

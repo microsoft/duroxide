@@ -56,6 +56,9 @@ duroxide = "0.1"  # Core only — bring your own Provider
 
 ### Hello world
 
+The fallible lifecycle calls below are **unreleased**. Use the source build
+containing these changes; the published 0.1.32 crate does not have them.
+
 ```rust
 use std::sync::Arc;
 use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
@@ -82,7 +85,10 @@ let orchestrations = OrchestrationRegistry::builder()
     })
     .build();
 
-let rt = runtime::Runtime::start_with_store(store.clone(), activities, orchestrations).await;
+let rt = runtime::Runtime::prepare(
+    store.clone(), activities, orchestrations, runtime::RuntimeOptions::default(),
+)?;
+Arc::clone(&rt).start_execution().await?;
 let client = Client::new(store);
 
 client.start_orchestration("inst-1", "HelloWorld", "Rust").await?;
@@ -91,10 +97,46 @@ match client.wait_for_orchestration("inst-1", std::time::Duration::from_secs(5))
     other => panic!("unexpected: {other:?}"),
 }
 
-rt.shutdown(None).await;
+rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await?;
 # Ok(())
 # }
 ```
+
+### Worker lifetime (unreleased)
+
+Use `Runtime::prepare` followed by `Arc::clone(&runtime).start_execution().await`
+to handle startup errors without a panic. Preparation does not start work or
+call the provider. The legacy `start*` factories still panic on startup failure.
+The runtime retains partially started work until rollback finishes.
+
+Use `shutdown_with_grace(grace)` to observe actual cleanup with a typed result.
+It returns `Result<ShutdownOutcome, RuntimeShutdownError>`. Both `Drained` and
+`Forced` confirm that tracked native work and registered foreign cleanup have ended.
+Grace limits the wait before force, not the total wait.
+Code that does not yield, or foreign work that does not finish, can prevent cleanup from completing.
+
+Concurrent native callers can shorten grace. Dropping a shutdown future does not
+release its tasks. Another call may be necessary to request force and finish cleanup.
+
+`request_shutdown()` promptly closes admission; `shutdown_until(deadline)` lets
+an adapter use an existing grace deadline. Each language SDK retains one cleanup
+future and applies a separate limit to the caller's wait. A stopped runtime cannot
+restart. An operational failure remains an error. Check `is_quiescent()` to find
+out whether all owned work and cleanup have ended.
+
+An internal lifecycle fault stops new work and requests **zero-grace shutdown of
+the affected Runtime**. This can interrupt other work in the same runtime.
+It does not terminate the process. An ordinary activity or orchestration error
+still affects only that operation. Interrupted work follows the existing recovery
+and retry rules. A retry can repeat an external effect. Read
+[fault shutdown and recovery](docs/ORCHESTRATION-GUIDE.md#fault-shutdown-and-recovery)
+before replacing a failed worker.
+
+Legacy `shutdown(None)` still uses one second of grace and returns `()` after cleanup.
+It has no total deadline and logs operational failures. SDK nanosecond transport
+limits do not restrict native grace. See the
+[lifecycle guide](docs/ORCHESTRATION-GUIDE.md#worker-lifecycle-unreleased) for
+validation, provider I/O, and language-adapter boundaries.
 
 ### Surviving crashes
 

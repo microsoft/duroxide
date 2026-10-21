@@ -193,6 +193,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_orchestration_turns` | Histogram | Orchestration | orchestration_name | Identify multi-turn orchestrations |
 | `duroxide_orchestration_continue_as_new_total` | Counter | Orchestration | orchestration_name, execution_id | Track CAN operations |
 | `duroxide_active_orchestrations` | Gauge | Orchestration | _(none)_ | **Current** active count |
+| `duroxide_pending_foreign_retirements` | Gauge | Runtime lifecycle | _(none)_ | Aggregate independently retained foreign completions (unreleased) |
 | **Activity Execution** |
 | `duroxide_activity_executions_total` | Counter | Activity | activity_name, outcome, retry_attempt | Track success/failure rates |
 | `duroxide_activity_duration_seconds` | Histogram | Activity | activity_name, outcome | Activity latency p95/p99 |
@@ -215,6 +216,40 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide.worker.dispatcher.execution_duration_ms` | Histogram | Internal | _(none)_ | Worker execution time |
 
 **Note**: Internal dispatcher metrics use dot notation and milliseconds (not exported to Prometheus by default).
+
+### Pending foreign retirements (unreleased)
+
+`duroxide_pending_foreign_retirements` counts registered foreign completions that
+the runtime retains independently after a turn. The existing metrics facade
+reports one aggregate gauge per recorder, without labels.
+All Runtime instances using that recorder contribute count changes.
+Starting or stopping another Runtime does not reset the count or create another series.
+
+Install the recorder before you start work.
+The runtime does not rebuild counts for a replacement recorder or manage exporter retention.
+
+Use structured events, not gauge labels, to identify a Runtime.
+The `duroxide::runtime::lifecycle` event with
+`category="foreign_retirement_count"` carries `lifecycle_id`, `runtime_id` and
+the affected Runtime's `pending_foreign_retirements` on count changes. Enable
+that tracing target at `info` to observe those events.
+
+The count can rise while the number of running orchestrations falls.
+An orchestration can complete or dehydrate before its foreign work ends.
+The count falls only after the registered completion returns and protected destruction finishes.
+An `Err` result also confirms that foreign work ended.
+It decreases the count and causes a lifecycle failure.
+
+A completion observer that panics or breaks remains in the count.
+Other evidence that suggests completion does not change this rule.
+Missing telemetry or a zero count does **not** prove that cleanup finished.
+
+The .NET retiring-invocation count measures a different population.
+Do not add the two counts as if they measured separate work.
+The gauge adds no age details, reservation details, outcome counters, or public backlog query.
+It does not trigger eviction or throttling.
+`metrics_snapshot()` and SDK metrics availability do not change.
+Use the retained lifecycle operation and its cleanup result to decide when resources can be released.
 
 #### Orchestration Lifecycle Metrics
 
@@ -645,4 +680,3 @@ Import this dashboard into Grafana to get:
 - [Library Observability Guide](library-observability.md) - For library developers
 - [examples/with_observability.rs](../examples/with_observability.rs) - Working example
 - [examples/grafana-dashboard.json](../examples/grafana-dashboard.json) - Production dashboard
-

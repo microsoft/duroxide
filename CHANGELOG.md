@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Foreign-runtime lifecycle integration** - Add fallible preparation and startup,
+  prompt stop requests, and typed cleanup results to the existing `TaskTracker` model.
+  Registered foreign cleanup remains owned after the native turn ends.
+  Finalization closes new durable effects before the snapshot.
+  Native shutdown waits through grace and cleanup. Language SDKs separately limit
+  caller waits and keep cleanup running.
+- **Pending foreign-retirement count** - One gauge reports retained foreign
+  completions per recorder, without Runtime labels or additional series.
+  New runtimes do not reset pending counts from other runtimes.
+  Structured events provide each Runtime's identity and count.
+  Broken completion observers remain counted. A zero count does not prove cleanup.
+
+### Changed
+
+- **Internal lifecycle fault shutdown** - Internal, destruction, finalization,
+  and registered-cleanup faults stop new work and request zero-grace shutdown of that Runtime.
+  This can interrupt unrelated admitted work. Ordinary application failures still
+  affect only their operation. The failed worker cannot restart and must still
+  finish cleanup. Existing recovery and retry rules can repeat external effects.
+  Shutdown does not terminate the process, undo committed history, or guarantee exactly-once execution.
+- **Finalization failure before the snapshot** - A detected failure rejects the
+  new durable batch from that attempt. It does not publish an ordinary failed turn.
+  Foreign cleanup remains owned. Later driver or cleanup faults do not rewrite a
+  valid decision or undo a committed acknowledgement.
+
+### Fixed
+
+- Preserve an observed `Drained` terminal outcome against a stale concurrent force
+  decision, while retaining native grace shortening before completion.
+- Preserve actual Tokio-generated activity-panic history text on the same task
+  after guarded destruction, instead of replacing it with payload-only text.
+
 ## [0.1.32] - 2026-10-11
 
 **Release:** <https://crates.io/crates/duroxide/0.1.32>

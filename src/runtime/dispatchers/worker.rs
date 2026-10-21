@@ -32,13 +32,16 @@
 //! 4. If the activity doesn't complete, it's aborted and the work item is dropped
 
 use crate::providers::WorkItem;
+use futures_util::FutureExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::{AbortOnDropHandle, TaskTracker};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
+use super::super::task_safety::{FailureKind, TaskRole, record_panic};
 use super::super::{Runtime, registry};
 
 // ============================================================================
@@ -206,7 +209,7 @@ impl Runtime {
                 session_owner_ids.push(session_owner.clone());
             }
 
-            let handle = self.task_tracker.spawn(async move {
+            let handle = self.clone().spawn_tracked(TaskRole::WorkerSlot, async move {
                 let mut consecutive_retryable_errors: u32 = 0;
 
                 loop {
@@ -269,7 +272,7 @@ impl Runtime {
         // Spawn a single session manager background task for heartbeat + cleanup
         let session_rt = Arc::clone(&self);
         let session_cancel = cancel.clone();
-        let session_handle = self.task_tracker.spawn(async move {
+        let session_handle = self.clone().spawn_tracked(TaskRole::SessionManager, async move {
             run_session_manager(session_rt, session_cancel, session_owner_ids).await;
         });
         worker_handles.push(session_handle);
@@ -473,7 +476,7 @@ async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::Activity
     let cancellation_token = CancellationToken::new();
 
     let manager_handle = spawn_activity_manager(
-        &rt.task_tracker,
+        rt,
         Arc::clone(&rt.history_store),
         ctx.lock_token.clone(),
         rt.options.worker_lock_timeout,
@@ -559,10 +562,7 @@ async fn run_activity_with_cancellation(
     let input = ctx.input.clone();
     // Abort-on-drop so the invocation cannot outlive this task if the worker is
     // aborted mid-activity during shutdown.
-    let mut activity_handle = AbortOnDropHandle::new(
-        rt.task_tracker
-            .spawn(async move { handler.invoke(activity_ctx, input).await }),
-    );
+    let mut activity_handle = AbortOnDropHandle::new(spawn_activity_invocation(rt, handler, activity_ctx, input));
 
     tokio::select! {
         joined = &mut activity_handle => {
@@ -621,6 +621,73 @@ async fn run_activity_with_cancellation(
             (result, ActivityOutcome::Cancelled)
         }
     }
+}
+
+enum ActivityInvocationOutcome {
+    Returned(Result<String, String>),
+    Panicked(Option<String>),
+}
+
+fn spawn_activity_invocation(
+    runtime: &Arc<Runtime>,
+    handler: Arc<dyn crate::runtime::ActivityHandler>,
+    context: crate::ActivityContext,
+    input: String,
+) -> JoinHandle<Result<String, String>> {
+    let invocation = runtime.clone().tracked_task(
+        TaskRole::ActivityInvocation,
+        invoke_activity(runtime.clone(), handler, context, input),
+    );
+    runtime.task_tracker.spawn(async move {
+        let outcome = invocation.await;
+        // Let Tokio preserve its JoinError format after protected cleanup.
+        // Only strings/unit may leave the guard, never an opaque panic payload.
+        match outcome {
+            ActivityInvocationOutcome::Returned(result) => result,
+            ActivityInvocationOutcome::Panicked(Some(message)) => std::panic::resume_unwind(Box::new(message)),
+            ActivityInvocationOutcome::Panicked(None) => std::panic::resume_unwind(Box::new(())),
+        }
+    })
+}
+
+async fn invoke_activity(
+    runtime: Arc<Runtime>,
+    handler: Arc<dyn crate::runtime::ActivityHandler>,
+    context: crate::ActivityContext,
+    input: String,
+) -> ActivityInvocationOutcome {
+    let mut future = handler.invoke(context, input);
+    let result = AssertUnwindSafe(future.as_mut()).catch_unwind().await;
+    let mut failures = Vec::new();
+    let result = match result {
+        Ok(result) => ActivityInvocationOutcome::Returned(result),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_string()));
+            // User panics remain durable application errors, not runtime failures.
+            if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+                record_panic(
+                    "activity-panic-payload",
+                    FailureKind::PanicPayloadPanicked,
+                    secondary,
+                    &mut failures,
+                );
+            }
+            ActivityInvocationOutcome::Panicked(message)
+        }
+    };
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
+        record_panic(
+            "activity-invocation",
+            FailureKind::DestructionPanicked,
+            payload,
+            &mut failures,
+        );
+    }
+    runtime.record_faults(&failures);
+    result
 }
 
 // ============================================================================
@@ -806,7 +873,7 @@ fn calculate_renewal_interval(lock_timeout: Duration, buffer: Duration) -> Durat
 ///
 /// Handles: lock renewal, cancellation detection, and cancellation signaling.
 fn spawn_activity_manager(
-    task_tracker: &TaskTracker,
+    runtime: &Arc<Runtime>,
     store: Arc<dyn crate::providers::Provider>,
     token: String,
     lock_timeout: Duration,
@@ -834,7 +901,7 @@ fn spawn_activity_manager(
     // renewing may still be running, and releasing the lock early would let another
     // node steal the work item and execute it twice. The owning worker stops this
     // task instead (this handle aborts on drop).
-    AbortOnDropHandle::new(task_tracker.spawn(async move {
+    AbortOnDropHandle::new(runtime.clone().spawn_tracked(TaskRole::ActivityManager, async move {
         let mut interval = tokio::time::interval(renewal_interval);
         interval.tick().await; // Skip first immediate tick
 
@@ -1058,5 +1125,336 @@ mod tests {
 
         drop(g2);
         assert_eq!(tracker.distinct_count(), 0);
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "test-hooks"))]
+    mod panic_compatibility {
+        use super::*;
+        use crate::providers::{Provider, sqlite::SqliteProvider};
+        use crate::runtime::{
+            ActivityHandler, FnActivity, ObservabilityConfig, RuntimeOptions, RuntimeShutdownError, ShutdownOutcome,
+        };
+        use crate::{ActivityContext, OrchestrationRegistry};
+        use std::any::Any;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        use std::task::{Context, Poll};
+
+        type PanicPayload = Box<dyn Any + Send>;
+        type PanicFactory = fn() -> PanicPayload;
+        const LIMIT: Duration = Duration::from_secs(5);
+
+        async fn bounded<T>(future: impl Future<Output = T>) -> T {
+            tokio::time::timeout(LIMIT, future)
+                .await
+                .expect("prototype fixture made progress")
+        }
+
+        async fn runtime() -> Arc<Runtime> {
+            let provider: Arc<dyn Provider> = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+            let runtime = Runtime::prepare(
+                provider,
+                registry::ActivityRegistry::builder().build(),
+                OrchestrationRegistry::builder().build(),
+                RuntimeOptions {
+                    orchestration_concurrency: 1,
+                    worker_concurrency: 1,
+                    dispatcher_long_poll_timeout: Duration::from_millis(50),
+                    dispatcher_min_poll_interval: Duration::from_millis(5),
+                    observability: ObservabilityConfig {
+                        log_level: "off".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            runtime.clone().start_execution().await.unwrap();
+            runtime
+        }
+
+        fn context(runtime: &Runtime) -> ActivityContext {
+            ActivityContext::new_with_cancellation(
+                "prototype".into(),
+                1,
+                "flow".into(),
+                "1.0.0".into(),
+                "work".into(),
+                1,
+                "worker".into(),
+                None,
+                None,
+                CancellationToken::new(),
+                runtime.history_store.clone(),
+            )
+        }
+
+        fn panic_handler(factory: impl Fn() -> PanicPayload + Send + Sync + 'static) -> Arc<dyn ActivityHandler> {
+            Arc::new(FnActivity(move |_: ActivityContext, _: String| {
+                let payload = factory();
+                async move {
+                    std::panic::resume_unwind(payload);
+                    #[allow(unreachable_code)]
+                    Ok::<String, String>(String::new())
+                }
+            }))
+        }
+
+        fn message_without_task_id(error: &tokio::task::JoinError) -> String {
+            let message = error.to_string();
+            message
+                .strip_prefix(&format!("task {} ", error.id()))
+                .expect("actual Tokio task identity is present")
+                .to_owned()
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn activity_panics_match_real_tokio_errors_without_poisoning_runtime() {
+            let runtime = runtime().await;
+            let cases: [(&str, PanicFactory); 7] = [
+                ("borrowed", || Box::new("borrowed panic")),
+                ("owned", || Box::new(String::from("owned panic"))),
+                ("empty borrowed", || Box::new("")),
+                ("empty owned", || Box::new(String::new())),
+                ("escaping", || Box::new(String::from("task 123 \"quoted\"\\\n\r\t\0"))),
+                ("unicode", || Box::new(String::from("\u{2603} \u{1f680}"))),
+                ("non-string", || Box::new(42_u32)),
+            ];
+            for (name, factory) in cases {
+                let reference = bounded(tokio::spawn(async move {
+                    std::panic::resume_unwind(factory());
+                }))
+                .await
+                .unwrap_err();
+                let task =
+                    spawn_activity_invocation(&runtime, panic_handler(factory), context(&runtime), String::new());
+                let task_id = task.id();
+                let actual = bounded(task).await.unwrap_err();
+                assert!(actual.is_panic(), "{name}");
+                assert_eq!(actual.id(), task_id, "{name}");
+                assert_eq!(
+                    message_without_task_id(&actual),
+                    message_without_task_id(&reference),
+                    "{name}"
+                );
+                assert!(runtime.lifecycle.lock().unwrap().failures.is_empty(), "{name}");
+            }
+            for result in [Ok("success".to_owned()), Err("business failure".to_owned())] {
+                let expected = result.clone();
+                let handler = Arc::new(FnActivity(move |_: ActivityContext, _: String| {
+                    let result = result.clone();
+                    async move { result }
+                }));
+                assert_eq!(
+                    bounded(spawn_activity_invocation(
+                        &runtime,
+                        handler,
+                        context(&runtime),
+                        String::new()
+                    ))
+                    .await
+                    .unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(
+                bounded(runtime.shutdown_with_grace(Duration::from_secs(1))).await,
+                Ok(ShutdownOutcome::Drained)
+            );
+        }
+
+        struct FailingPayload(Arc<AtomicUsize>);
+
+        impl Drop for FailingPayload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("prototype payload destructor");
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn original_panic_payload_destruction_still_faults_runtime() {
+            let runtime = runtime().await;
+            let drops = Arc::new(AtomicUsize::new(0));
+            let observed = drops.clone();
+            let error = bounded(spawn_activity_invocation(
+                &runtime,
+                panic_handler(move || Box::new(FailingPayload(observed.clone()))),
+                context(&runtime),
+                String::new(),
+            ))
+            .await
+            .unwrap_err();
+            assert!(error.into_panic().is::<()>(), "opaque payload must not escape to Tokio");
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                bounded(runtime.clone().shutdown_with_grace(Duration::ZERO)).await,
+                Err(RuntimeShutdownError::Failed { quiescent: true })
+            );
+            assert!(runtime.lifecycle.lock().unwrap().failures.iter().any(|failure| {
+                failure.task == "activity-panic-payload" && failure.kind == FailureKind::PanicPayloadPanicked
+            }));
+        }
+
+        struct DirectFutureHandler<F>(F);
+
+        // Avoid an async-trait wrapper so the probe exercises the returned future's own Drop.
+        impl<F, Fut> ActivityHandler for DirectFutureHandler<F>
+        where
+            F: Fn() -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = Result<String, String>> + Send + 'static,
+        {
+            fn invoke<'life0, 'async_trait>(
+                &'life0 self,
+                _context: ActivityContext,
+                _input: String,
+            ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin((self.0)())
+            }
+        }
+
+        struct FailingFutureDrop(Arc<AtomicUsize>);
+
+        impl Future for FailingFutureDrop {
+            type Output = Result<String, String>;
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Ok("completed".to_owned()))
+            }
+        }
+
+        impl Drop for FailingFutureDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("prototype future destructor");
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn completed_activity_future_destruction_still_faults_runtime() {
+            let runtime = runtime().await;
+            let drops = Arc::new(AtomicUsize::new(0));
+            let observed = drops.clone();
+            let handler = Arc::new(DirectFutureHandler(move || FailingFutureDrop(observed.clone())));
+            assert_eq!(
+                bounded(spawn_activity_invocation(
+                    &runtime,
+                    handler,
+                    context(&runtime),
+                    String::new()
+                ))
+                .await
+                .unwrap(),
+                Ok("completed".to_owned())
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                bounded(runtime.clone().shutdown_with_grace(Duration::ZERO)).await,
+                Err(RuntimeShutdownError::Failed { quiescent: true })
+            );
+            assert!(runtime.lifecycle.lock().unwrap().failures.iter().any(|failure| {
+                failure.task == "activity-invocation" && failure.kind == FailureKind::DestructionPanicked
+            }));
+        }
+
+        struct CountedPayload(Arc<AtomicUsize>);
+
+        impl Drop for CountedPayload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct HeldFutureDrop {
+            payload_drops: Arc<AtomicUsize>,
+            future_drops: Arc<AtomicUsize>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<Mutex<mpsc::Receiver<()>>>,
+        }
+
+        impl Future for HeldFutureDrop {
+            type Output = Result<String, String>;
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                std::panic::resume_unwind(Box::new(CountedPayload(self.payload_drops.clone())))
+            }
+        }
+
+        impl Drop for HeldFutureDrop {
+            fn drop(&mut self) {
+                self.entered.notify_one();
+                tokio::task::block_in_place(|| {
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(LIMIT)
+                        .expect("release held destructor");
+                });
+                self.future_drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn dropped_observer_cannot_publish_cleanup_before_destructor_returns() {
+            for _ in 0..100 {
+                let runtime = runtime().await;
+                let payload_drops = Arc::new(AtomicUsize::new(0));
+                let future_drops = Arc::new(AtomicUsize::new(0));
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let (release, receiver) = mpsc::channel();
+                let receiver = Arc::new(Mutex::new(receiver));
+                let handler = {
+                    let payload_drops = payload_drops.clone();
+                    let future_drops = future_drops.clone();
+                    let entered = entered.clone();
+                    Arc::new(DirectFutureHandler(move || HeldFutureDrop {
+                        payload_drops: payload_drops.clone(),
+                        future_drops: future_drops.clone(),
+                        entered: entered.clone(),
+                        release: receiver.clone(),
+                    }))
+                };
+                let activity = spawn_activity_invocation(&runtime, handler, context(&runtime), String::new());
+                bounded(entered.notified()).await;
+                assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
+                activity.abort();
+                drop(activity);
+                let mut stopped = tokio::spawn(runtime.clone().shutdown_with_grace(Duration::ZERO));
+                bounded(async {
+                    while !(runtime.task_tracker.is_closed()
+                        && runtime.task_tracker.len() == 1
+                        && runtime
+                            .hooks()
+                            .hits(crate::runtime::test_hooks::LifecyclePoint::ForceRequested)
+                            == 1)
+                    {
+                        assert!(!stopped.is_finished(), "shutdown completed while destruction was held");
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), &mut stopped)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(future_drops.load(Ordering::SeqCst), 0);
+                release.send(()).unwrap();
+                assert_eq!(bounded(stopped).await.unwrap(), Ok(ShutdownOutcome::Forced));
+                assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(runtime.task_tracker.len(), 0);
+                assert!(runtime.lifecycle.lock().unwrap().failures.is_empty());
+            }
+        }
     }
 }

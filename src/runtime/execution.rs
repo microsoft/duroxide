@@ -40,6 +40,39 @@ impl Runtime {
         Vec<ScheduledActivityIdentifier>,
         Result<String, String>,
     ) {
+        self.run_single_execution_scoped(
+            instance,
+            history_mgr,
+            workitem_reader,
+            execution_id,
+            worker_id,
+            handler,
+            orchestration_version,
+            kv_snapshot,
+            Default::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_single_execution_scoped(
+        self: Arc<Self>,
+        instance: &str,
+        history_mgr: &mut crate::runtime::state_helpers::HistoryManager,
+        workitem_reader: &crate::runtime::state_helpers::WorkItemReader,
+        execution_id: u64,
+        worker_id: &str,
+        handler: Arc<dyn OrchestrationHandler>,
+        orchestration_version: String,
+        kv_snapshot: std::collections::HashMap<String, crate::providers::KvEntry>,
+        cleanup: super::invocation_scope::CleanupAttachment,
+    ) -> (
+        Vec<Event>,
+        Vec<WorkItem>,
+        Vec<WorkItem>,
+        Vec<ScheduledActivityIdentifier>,
+        Result<String, String>,
+    ) {
         let orchestration_name = &workitem_reader.orchestration_name;
         debug!(instance, orchestration_name, "🚀 Starting atomic single execution");
 
@@ -108,12 +141,13 @@ impl Runtime {
         }
 
         // Execute the orchestration logic
-        let turn_result = turn.execute_orchestration(
+        let turn_result = turn.execute_orchestration_scoped(
             handler.clone(),
             input.clone(),
             orchestration_name.to_string(),
             orchestration_version.clone(),
             worker_id,
+            cleanup,
         );
 
         // Select/select2 losers: request cancellation for those activities now.
