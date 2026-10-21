@@ -114,7 +114,9 @@ must all retire before success. Independent provider token-refresh tasks and
 arbitrary application-detached tasks are outside that barrier.
 
 Each native caller supplies a grace period. Concurrent callers wait for the same
-tracked work, and a shorter call may force an earlier abort. Native grace is not
+tracked work, and a shorter call may force an earlier abort. A stale force
+decision cannot change an already observed terminal `Drained` result to `Forced`;
+concurrent shortening applies only before terminal completion. Native grace is not
 restricted by SDK nanosecond transport limits. A duration beyond the clock's
 representable future waits for natural cleanup without a force timer, never
 immediate force. Positive sub-millisecond precision is retained. A never-started runtime can
@@ -144,6 +146,33 @@ Legacy `shutdown(None)` retains the unit return and one-second grace;
 `Some(0)` requests immediate force. Both still await actual cleanup without a
 total limit. Operational failures are logged rather than becoming shutdown-timeout panics.
 
+### Fault shutdown and recovery
+
+The unreleased lifecycle integration adds **per-Runtime fail-stop** for internal
+execution, destruction, finalization and registered-cleanup faults. A detected
+fault closes admission and requests zero-grace shutdown of that Runtime, which
+can interrupt unrelated work already admitted by the same worker. There is no
+selective catch-and-continue mode. Ordinary activity/orchestration application
+errors, including ordinary handler polling panics, remain operation-local.
+Rust activity panic history retains the actual Tokio-generated task-panic message;
+normal returned `Result` errors are unchanged.
+
+Zero grace requests force, not immediate cleanup completion. Non-yielding native
+frames and outstanding foreign completions remain owned until actual retirement,
+even if that takes indefinitely. The runtime does not kill the OS process or stop
+every co-hosted Runtime. SDK observation deadlines do not cancel this cleanup or
+authorize release; an SDK's incomplete-cleanup termination obligation remains the
+application/supervisor's responsibility even if cleanup eventually completes.
+
+A stopped or faulted Runtime cannot restart. After proven cleanup, recovery can
+use a newly constructed worker; do not resume admission on the failed one.
+Unacknowledged work follows existing provider lease-expiry, recovery, retry and
+poison rules. Recovery need not be immediate and may consume retry attempts.
+Already acknowledged history stays committed. Retried activities can repeat
+external effects, so use the application's existing idempotency protections.
+Runtime shutdown is not a transaction rollback, compensation mechanism or new
+exactly-once guarantee.
+
 ### Foreign invocations and replay retirement
 
 An adapter must register one `OrchestrationContext::register_invocation_cleanup`
@@ -154,11 +183,27 @@ accepting cleanup that it cannot await.
 
 The optional `register_invocation_cleanup_with_finalization` notification closes
 foreign scheduling/mutation admission before the durable turn snapshot. The
-runtime destroys the driver and tracks foreign retirement only after capturing
-the durable decision, so teardown-induced cancellation does not become persisted
+runtime destroys the driver and tracks foreign retirement after the decision
+attempt, so teardown-induced cancellation does not become persisted
 orchestration failure. Finalization must be prompt: no I/O or waiting for foreign
 work in the notification. Ordinary replay completion, dehydration, failure, and
 continue-as-new retire a turn; they are not automatically forced runtime shutdown.
+
+Normal finalization includes already-admitted actions in the snapshot under the
+existing turn rules, including scheduling and continue-as-new. A **detected
+pre-snapshot finalization failure**, including notification-capture destruction,
+rejects that attempt's newly generated durable batch: no acknowledgement of its
+history, actions or detached starts is attempted. It stops the Runtime under the
+fault policy above while retaining outstanding foreign cleanup. Returning an
+ordinary failed application turn would not provide this no-new-effects boundary.
+Previously committed history is not erased.
+
+An outer engine decision-construction panic likewise finalizes and destroys the
+driver outside active unwinding before propagating, without waiting for foreign
+completion first. Post-decision driver or cleanup failures do not rewrite a valid
+decision or undo an already committed acknowledgement. Shutdown may race an
+acknowledgement still in progress; there is no additional provider transaction or
+external-effect compensation guarantee.
 
 Turn retirement transfers registered cleanup into the runtime's task tracker
 before the native turn can leave it. This cleanup is not an abortable dispatcher
@@ -169,6 +214,10 @@ error is still a lifecycle failure. A panicking completion cannot certify that
 work ended and remains retained. Unregistered continuations cannot be covered by
 this contract. The .NET adapter registers its root/SDK continuation lifetime;
 the narrow Node/Python adapters do not provide that additional guarantee.
+
+Production [retirement diagnostics](observability-guide.md#pending-foreign-retirements-unreleased)
+expose the count of independently retained foreign completions, separately from
+durable workload metrics. A zero count is never permission to release resources.
 
 ---
 

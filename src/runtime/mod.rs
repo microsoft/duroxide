@@ -477,6 +477,7 @@ struct Lifecycle {
     failures: Vec<TaskFailure>,
     forced: bool,
     rollback_requested: bool,
+    pending_foreign_retirements: usize,
 }
 
 struct StartWaiter {
@@ -1131,6 +1132,7 @@ impl Runtime {
                 failures: Vec::new(),
                 forced: false,
                 rollback_requested: false,
+                pending_foreign_retirements: 0,
             }),
             lifecycle_id: NEXT_LIFECYCLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             startup_result: watch::channel(None).0,
@@ -1286,17 +1288,29 @@ impl Runtime {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        self.task_tracker.spawn(self.clone().tracked_task(role, future))
+    }
+
+    fn tracked_task<F>(
+        self: Arc<Self>,
+        role: TaskRole,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + Send
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
         #[cfg(feature = "test-hooks")]
         let hooks = self.hooks();
+        #[cfg(feature = "test-hooks")]
         let work = async move {
-            #[cfg(feature = "test-hooks")]
             let _guard = hooks.track(role);
-            #[cfg(feature = "test-hooks")]
             hooks.checkpoint(test_hooks::LifecyclePoint::ParentWork(role)).await;
             future.await
         };
-        self.task_tracker
-            .spawn(task_safety::TrackedTask::new(self.clone(), role.name(), work))
+        #[cfg(not(feature = "test-hooks"))]
+        let work = future;
+        task_safety::TrackedTask::new(self, role.name(), work)
     }
 
     fn record_faults(self: &Arc<Self>, failures: &[TaskFailure]) {
@@ -1332,6 +1346,44 @@ impl Runtime {
                 &mut failures,
             );
             self.lifecycle.lock().unwrap().failures.extend(failures);
+        }
+    }
+
+    fn record_foreign_retirement(self: &Arc<Self>, started: bool) {
+        let pending = {
+            let mut state = self.lifecycle.lock().unwrap();
+            if started {
+                state.pending_foreign_retirements += 1;
+            } else {
+                state.pending_foreign_retirements -= 1;
+            }
+            state.pending_foreign_retirements
+        };
+        let reported = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let gauge = metrics::gauge!("duroxide_pending_foreign_retirements");
+            if started {
+                gauge.increment(1.0);
+            } else {
+                gauge.decrement(1.0);
+            }
+            tracing::info!(
+                target: "duroxide::runtime::lifecycle",
+                category = "foreign_retirement_count",
+                lifecycle_id = self.lifecycle_id,
+                runtime_id = %self.runtime_id,
+                pending_foreign_retirements = pending,
+                "Pending foreign retirement count changed; telemetry is not cleanup proof"
+            );
+        }));
+        if let Err(payload) = reported {
+            let mut failures = Vec::new();
+            task_safety::record_panic(
+                "foreign-retirement-reporting",
+                FailureKind::ReportingPanicked,
+                payload,
+                &mut failures,
+            );
+            self.record_faults(&failures);
         }
     }
 
@@ -1463,44 +1515,52 @@ impl Runtime {
             false
         };
         if force {
-            let first = {
-                let mut state = self.lifecycle.lock().unwrap();
-                let first = !state.forced;
-                state.forced = true;
-                if let Some(startup) = &state.startup_owner {
-                    startup.abort();
-                }
-                first
-            };
-            for handle in self.tasks.lock().await.iter() {
-                handle.abort();
-            }
-            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                warn!(
-                    target: "duroxide::runtime::lifecycle",
-                    category = "shutdown_forced",
-                    lifecycle_id = self.lifecycle_id,
-                    runtime_id = %self.runtime_id,
-                    remaining_tasks = self.task_tracker.len(),
-                    "Aborting dispatchers and waiting for task cleanup"
-                );
-            })) {
-                let mut failures = Vec::new();
-                task_safety::record_panic(
-                    "shutdown-reporting",
-                    FailureKind::ReportingPanicked,
-                    payload,
-                    &mut failures,
-                );
-                self.record_faults(&failures);
-            }
             #[cfg(feature = "test-hooks")]
-            if first {
-                self.shutdown_checkpoint(test_hooks::LifecyclePoint::ForceRequested)
-                    .await;
+            self.shutdown_checkpoint(test_hooks::LifecyclePoint::BeforeForce).await;
+            let admitted = {
+                let mut state = self.lifecycle.lock().unwrap();
+                if state.phase == RuntimePhase::Stopped {
+                    None
+                } else {
+                    let first = !state.forced;
+                    state.forced = true;
+                    if let Some(startup) = &state.startup_owner {
+                        startup.abort();
+                    }
+                    Some(first)
+                }
+            };
+            if let Some(first) = admitted {
+                for handle in self.tasks.lock().await.iter() {
+                    handle.abort();
+                }
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    warn!(
+                        target: "duroxide::runtime::lifecycle",
+                        category = "shutdown_forced",
+                        lifecycle_id = self.lifecycle_id,
+                        runtime_id = %self.runtime_id,
+                        remaining_tasks = self.task_tracker.len(),
+                        "Aborting dispatchers and waiting for task cleanup"
+                    );
+                })) {
+                    let mut failures = Vec::new();
+                    task_safety::record_panic(
+                        "shutdown-reporting",
+                        FailureKind::ReportingPanicked,
+                        payload,
+                        &mut failures,
+                    );
+                    self.record_faults(&failures);
+                }
+                #[cfg(feature = "test-hooks")]
+                if first {
+                    self.shutdown_checkpoint(test_hooks::LifecyclePoint::ForceRequested)
+                        .await;
+                }
+                #[cfg(not(feature = "test-hooks"))]
+                let _ = first;
             }
-            #[cfg(not(feature = "test-hooks"))]
-            let _ = first;
         }
 
         self.task_tracker.wait().await;

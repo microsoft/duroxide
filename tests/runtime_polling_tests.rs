@@ -47,6 +47,7 @@ async fn records_controlled_ten_second_polling_windows() {
         let start = provider.begin_window(window);
         tokio::time::sleep_until((start + window).into()).await;
         let sample = provider.sample();
+        println!("DUROXIDE_POLLING_SAMPLE {}", serde_json::to_string(&sample).unwrap());
 
         provider.stop_polling();
         assert_eq!(
@@ -80,7 +81,6 @@ async fn records_controlled_ten_second_polling_windows() {
             assert_eq!(request.poll_timeout, poll_timeout);
             assert_eq!(request.lock_timeout, expected_locks[request.queue]);
         }
-        println!("DUROXIDE_POLLING_SAMPLE {}", serde_json::to_string(&sample).unwrap());
     }
 }
 

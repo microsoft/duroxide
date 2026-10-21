@@ -29,12 +29,14 @@ pub struct FetchRequest {
     pub queue: usize,
     pub lock_timeout: Duration,
     pub poll_timeout: Duration,
+    pub offset: Duration,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct PollingSample {
     pub behavior: PollBehavior,
     pub window: Duration,
+    pub observation_offset: Duration,
     pub inner_probe_interval: Duration,
     pub outer_fetches: [usize; 2],
     pub inner_probes: [usize; 2],
@@ -115,13 +117,12 @@ impl ControlledProvider {
     pub fn sample(&self) -> PollingSample {
         let measurement = self.measurement.lock().unwrap();
         let measurement = measurement.as_ref().expect("measurement window started");
-        assert!(
-            measurement.start.elapsed() >= measurement.window,
-            "window has not ended"
-        );
+        let observation_offset = measurement.start.elapsed();
+        assert!(observation_offset >= measurement.window, "window has not ended");
         PollingSample {
             behavior: self.behavior,
             window: measurement.window,
+            observation_offset,
             inner_probe_interval: Self::PROBE_INTERVAL,
             outer_fetches: std::array::from_fn(|queue| {
                 measurement
@@ -191,12 +192,18 @@ impl ControlledProvider {
         self.returned(operation, result, committed).await
     }
 
-    fn record_request(&self, request: FetchRequest) {
+    fn record_request(&self, queue: usize, lock_timeout: Duration, poll_timeout: Duration) {
         let mut measurement = self.measurement.lock().unwrap();
-        if let Some(measurement) = measurement.as_mut()
-            && measurement.start.elapsed() < measurement.window
-        {
-            measurement.requests.push(request);
+        if let Some(measurement) = measurement.as_mut() {
+            let offset = measurement.start.elapsed();
+            if offset < measurement.window {
+                measurement.requests.push(FetchRequest {
+                    queue,
+                    lock_timeout,
+                    poll_timeout,
+                    offset,
+                });
+            }
         }
     }
 
@@ -223,11 +230,7 @@ impl ControlledProvider {
     {
         self.ready[queue].cancel();
         self.start.cancelled().await;
-        self.record_request(FetchRequest {
-            queue,
-            lock_timeout,
-            poll_timeout,
-        });
+        self.record_request(queue, lock_timeout, poll_timeout);
         let deadline = Instant::now()
             .checked_add(poll_timeout)
             .expect("fixture poll duration representable");

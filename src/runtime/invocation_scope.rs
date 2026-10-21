@@ -40,6 +40,7 @@ struct State {
     closed: bool,
     attached: bool,
     finalized: bool,
+    finalization_failed: bool,
     finalization: Option<Box<dyn FnMut() + Send + 'static>>,
     cleanup: Option<TaskFuture<'static>>,
     failures: Vec<TaskFailure>,
@@ -75,12 +76,12 @@ impl Drop for InvocationGuard {
     fn drop(&mut self) {
         let scope = self.scope.take().expect("invocation retires once");
         scope.attachment().finalize();
-        let has_cleanup = {
+        let (needs_retirement, has_cleanup) = {
             let mut state = scope.0.lock().unwrap();
             state.closed = true;
-            state.attached || !state.failures.is_empty()
+            (state.attached || !state.failures.is_empty(), state.cleanup.is_some())
         };
-        if !has_cleanup {
+        if !needs_retirement {
             return;
         }
         let runtime = self.runtime.clone();
@@ -92,11 +93,19 @@ impl Drop for InvocationGuard {
             .clone()
             .expect("executing turn has an executor");
         let tracker = runtime.task_tracker.clone();
+        if has_cleanup {
+            runtime.record_foreign_retirement(true);
+        }
         // Registration occurs before the parent can leave the tracker. This cleanup
         // is deliberately not an abortable dispatcher child.
         tracker.spawn_on(
             async move {
                 let _ = scope.retire_reporting(|failures| runtime.record_faults(failures)).await;
+                // Only a returned completion proves retirement, including an Err.
+                // Dropping or panicking an observer must not decrement this count.
+                if has_cleanup {
+                    runtime.record_foreign_retirement(false);
+                }
             },
             &executor,
         );
@@ -268,8 +277,24 @@ impl CleanupAttachment {
                 &mut failures,
             );
         }
-        state.lock().unwrap().failures.extend(failures);
+        let mut state = state.lock().unwrap();
+        state.finalization_failed |= !failures.is_empty();
+        state.failures.extend(failures);
         true
+    }
+
+    pub(super) fn finalization_failed(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|state| state.lock().unwrap().finalization_failed)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn before_turn_decision(&self) {
+        let hooks = self.0.as_ref().and_then(|state| state.lock().unwrap().hooks.clone());
+        if let Some(hooks) = hooks {
+            hooks.panic_if_armed(super::test_hooks::LifecyclePoint::BeforeTurnDecision);
+        }
     }
 
     pub(super) fn destroy_driver(&self, driver: impl Sized) {
@@ -478,6 +503,7 @@ mod tests {
             )
             .unwrap();
         assert!(scope.attachment().finalize());
+        assert!(scope.attachment().finalization_failed());
         let retirement = tokio::spawn(scope.retire());
         assert!(!retirement.is_finished());
         release.send(()).unwrap();
@@ -490,20 +516,31 @@ mod tests {
 
     #[tokio::test]
     async fn finalization_precedes_snapshot_and_driver_drop_without_capturing_drop_mutations() {
+        finalization_and_driver_destruction(false).await;
+    }
+
+    #[tokio::test]
+    async fn post_decision_driver_destruction_failure_preserves_the_valid_decision() {
+        finalization_and_driver_destruction(true).await;
+    }
+
+    async fn finalization_and_driver_destruction(fail_driver: bool) {
         use crate::runtime::replay_engine::{ReplayEngine, TurnResult};
         use crate::{Action, Event, EventKind, OrchestrationContext, OrchestrationHandler};
 
         struct DriverDrop {
             context: OrchestrationContext,
             order: Arc<Mutex<Vec<&'static str>>>,
+            fail: bool,
         }
         impl Drop for DriverDrop {
             fn drop(&mut self) {
                 self.order.lock().unwrap().push("driver-drop");
                 self.context.set_kv_value("after-snapshot", "must-not-be-committed");
+                assert!(!self.fail, "post-decision driver destruction");
             }
         }
-        struct Handler(Arc<Mutex<Vec<&'static str>>>);
+        struct Handler(Arc<Mutex<Vec<&'static str>>>, bool);
         #[async_trait::async_trait]
         impl OrchestrationHandler for Handler {
             async fn invoke(&self, context: OrchestrationContext, _: String) -> Result<String, String> {
@@ -525,6 +562,7 @@ mod tests {
                 let _driver = DriverDrop {
                     context: context.clone(),
                     order: Arc::clone(&self.0),
+                    fail: self.1,
                 };
                 context.schedule_activity("held", "input").await
             }
@@ -550,7 +588,7 @@ mod tests {
         );
         let mut engine = ReplayEngine::new("fenced".into(), 1, vec![event]);
         let result = engine.execute_orchestration_scoped(
-            Arc::new(Handler(Arc::clone(&order))),
+            Arc::new(Handler(Arc::clone(&order), fail_driver)),
             String::new(),
             "flow".into(),
             "1.0.0".into(),
@@ -558,6 +596,7 @@ mod tests {
             scope.attachment(),
         );
         assert!(matches!(result, TurnResult::Continue));
+        assert!(!scope.attachment().finalization_failed());
         assert_eq!(*order.lock().unwrap(), ["finalization", "driver-drop"]);
         assert!(engine.pending_actions.iter().any(|action| matches!(
             action, Action::SetKeyValue { key, value, .. } if key == "before-snapshot" && value == "included"
@@ -565,7 +604,18 @@ mod tests {
         assert!(!engine.pending_actions.iter().any(|action| matches!(
             action, Action::SetKeyValue { key, .. } if key == "after-snapshot"
         )));
-        assert_eq!(scope.retire().await, Ok(()));
+        let retirement = scope.retire().await;
+        if fail_driver {
+            assert_eq!(
+                retirement,
+                Err(vec![TaskFailure {
+                    task: "orchestration-driver",
+                    kind: FailureKind::DestructionPanicked,
+                }])
+            );
+        } else {
+            assert_eq!(retirement, Ok(()));
+        }
         assert_eq!(*order.lock().unwrap(), ["finalization", "driver-drop", "completion"]);
     }
 }

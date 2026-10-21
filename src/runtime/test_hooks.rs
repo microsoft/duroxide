@@ -105,7 +105,9 @@ pub enum LifecyclePoint {
     StartupBeforeIo,
     StartupAfterSpawn(LifecycleTask),
     ShutdownCoordinator,
+    BeforeForce,
     ForceRequested,
+    BeforeTurnDecision,
     ParentWork(LifecycleTask),
     ProviderEnter(ProviderOperation),
     ProviderReturn(ProviderOperation),
@@ -224,6 +226,17 @@ impl LifecycleHooks {
                 gate.released.cancelled().await;
             }
         }
+        if let Some(message) = fail {
+            panic!("{message}");
+        }
+    }
+
+    pub(super) fn panic_if_armed(&self, point: LifecyclePoint) {
+        let fail = {
+            let mut state = self.0.lock().unwrap();
+            *state.hits.entry(point).or_default() += 1;
+            state.faults.remove(&point)
+        };
         if let Some(message) = fail {
             panic!("{message}");
         }

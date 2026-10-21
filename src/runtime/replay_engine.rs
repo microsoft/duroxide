@@ -660,7 +660,7 @@ impl ReplayEngine {
                             break;
                         }
                         Ok(None) => {}
-                        Err(err) => return err,
+                        Err(err) => return Ok(err),
                     }
                     must_poll = false;
                 }
@@ -673,7 +673,7 @@ impl ReplayEngine {
                     &mut schedule_kinds,
                     &mut must_poll,
                 ) {
-                    return err;
+                    return Ok(err);
                 }
             }
 
@@ -683,7 +683,7 @@ impl ReplayEngine {
                 match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
                     Ok(Some(result)) => output_opt = Some(result),
                     Ok(None) => {}
-                    Err(err) => return err,
+                    Err(err) => return Ok(err),
                 }
             }
 
@@ -699,20 +699,30 @@ impl ReplayEngine {
             self.convert_emitted_actions(&ctx, emitted_actions);
 
             if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt) {
-                return err;
+                return Ok(err);
             }
 
-            if cleanup.finalize() {
+            #[cfg(feature = "test-hooks")]
+            cleanup.before_turn_decision();
+            let finalized = cleanup.finalize();
+            if cleanup.finalization_failed() {
+                return Err(());
+            }
+            if finalized {
                 self.convert_emitted_actions(&ctx, ctx.drain_emitted_actions());
             }
-            self.finalize_turn(&ctx, output_opt)
+            Ok(self.finalize_turn(&ctx, output_opt))
         }));
         // Destruction may emit cancellation bookkeeping; it follows the durable
         // decision, while foreign scheduling is fenced before that snapshot.
         cleanup.finalize();
+        let finalization_failed = cleanup.finalization_failed();
         cleanup.destroy_driver(fut);
         match decision {
-            Ok(result) => result,
+            Ok(Ok(result)) if !finalization_failed => result,
+            // This is an engine failure, not a failed application turn: the caller
+            // must not acknowledge any newly generated history, actions or starts.
+            Ok(_) => std::panic::resume_unwind(Box::new(())),
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }

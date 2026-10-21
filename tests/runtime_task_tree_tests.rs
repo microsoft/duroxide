@@ -68,7 +68,15 @@ async fn startup_failure_after_each_dispatcher_batch_retains_and_cleans_started_
 #[tokio::test]
 async fn every_tracked_task_role_reports_faults_and_retires_all_remaining_work() {
     let (events, _capture) = tracing_capture::install_tracing_capture();
-    for task in LifecycleTask::ALL {
+    for (task, expected_role) in [
+        (LifecycleTask::GaugePoller, "gauge-poller"),
+        (LifecycleTask::OrchestrationSlot, "orchestration-slot"),
+        (LifecycleTask::OrchestrationRenewal, "orchestration-renewal"),
+        (LifecycleTask::WorkerSlot, "worker-slot"),
+        (LifecycleTask::SessionManager, "session-manager"),
+        (LifecycleTask::ActivityManager, "activity-manager"),
+        (LifecycleTask::ActivityInvocation, "activity-invocation"),
+    ] {
         let f = Fixture::new().await;
         let fault = LifecyclePoint::ParentWork(task);
         f.hooks.fail_once_with_message(fault, SECRET).unwrap();
@@ -81,6 +89,15 @@ async fn every_tracked_task_role_reports_faults_and_retires_all_remaining_work()
         };
         f.client().start_orchestration("task-fault", "flow", "").await.unwrap();
         let runtime = f.prepare(pending_activity(), flow(), options());
+        let lifecycle_id = events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|event| event.field("category").as_deref() == Some("runtime_prepared"))
+            .unwrap()
+            .field("lifecycle_id")
+            .unwrap();
         let started = runtime.clone().start_execution().await;
         assert!(matches!(started, Ok(()) | Err(RuntimeStartError::StartupFailed)));
         until(|| f.hooks.hits(fault) == 1).await;
@@ -93,13 +110,113 @@ async fn every_tracked_task_role_reports_faults_and_retires_all_remaining_work()
         if let Some(ack) = ack {
             ack.release();
         }
+        let captured = events.lock().unwrap();
+        assert!(
+            captured.iter().any(|event| event.level == tracing::Level::ERROR
+                && event.target == "duroxide::runtime::lifecycle"
+                && event.message.contains("failed")
+                && event.field("category").as_deref() == Some("owned_execution_failed")
+                && event.field("lifecycle_id").as_deref() == Some(lifecycle_id.as_str())
+                && event.field("task").as_deref() == Some(expected_role)
+                && event.field("kind").as_deref() == Some("PollPanicked")),
+            "missing original {expected_role}/PollPanicked report for lifecycle {lifecycle_id}: {captured:?}"
+        );
     }
     let captured = events.lock().unwrap();
-    assert!(captured.iter().any(|event| event.level == tracing::Level::ERROR
-        && event.target == "duroxide::runtime::lifecycle"
-        && event.message.contains("failed")
-        && event.field("category").as_deref() == Some("owned_execution_failed")));
     assert!(!format!("{captured:?}").contains("sentinel"));
+}
+
+#[tokio::test]
+async fn legacy_none_allows_completion_during_its_one_second_grace_but_zero_forces() {
+    for grace in [None, Some(0)] {
+        let f = Fixture::new().await;
+        let active = CancellationToken::new();
+        let release = CancellationToken::new();
+        let handler_active = active.clone();
+        let handler_release = release.clone();
+        let activities = ActivityRegistry::builder()
+            .register("work", move |_: ActivityContext, _: String| {
+                let active = handler_active.clone();
+                let release = handler_release.clone();
+                async move {
+                    active.cancel();
+                    release.cancelled().await;
+                    Ok("completed within default grace".to_string())
+                }
+            })
+            .build();
+        let runtime = f.prepare(activities, flow(), options());
+        runtime.clone().start_execution().await.unwrap();
+        f.client()
+            .start_orchestration("legacy-grace", "flow", "")
+            .await
+            .unwrap();
+        bounded(active.cancelled()).await;
+        let shutdown = tokio::spawn(runtime.clone().shutdown(grace));
+        until(|| f.hooks.hits(LifecyclePoint::ShutdownCoordinator) == 1).await;
+        if grace.is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!shutdown.is_finished(), "None must not force admitted work immediately");
+            assert_eq!(f.hooks.hits(LifecyclePoint::ForceRequested), 0);
+            release.cancel();
+        } else {
+            until(|| f.hooks.hits(LifecyclePoint::ForceRequested) == 1).await;
+        }
+        bounded(shutdown).await.unwrap();
+        assert_eq!(
+            runtime.shutdown_with_grace(Duration::ZERO).await,
+            Ok(if grace.is_none() {
+                ShutdownOutcome::Drained
+            } else {
+                ShutdownOutcome::Forced
+            })
+        );
+        assert_eq!(
+            f.hooks
+                .hits(LifecyclePoint::ProviderCommit(ProviderOperation::AcknowledgeActivity)),
+            usize::from(grace.is_none())
+        );
+        f.assert_retired();
+        if grace.is_none() {
+            let peer =
+                Runtime::start_with_options(f.inner.clone(), ActivityRegistry::builder().build(), flow(), options())
+                    .await;
+            assert!(
+                matches!(bounded(f.client().wait_for_orchestration("legacy-grace", Duration::from_secs(3))).await.unwrap(),
+                OrchestrationStatus::Completed { output, .. } if output == "completed within default grace")
+            );
+            peer.shutdown(Some(0)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_none_forces_work_held_through_default_grace_expiry() {
+    let f = Fixture::new().await;
+    let active = f.hold(LifecyclePoint::ParentWork(LifecycleTask::ActivityInvocation));
+    let runtime = f.prepare(pending_activity(), flow(), options());
+    runtime.clone().start_execution().await.unwrap();
+    f.client()
+        .start_orchestration("legacy-expiry", "flow", "")
+        .await
+        .unwrap();
+    entered(&active).await;
+    let start = std::time::Instant::now();
+    let shutdown = tokio::spawn(runtime.clone().shutdown(None));
+    until(|| f.hooks.hits(LifecyclePoint::ForceRequested) == 1).await;
+    assert!(start.elapsed() >= Duration::from_secs(1), "None's grace was shortened");
+    bounded(shutdown).await.unwrap();
+    assert_eq!(
+        runtime.shutdown_with_grace(Duration::ZERO).await,
+        Ok(ShutdownOutcome::Forced)
+    );
+    assert_eq!(
+        f.hooks
+            .hits(LifecyclePoint::ProviderCommit(ProviderOperation::AcknowledgeActivity)),
+        0
+    );
+    f.assert_retired();
+    active.release();
 }
 
 #[tokio::test]
@@ -295,11 +412,17 @@ async fn shutdown_hook_fault_remains_an_error_without_losing_startup_cleanup() {
 #[tokio::test]
 async fn application_panics_remain_durable_application_errors_with_their_message() {
     let f = Fixture::new().await;
+    let task_id = Arc::new(Mutex::new(None));
+    let captured_task_id = task_id.clone();
     let activities = ActivityRegistry::builder()
-        .register("work", |_: ActivityContext, _: String| async {
-            panic!("application-panic-message");
-            #[allow(unreachable_code)]
-            Ok(String::new())
+        .register("work", move |_: ActivityContext, _: String| {
+            let task_id = captured_task_id.clone();
+            async move {
+                *task_id.lock().unwrap() = Some(tokio::task::id());
+                panic!("application-panic-message");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            }
         })
         .build();
     let runtime = f.prepare(activities, flow(), options());
@@ -309,6 +432,30 @@ async fn application_panics_remain_durable_application_errors_with_their_message
         matches!(bounded(f.client().wait_for_orchestration("app-panic", Duration::from_secs(3))).await.unwrap(),
         OrchestrationStatus::Failed { details, .. } if details.display_message().contains("application-panic-message"))
     );
+    let expected = format!(
+        "task {} panicked with message {:?}",
+        task_id
+            .lock()
+            .unwrap()
+            .expect("activity recorded its actual Tokio task"),
+        "application-panic-message"
+    );
+    let history = f.inner.read("app-panic").await.unwrap();
+    let activity_errors: Vec<_> = history
+        .iter()
+        .filter_map(|event| match &event.kind {
+            duroxide::EventKind::ActivityFailed {
+                details:
+                    duroxide::ErrorDetails::Application {
+                        kind: duroxide::AppErrorKind::ActivityFailed,
+                        message,
+                        ..
+                    },
+            } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(activity_errors, vec![expected.as_str()]);
     assert_eq!(
         runtime.shutdown_with_grace(Duration::from_secs(1)).await,
         Ok(ShutdownOutcome::Drained)

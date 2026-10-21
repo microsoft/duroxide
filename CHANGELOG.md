@@ -15,6 +15,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finalization prevent native task completion from prematurely releasing foreign
   work. Native shutdown retains grace-then-cleanup semantics; language adapters
   own bounded observation and independent cleanup progress.
+- **Pending foreign-retirement count** - One unlabeled gauge aggregates independently
+  retained foreign completions per recorder, without creating series for successive
+  Runtime lifetimes or resetting overlapping populations. Structured lifecycle
+  diagnostics retain per-Runtime identity and counts. Broken completion observers
+  remain outstanding; zero telemetry is not cleanup proof.
+
+### Changed
+
+- **Internal/lifecycle fault shutdown (unreleased integration)** - Internal,
+  destruction, finalization and registered-cleanup faults now close admission and
+  request zero-grace shutdown of the affected Runtime, including unrelated admitted
+  work. Ordinary application failures remain local. Actual cleanup is still awaited;
+  the failed worker cannot restart. Existing lease recovery/retries may repeat
+  external effects. This does not terminate the process, undo committed history or
+  provide exactly-once execution. See the lifecycle guide before replacing a worker.
+- **Pre-snapshot finalization failure** - A detected failure rejects that attempt's
+  newly generated durable batch rather than publishing an ordinary failed turn.
+  Foreign cleanup remains owned. Later driver/cleanup faults do not rewrite valid
+  decisions or undo already committed acknowledgements.
+
+### Fixed
+
+- Preserve an observed `Drained` terminal outcome against a stale concurrent force
+  decision, while retaining native grace shortening before completion.
+- Preserve actual Tokio-generated activity-panic history text on the same task
+  after guarded destruction, instead of replacing it with payload-only text.
 
 ## [0.1.32] - 2026-10-11
 

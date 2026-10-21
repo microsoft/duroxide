@@ -123,6 +123,14 @@ cleanup future and separately bound their callers' waits. A stopped runtime
 cannot restart. Operational failures stay errors; inspect `is_quiescent()`
 rather than assuming an error proves retirement.
 
+Internal/lifecycle faults automatically close admission and request **zero-grace
+shutdown of the affected Runtime**, including unrelated admitted work. This is
+not automatic process termination; ordinary activity/orchestration application
+errors remain operation-local. Cleanup still has to finish, and interrupted work
+uses existing lease recovery and retry rules, with possible duplicate external
+effects. See [fault shutdown and recovery](docs/ORCHESTRATION-GUIDE.md#fault-shutdown-and-recovery)
+before replacing a failed worker.
+
 Legacy `shutdown(None)` still returns `()` after cleanup, with one second of grace
 and no implicit total deadline. It logs operational failures. Native grace is not
 restricted by SDK nanosecond transport limits. See the

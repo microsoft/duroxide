@@ -299,6 +299,7 @@ async fn lifecycle_diagnostics_identify_separate_runtime_instances() {
 async fn shorter_native_call_can_force_an_existing_grace_period_100_times() {
     for _ in 0..100 {
         let f = Fixture::new().await;
+        let force = f.hold(LifecyclePoint::BeforeForce);
         let active = CancellationToken::new();
         let entered = active.clone();
         let activities = ActivityRegistry::builder()
@@ -324,14 +325,72 @@ async fn shorter_native_call_can_force_an_existing_grace_period_100_times() {
         bounded(active.cancelled()).await;
         let mut first = Box::pin(runtime.clone().shutdown_with_grace(Duration::from_secs(30)));
         assert!(first.as_mut().now_or_never().is_none());
-        assert_eq!(
-            bounded(runtime.shutdown_with_grace(Duration::ZERO)).await,
-            Ok(ShutdownOutcome::Forced)
-        );
+        let second = tokio::spawn(runtime.shutdown_with_grace(Duration::ZERO));
+        support::entered(&force).await;
+        assert_eq!(f.hooks.hits(LifecyclePoint::ForceRequested), 0);
+        assert!(first.as_mut().now_or_never().is_none());
+        force.release();
+        assert_eq!(bounded(second).await.unwrap(), Ok(ShutdownOutcome::Forced));
         assert_eq!(bounded(first).await, Ok(ShutdownOutcome::Forced));
         assert_eq!(f.hooks.hits(LifecyclePoint::ForceRequested), 1);
         f.assert_retired();
     }
+}
+
+#[tokio::test]
+async fn stale_force_decision_cannot_change_an_observed_drained_outcome_100_times() {
+    let (events, _capture) = tracing_capture::install_tracing_capture();
+    for _ in 0..100 {
+        let f = Fixture::new().await;
+        let force = f.hold(LifecyclePoint::BeforeForce);
+        let active = CancellationToken::new();
+        let release = CancellationToken::new();
+        let handler_active = active.clone();
+        let handler_release = release.clone();
+        let activities = ActivityRegistry::builder()
+            .register("work", move |_: duroxide::ActivityContext, _: String| {
+                let active = handler_active.clone();
+                let release = handler_release.clone();
+                async move {
+                    active.cancel();
+                    release.cancelled().await;
+                    Ok("drained".to_string())
+                }
+            })
+            .build();
+        let orchestrations = OrchestrationRegistry::builder()
+            .register("flow", |ctx: duroxide::OrchestrationContext, _: String| async move {
+                ctx.schedule_activity("work", "").await
+            })
+            .build();
+        let runtime = f.prepare(activities, orchestrations, options());
+        runtime.clone().start_execution().await.unwrap();
+        f.client().start_orchestration("stale-force", "flow", "").await.unwrap();
+        bounded(active.cancelled()).await;
+        let stale = tokio::spawn(runtime.clone().shutdown_with_grace(Duration::ZERO));
+        entered(&force).await;
+        release.cancel();
+        assert_eq!(
+            bounded(runtime.clone().shutdown_with_grace(Duration::from_secs(3))).await,
+            Ok(ShutdownOutcome::Drained)
+        );
+        f.assert_retired();
+        force.release();
+        assert_eq!(bounded(stale).await.unwrap(), Ok(ShutdownOutcome::Drained));
+        assert_eq!(
+            runtime.shutdown_with_grace(Duration::ZERO).await,
+            Ok(ShutdownOutcome::Drained)
+        );
+        assert_eq!(f.hooks.hits(LifecyclePoint::BeforeForce), 1);
+        assert_eq!(f.hooks.hits(LifecyclePoint::ForceRequested), 0);
+    }
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| { event.field("category").as_deref() == Some("shutdown_forced") })
+    );
 }
 
 #[tokio::test]

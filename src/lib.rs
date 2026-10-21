@@ -2492,7 +2492,8 @@ impl OrchestrationContext {
     /// Attach the foreign invocation's completion before starting foreign work.
     ///
     /// The runtime retains this single-use completion independently of the replay
-    /// future. It is awaited after the durable turn decision and driver destruction.
+    /// future. It is awaited after the turn decision (or a failed decision attempt)
+    /// and driver destruction.
     /// Cleanup errors become lifecycle failures; their arbitrary text is not logged.
     /// A returned result, including `Err`, must certify that foreign work has ended.
     /// A panicking completion cannot certify that fact: it is logged and retained
@@ -2518,8 +2519,12 @@ impl OrchestrationContext {
     /// durable snapshot. It must return promptly without joining foreign work or
     /// performing I/O. Already-admitted foreign execution remains owned by `completion`,
     /// which has the same retirement contract as [`Self::register_invocation_cleanup`].
-    /// A panic in the notification is contained and reported as a lifecycle failure;
-    /// it never substitutes for actual foreign completion.
+    /// A detected notification or capture-destruction failure rejects this attempt's
+    /// newly generated durable effects and stops the affected Runtime. Previously
+    /// committed history is unchanged, and foreign completion remains owned.
+    /// Later driver/cleanup failures do not rewrite a valid decision or undo an
+    /// already committed acknowledgement. This adds no transaction or compensation
+    /// guarantee for external effects.
     ///
     /// Existing handlers need not opt into this notification.
     ///
