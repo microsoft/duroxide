@@ -219,35 +219,37 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 
 ### Pending foreign retirements (unreleased)
 
-`duroxide_pending_foreign_retirements` counts registered foreign completions
-transferred into independent retirement ownership after a turn. It is emitted
-through the existing metrics facade as one unlabeled aggregate gauge per
-recorder. All Runtime populations reporting to that recorder contribute deltas;
-creating or stopping another Runtime does not reset outstanding contributions.
-Repeated Runtime lifetimes do not create additional series. As with other facade
-metrics, install the recorder before starting work; the Runtime neither rebuilds
-counts for a replacement recorder nor owns exporter retention.
+`duroxide_pending_foreign_retirements` counts registered foreign completions that
+the runtime retains independently after a turn. The existing metrics facade
+reports one aggregate gauge per recorder, without labels.
+All Runtime instances using that recorder contribute count changes.
+Starting or stopping another Runtime does not reset the count or create another series.
 
-Per-Runtime correlation belongs only in structured events, not gauge labels.
+Install the recorder before you start work.
+The runtime does not rebuild counts for a replacement recorder or manage exporter retention.
+
+Use structured events, not gauge labels, to identify a Runtime.
 The `duroxide::runtime::lifecycle` event with
 `category="foreign_retirement_count"` carries `lifecycle_id`, `runtime_id` and
 the affected Runtime's `pending_foreign_retirements` on count changes. Enable
 that tracing target at `info` to observe those events.
 
-This population can grow while durable running-instance counts fall: completing
-or dehydrating an orchestration does not imply that its foreign tail ended.
-The count decreases only when the registered completion returns and protected
-destruction finishes. `Err` still certifies the foreign work ended and decrements
-the count, while also causing a lifecycle failure. A panicking/broken completion
-observer remains outstanding, even if unrelated evidence later suggests the work
-finished. Missing telemetry or a zero count is **not** cleanup/quiescence proof.
+The count can rise while the number of running orchestrations falls.
+An orchestration can complete or dehydrate before its foreign work ends.
+The count falls only after the registered completion returns and protected destruction finishes.
+An `Err` result also confirms that foreign work ended.
+It decreases the count and causes a lifecycle failure.
 
-The .NET SDK's retiring-invocation count with outstanding admitted members is a
-different population/unit; do not sum it with this core count as separate work.
-There are no age/reservation details, new outcome counters, public backlog query,
-or telemetry-based eviction/throttling. `metrics_snapshot()` and SDK metrics
-availability are unchanged. Always use the retained lifecycle operation and its
-actual cleanup result, never these diagnostics, to decide resource release.
+A completion observer that panics or breaks remains in the count.
+Other evidence that suggests completion does not change this rule.
+Missing telemetry or a zero count does **not** prove that cleanup finished.
+
+The .NET retiring-invocation count measures a different population.
+Do not add the two counts as if they measured separate work.
+The gauge adds no age details, reservation details, outcome counters, or public backlog query.
+It does not trigger eviction or throttling.
+`metrics_snapshot()` and SDK metrics availability do not change.
+Use the retained lifecycle operation and its cleanup result to decide when resources can be released.
 
 #### Orchestration Lifecycle Metrics
 

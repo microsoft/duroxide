@@ -9,31 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Foreign-runtime lifecycle integration** - Fallible preparation/activation,
-  prompt stop acceptance and typed cleanup results extend the existing
-  `TaskTracker` ownership model. Registered foreign completion and pre-snapshot
-  finalization prevent native task completion from prematurely releasing foreign
-  work. Native shutdown retains grace-then-cleanup semantics; language adapters
-  own bounded observation and independent cleanup progress.
-- **Pending foreign-retirement count** - One unlabeled gauge aggregates independently
-  retained foreign completions per recorder, without creating series for successive
-  Runtime lifetimes or resetting overlapping populations. Structured lifecycle
-  diagnostics retain per-Runtime identity and counts. Broken completion observers
-  remain outstanding; zero telemetry is not cleanup proof.
+- **Foreign-runtime lifecycle integration** - Add fallible preparation and startup,
+  prompt stop requests, and typed cleanup results to the existing `TaskTracker` model.
+  Registered foreign cleanup remains owned after the native turn ends.
+  Finalization closes new durable effects before the snapshot.
+  Native shutdown waits through grace and cleanup. Language SDKs separately limit
+  caller waits and keep cleanup running.
+- **Pending foreign-retirement count** - One gauge reports retained foreign
+  completions per recorder, without Runtime labels or additional series.
+  New runtimes do not reset pending counts from other runtimes.
+  Structured events provide each Runtime's identity and count.
+  Broken completion observers remain counted. A zero count does not prove cleanup.
 
 ### Changed
 
-- **Internal/lifecycle fault shutdown (unreleased integration)** - Internal,
-  destruction, finalization and registered-cleanup faults now close admission and
-  request zero-grace shutdown of the affected Runtime, including unrelated admitted
-  work. Ordinary application failures remain local. Actual cleanup is still awaited;
-  the failed worker cannot restart. Existing lease recovery/retries may repeat
-  external effects. This does not terminate the process, undo committed history or
-  provide exactly-once execution. See the lifecycle guide before replacing a worker.
-- **Pre-snapshot finalization failure** - A detected failure rejects that attempt's
-  newly generated durable batch rather than publishing an ordinary failed turn.
-  Foreign cleanup remains owned. Later driver/cleanup faults do not rewrite valid
-  decisions or undo already committed acknowledgements.
+- **Internal lifecycle fault shutdown** - Internal, destruction, finalization,
+  and registered-cleanup faults stop new work and request zero-grace shutdown of that Runtime.
+  This can interrupt unrelated admitted work. Ordinary application failures still
+  affect only their operation. The failed worker cannot restart and must still
+  finish cleanup. Existing recovery and retry rules can repeat external effects.
+  Shutdown does not terminate the process, undo committed history, or guarantee exactly-once execution.
+- **Finalization failure before the snapshot** - A detected failure rejects the
+  new durable batch from that attempt. It does not publish an ordinary failed turn.
+  Foreign cleanup remains owned. Later driver or cleanup faults do not rewrite a
+  valid decision or undo a committed acknowledgement.
 
 ### Fixed
 

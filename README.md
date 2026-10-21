@@ -105,35 +105,36 @@ rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await?;
 ### Worker lifetime (unreleased)
 
 Use `Runtime::prepare` followed by `Arc::clone(&runtime).start_execution().await`
-to handle startup failures without panicking. Preparation does not dispatch or
-perform provider I/O. The legacy `start*` factories retain their panic-shaped
-startup contract, but partial startup work still has an owned rollback.
+to handle startup errors without a panic. Preparation does not start work or
+call the provider. The legacy `start*` factories still panic on startup failure.
+The runtime retains partially started work until rollback finishes.
 
 Use `shutdown_with_grace(grace)` to observe actual cleanup with a typed result.
-It returns `Result<ShutdownOutcome, RuntimeShutdownError>`: `Drained`/`Forced`
-prove retirement of tracked native work and registered foreign cleanup. Grace is
-not a total wait limit: non-yielding work or a foreign tail can keep cleanup
-pending indefinitely. Concurrent native callers can shorten grace. Dropping a
-native waiter retains task ownership, but another call may be needed to drive
-force and finish shutdown.
+It returns `Result<ShutdownOutcome, RuntimeShutdownError>`. Both `Drained` and
+`Forced` confirm that tracked native work and registered foreign cleanup have ended.
+Grace limits the wait before force, not the total wait.
+Code that does not yield, or foreign work that does not finish, can prevent cleanup from completing.
+
+Concurrent native callers can shorten grace. Dropping a shutdown future does not
+release its tasks. Another call may be necessary to request force and finish cleanup.
 
 `request_shutdown()` promptly closes admission; `shutdown_until(deadline)` lets
-an adapter inherit an existing grace deadline. The language SDKs retain one
-cleanup future and separately bound their callers' waits. A stopped runtime
-cannot restart. Operational failures stay errors; inspect `is_quiescent()`
-rather than assuming an error proves retirement.
+an adapter use an existing grace deadline. Each language SDK retains one cleanup
+future and applies a separate limit to the caller's wait. A stopped runtime cannot
+restart. An operational failure remains an error. Check `is_quiescent()` to find
+out whether all owned work and cleanup have ended.
 
-Internal/lifecycle faults automatically close admission and request **zero-grace
-shutdown of the affected Runtime**, including unrelated admitted work. This is
-not automatic process termination; ordinary activity/orchestration application
-errors remain operation-local. Cleanup still has to finish, and interrupted work
-uses existing lease recovery and retry rules, with possible duplicate external
-effects. See [fault shutdown and recovery](docs/ORCHESTRATION-GUIDE.md#fault-shutdown-and-recovery)
+An internal lifecycle fault stops new work and requests **zero-grace shutdown of
+the affected Runtime**. This can interrupt other work in the same runtime.
+It does not terminate the process. An ordinary activity or orchestration error
+still affects only that operation. Interrupted work follows the existing recovery
+and retry rules. A retry can repeat an external effect. Read
+[fault shutdown and recovery](docs/ORCHESTRATION-GUIDE.md#fault-shutdown-and-recovery)
 before replacing a failed worker.
 
-Legacy `shutdown(None)` still returns `()` after cleanup, with one second of grace
-and no implicit total deadline. It logs operational failures. Native grace is not
-restricted by SDK nanosecond transport limits. See the
+Legacy `shutdown(None)` still uses one second of grace and returns `()` after cleanup.
+It has no total deadline and logs operational failures. SDK nanosecond transport
+limits do not restrict native grace. See the
 [lifecycle guide](docs/ORCHESTRATION-GUIDE.md#worker-lifecycle-unreleased) for
 validation, provider I/O, and language-adapter boundaries.
 
