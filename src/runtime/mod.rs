@@ -455,9 +455,41 @@ where
     }
 }
 
+/// A nonblocking admission decision made before invoking an activity.
+pub enum ActivityAdmission {
+    /// The guard is held until the activity handler returns or its task is dropped.
+    Admit(Box<dyn Send>),
+    /// Leave the activity pending and retry admission after a positive delay.
+    ///
+    /// Deferral releases the worker slot without recording a history event or
+    /// consuming a fetch attempt. It does not retry an executed activity.
+    Defer(Duration),
+}
+
+impl ActivityAdmission {
+    /// Admit an activity while retaining ownership of its resource reservation.
+    pub fn admit(guard: impl Send + 'static) -> Self {
+        Self::Admit(Box::new(guard))
+    }
+}
+
 /// Trait implemented by activity handlers that can be invoked by the runtime.
 #[async_trait]
 pub trait ActivityHandler: Send + Sync {
+    /// Reserve resources without blocking or performing I/O.
+    ///
+    /// Called again on each deferred fetch, outside orchestration replay. An
+    /// error rejects the activity as an application failure. A returned guard
+    /// must release its reservation on drop, including cancellation and panic.
+    ///
+    /// # Errors
+    ///
+    /// Return an error when admission configuration is invalid or a required
+    /// resource is unavailable permanently, rather than temporarily at capacity.
+    fn try_admit(&self, _ctx: &crate::ActivityContext, _input: &str) -> Result<ActivityAdmission, String> {
+        Ok(ActivityAdmission::admit(()))
+    }
+
     async fn invoke(&self, ctx: crate::ActivityContext, input: String) -> Result<String, String>;
 }
 
