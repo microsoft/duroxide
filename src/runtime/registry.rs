@@ -13,7 +13,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 
-use super::{ActivityHandler, FnActivity, FnOrchestration, OrchestrationHandler};
+use super::{ActivityAdmission, ActivityHandler, FnActivity, FnOrchestration, OrchestrationHandler};
 use crate::_typed_codec::Codec;
 use crate::OrchestrationContext;
 use semver::Version;
@@ -411,6 +411,27 @@ impl OrchestrationRegistryBuilder {
 // Activity Builder - Specialized Methods
 // ============================================================================
 
+struct AdmissionControlledActivity<A, F> {
+    admission: A,
+    handler: F,
+}
+
+#[async_trait::async_trait]
+impl<A, F, Fut> ActivityHandler for AdmissionControlledActivity<A, F>
+where
+    A: Fn(&crate::ActivityContext, &str) -> Result<ActivityAdmission, String> + Send + Sync,
+    F: Fn(crate::ActivityContext, String) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<String, String>> + Send,
+{
+    fn try_admit(&self, ctx: &crate::ActivityContext, input: &str) -> Result<ActivityAdmission, String> {
+        (self.admission)(ctx, input)
+    }
+
+    async fn invoke(&self, ctx: crate::ActivityContext, input: String) -> Result<String, String> {
+        (self.handler)(ctx, input).await
+    }
+}
+
 impl ActivityRegistryBuilder {
     /// Deprecated: use `ActivityRegistry::builder_from` instead
     pub fn from_registry(reg: &ActivityRegistry) -> Self {
@@ -449,6 +470,29 @@ impl ActivityRegistryBuilder {
             .or_default()
             .insert(DEFAULT_VERSION, Arc::new(FnActivity(f)));
         // Set policy to Latest (hardcoded for activities)
+        self.policy.insert(name, VersionPolicy::Latest);
+        self
+    }
+
+    /// Register an activity with a nonblocking resource-admission callback.
+    ///
+    /// The callback must atomically reserve all required capacity or return
+    /// `Defer` holding none. Admission applies to each execution attempt, not
+    /// replayed activity results. No cross-runtime coordination is provided.
+    pub fn register_with_admission<A, F, Fut>(mut self, name: impl Into<String>, admission: A, f: F) -> Self
+    where
+        A: Fn(&crate::ActivityContext, &str) -> Result<ActivityAdmission, String> + Send + Sync + 'static,
+        F: Fn(crate::ActivityContext, String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        let name = name.into();
+        if self.check_reserved_prefix(&name) || self.check_duplicate(&name, &DEFAULT_VERSION, "activity") {
+            return self;
+        }
+        self.map.entry(name.clone()).or_default().insert(
+            DEFAULT_VERSION,
+            Arc::new(AdmissionControlledActivity { admission, handler: f }),
+        );
         self.policy.insert(name, VersionPolicy::Latest);
         self
     }

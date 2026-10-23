@@ -39,7 +39,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
-use super::super::{Runtime, registry};
+use super::super::{ActivityAdmission, Runtime, registry};
 
 // ============================================================================
 // Types
@@ -123,6 +123,13 @@ enum ActivityOutcome {
     AppError,
     /// Orchestration was cancelled, activity result dropped
     Cancelled,
+    /// Admission deferred without executing the handler
+    Deferred,
+}
+
+enum ActivityInvocation {
+    Completed(String),
+    Deferred(Duration),
 }
 
 /// Context for processing a single activity work item.
@@ -543,14 +550,41 @@ async fn run_activity_with_cancellation(
     start_time: std::time::Instant,
 ) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
     let input = ctx.input.clone();
-    let mut activity_handle = tokio::spawn(async move { handler.invoke(activity_ctx, input).await });
+    let mut activity_handle = tokio::spawn(async move {
+        let _admission_guard = match handler.try_admit(&activity_ctx, &input)? {
+            ActivityAdmission::Admit(guard) => guard,
+            ActivityAdmission::Defer(delay) if delay.is_zero() => {
+                return Err("Activity admission deferral requires a positive retry delay".to_string());
+            }
+            ActivityAdmission::Defer(delay) => return Ok(ActivityInvocation::Deferred(delay)),
+        };
+        handler
+            .invoke(activity_ctx, input)
+            .await
+            .map(ActivityInvocation::Completed)
+    });
 
     tokio::select! {
         joined = &mut activity_handle => {
             manager_handle.abort();
             // Handle normal activity completion (success, error, or panic)
             match joined {
-                Ok(Ok(result)) => handle_activity_success(rt, ctx, result, start_time).await,
+                Ok(Ok(ActivityInvocation::Completed(result))) => {
+                    handle_activity_success(rt, ctx, result, start_time).await
+                }
+                Ok(Ok(ActivityInvocation::Deferred(delay))) => {
+                    tracing::debug!(
+                        instance = %ctx.instance,
+                        activity_name = %ctx.activity_name,
+                        activity_id = ctx.activity_id,
+                        retry_after_ms = delay.as_millis(),
+                        "Activity admission deferred"
+                    );
+                    let result = rt.history_store
+                        .abandon_work_item(&ctx.lock_token, Some(delay), true)
+                        .await;
+                    (result, ActivityOutcome::Deferred)
+                }
                 Ok(Err(error)) => handle_activity_error(rt, ctx, error, start_time).await,
                 Err(join_error) => handle_activity_error(rt, ctx, join_error.to_string(), start_time).await,
             }
@@ -743,7 +777,7 @@ async fn handle_activity_outcome(
         Ok(()) => match outcome {
             ActivityOutcome::Success => rt.record_activity_success(),
             ActivityOutcome::AppError => rt.record_activity_app_error(),
-            ActivityOutcome::Cancelled => {}
+            ActivityOutcome::Cancelled | ActivityOutcome::Deferred => {}
         },
         Err(e) => {
             warn!(
@@ -752,12 +786,25 @@ async fn handle_activity_outcome(
                 activity_id = ctx.activity_id,
                 worker_id = %ctx.worker_id,
                 error = %e,
-                "worker: atomic ack failed, abandoning work item"
+                outcome = ?outcome,
+                "worker: activity acknowledgment or deferral failed, abandoning work item"
             );
-            let _ = rt
+            if let Err(error) = rt
                 .history_store
-                .abandon_work_item(&ctx.lock_token, Some(Duration::from_millis(100)), false)
-                .await;
+                .abandon_work_item(
+                    &ctx.lock_token,
+                    Some(Duration::from_millis(100)),
+                    matches!(outcome, ActivityOutcome::Deferred),
+                )
+                .await
+            {
+                warn!(
+                    instance = %ctx.instance,
+                    activity_id = ctx.activity_id,
+                    error = %error,
+                    "Failed to abandon activity work item; waiting for lock expiry"
+                );
+            }
             rt.record_activity_infra_error();
         }
     }

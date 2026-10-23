@@ -242,6 +242,52 @@ activities.register("CallExternalAPI", |ctx: ActivityContext, request: String| a
 | `ctx.is_cancelled()` | Returns `true` if cancellation was requested |
 | `ctx.cancelled()` | Returns a `Future` that completes when cancelled (use in `select!`) |
 
+### Activity Admission
+
+Use `ActivityRegistry::builder().register_with_admission(name, admission, handler)`
+to impose resource limits without occupying worker slots while waiting.
+The synchronous admission callback receives `&ActivityContext` and the activity's
+input as `&str`. It must not block or perform I/O.
+
+```rust
+use duroxide::runtime::{ActivityAdmission, registry::ActivityRegistry};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::{Semaphore, TryAcquireError};
+
+let capacity = Arc::new(Semaphore::new(4));
+let activities = ActivityRegistry::builder()
+    .register_with_admission(
+        "Limited",
+        move |_ctx, _input| match capacity.clone().try_acquire_owned() {
+            Ok(permit) => Ok(ActivityAdmission::admit(permit)),
+            Err(TryAcquireError::NoPermits) => {
+                Ok(ActivityAdmission::Defer(Duration::from_millis(100)))
+            }
+            Err(error) => Err(error.to_string()),
+        },
+        |_ctx, input| async move { Ok(input) },
+    )
+    .build();
+```
+
+`admit(guard)` retains a resource reservation until the handler returns or its
+task is dropped, including error, panic, and cancellation. If several limits
+apply, reserve all of them atomically or defer holding none. Detached work is
+not protected after the handler finishes.
+
+`Defer(delay)` requires a positive delay. It leaves the original activity
+pending in durable storage, frees the worker to fetch other work, and does not
+record an activity result or consume the poison-message fetch-attempt budget.
+It is not a retry of an executed activity. An admission error, panic, or invalid
+delay fails the activity rather than invoking the handler. Storage errors during
+deferral are reported as infrastructure errors.
+
+Admission runs outside orchestration replay; completed results are unaffected.
+Each recovered execution attempt is admitted again. Resource counters belong
+to the application and are not automatically coordinated across runtimes.
+Keep total worker capacity above the admitted activity ceiling if other work
+needs headroom. Admission does not guarantee fair scheduling between workflows.
+
 ### The Replay Model
 
 
@@ -2693,4 +2739,3 @@ async fn fast_updates(ctx: OrchestrationContext, items_json: String) -> Result<(
 ---
 
 **You now have everything needed to build production-grade durable workflows!** 🎉
-
