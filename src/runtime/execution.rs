@@ -147,8 +147,11 @@ impl Runtime {
             orchestration_name.to_string(),
             orchestration_version.clone(),
             worker_id,
-            cleanup,
+            cleanup.clone(),
         );
+        // Finalization and driver destruction have finished. Report their faults
+        // before routing can await a provider; the guard still owns retirement.
+        self.record_faults(&cleanup.take_failures());
 
         // Select/select2 losers: request cancellation for those activities now.
         for activity_id in turn.cancelled_activity_ids() {

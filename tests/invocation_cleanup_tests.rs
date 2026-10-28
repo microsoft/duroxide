@@ -3,6 +3,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 #[allow(dead_code)]
 #[path = "replay_engine/helpers.rs"]
 mod replay_helpers;
@@ -10,8 +12,7 @@ mod replay_helpers;
 mod retirement_metrics;
 #[path = "common/runtime_lifecycle.rs"]
 mod support;
-#[path = "common/tracing_capture.rs"]
-mod tracing_capture;
+use common::tracing_capture;
 
 use std::sync::{
     Arc, Mutex,
@@ -22,7 +23,9 @@ use std::time::{Duration, Instant};
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::replay_engine::TurnResult;
 use duroxide::runtime::test_hooks::{LifecyclePoint, LifecycleTask, ProviderOperation};
-use duroxide::runtime::{InvocationCleanupError, RuntimeShutdownError, ShutdownOutcome};
+use duroxide::runtime::{
+    InvocationCleanupError, RuntimeShutdownError, RuntimeStopObserver, RuntimeStopStatus, ShutdownOutcome,
+};
 use duroxide::{Event, EventKind, OrchestrationContext, OrchestrationRegistry};
 use retirement_metrics::retirement_gauge;
 use support::{Fixture, SECRET, bounded, entered, options, until};
@@ -261,6 +264,348 @@ fn without_creation_times(mut history: Vec<Event>) -> Vec<Event> {
         event.timestamp_ms = 0;
     }
     history
+}
+
+async fn fault_before_parent_routing(stamped: bool, fail_driver: bool) -> bool {
+    use duroxide::providers::{ExecutionMetadata, WorkItem};
+    use duroxide::runtime::RuntimeStartError;
+    use duroxide::runtime::test_hooks::LifecycleGate;
+
+    struct ReleaseGates(Vec<LifecycleGate>, CancellationToken);
+    impl Drop for ReleaseGates {
+        fn drop(&mut self) {
+            for gate in &self.0 {
+                gate.release();
+            }
+            self.1.cancel();
+        }
+    }
+    struct FaultingDriver {
+        context: OrchestrationContext,
+        drops: Arc<AtomicUsize>,
+        fail: bool,
+    }
+    impl Drop for FaultingDriver {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            self.context.set_kv_value("after-snapshot", "excluded");
+            assert!(!self.fail, "post-decision driver destruction");
+        }
+    }
+
+    let (events, _capture) = tracing_capture::install_tracing_capture();
+    let f = Fixture::new().await;
+    for (instance, execution, is_child) in [("parent", 7, false), ("child", 1, true)] {
+        let parent_instance = is_child.then(|| "parent".to_string());
+        let parent_id = is_child.then_some(42);
+        let parent_execution_id = (is_child && stamped).then_some(7);
+        common::seed_history_turn(
+            f.inner.as_ref(),
+            WorkItem::StartOrchestration {
+                instance: instance.to_string(),
+                orchestration: "flow".to_string(),
+                input: String::new(),
+                version: Some("1.0.0".to_string()),
+                parent_instance: parent_instance.clone(),
+                parent_id,
+                parent_execution_id,
+                execution_id: execution,
+            },
+            execution,
+            vec![Event::with_event_id(
+                1,
+                instance,
+                execution,
+                None,
+                EventKind::OrchestrationStarted {
+                    name: "flow".to_string(),
+                    version: "1.0.0".to_string(),
+                    input: String::new(),
+                    parent_instance,
+                    parent_id,
+                    parent_execution_id,
+                    carry_forward_events: None,
+                    initial_custom_status: None,
+                },
+            )],
+            if is_child {
+                vec![WorkItem::CancelInstance {
+                    instance: instance.to_string(),
+                    reason: "controlled cancellation".to_string(),
+                }]
+            } else {
+                vec![]
+            },
+            ExecutionMetadata {
+                orchestration_name: Some("flow".to_string()),
+                orchestration_version: Some("1.0.0".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let read = f.hold(LifecyclePoint::ProviderEnter(ProviderOperation::Read));
+    let force = f.hold(LifecyclePoint::BeforeForce);
+    let committed = f.hold(LifecyclePoint::ProviderCommit(
+        ProviderOperation::AcknowledgeOrchestration,
+    ));
+    let release = CancellationToken::new();
+    let cleanup_entered = CancellationToken::new();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let finalized = Arc::new(AtomicUsize::new(0));
+    let _release_on_exit = ReleaseGates(vec![read.clone(), force.clone(), committed.clone()], release.clone());
+    let registry = {
+        let release = release.clone();
+        let entered = cleanup_entered.clone();
+        let completed = Arc::clone(&completed);
+        let drops = Arc::clone(&drops);
+        let finalized = Arc::clone(&finalized);
+        OrchestrationRegistry::builder()
+            .register("flow", move |ctx: OrchestrationContext, _: String| {
+                let release = release.clone();
+                let entered = entered.clone();
+                let completed = Arc::clone(&completed);
+                let drops = Arc::clone(&drops);
+                let finalized = Arc::clone(&finalized);
+                async move {
+                    let final_ctx = ctx.clone();
+                    ctx.register_invocation_cleanup_with_finalization(
+                        async move {
+                            entered.cancel();
+                            release.cancelled().await;
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                        move || {
+                            finalized.fetch_add(1, Ordering::SeqCst);
+                            final_ctx.set_kv_value("before-snapshot", "included");
+                        },
+                    )
+                    .unwrap();
+                    let _driver = FaultingDriver {
+                        context: ctx.clone(),
+                        drops,
+                        fail: fail_driver,
+                    };
+                    Ok(ctx.schedule_wait("never").await)
+                }
+            })
+            .build()
+    };
+    let runtime = f.prepare(ActivityRegistry::builder().build(), registry, options());
+    bounded(Arc::clone(&runtime).start_execution()).await.unwrap();
+    let fault_count = || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.field("category").as_deref() == Some("owned_execution_failed")
+                    && event.field("task").as_deref() == Some("orchestration-driver")
+                    && event.field("kind").as_deref() == Some("DestructionPanicked")
+            })
+            .count()
+    };
+    if stamped {
+        bounded(cleanup_entered.cancelled()).await;
+    } else {
+        entered(&read).await;
+        let fetches = f
+            .hooks
+            .hits(LifecyclePoint::ProviderEnter(ProviderOperation::FetchActivity));
+        // Establish scheduler progress even on the no-fault and uncorrected paths.
+        until(|| {
+            fault_count() > 0
+                || f.hooks
+                    .hits(LifecyclePoint::ProviderEnter(ProviderOperation::FetchActivity))
+                    >= fetches + 2
+        })
+        .await;
+        assert_eq!(
+            f.hooks.cleanup_counts().started,
+            0,
+            "the held turn still owns retirement"
+        );
+    }
+    let early_fault = fault_count() > 0;
+    assert_eq!(
+        runtime.stop_status(),
+        if fail_driver {
+            RuntimeStopStatus::Faulted
+        } else {
+            RuntimeStopStatus::NotRequested
+        }
+    );
+    let early_start = Arc::clone(&runtime).start_execution().await;
+    assert_eq!(finalized.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.hooks.hits(LifecyclePoint::ProviderEnter(ProviderOperation::Read)),
+        usize::from(!stamped)
+    );
+
+    read.release();
+    bounded(cleanup_entered.cancelled()).await;
+    entered(&committed).await;
+    let history = f.inner.read("child").await.unwrap();
+    assert_eq!(
+        f.inner.get_kv_value("child", "before-snapshot").await.unwrap(),
+        Some("included".to_string())
+    );
+    assert_eq!(f.inner.get_kv_value("child", "after-snapshot").await.unwrap(), None);
+    let (route, token, _) = bounded(
+        f.inner
+            .fetch_orchestration_item(Duration::from_secs(1), Duration::ZERO, None),
+    )
+    .await
+    .unwrap()
+    .expect("committed child outcome has a parent notification");
+    assert!(route.messages.iter().any(|item| matches!(
+        item,
+        WorkItem::SubOrchFailed {
+            parent_execution_id: 7,
+            parent_id: 42,
+            ..
+        }
+    )));
+    f.inner.abandon_orchestration_item(&token, None, true).await.unwrap();
+    committed.release();
+    force.release();
+    let mut shutdown = tokio::spawn(Arc::clone(&runtime).shutdown_with_grace(Duration::ZERO));
+    until(|| f.hooks.hits(LifecyclePoint::ForceRequested) > 0).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    assert_eq!(f.hooks.cleanup_counts().active, 1);
+    release.cancel();
+    let outcome = bounded(shutdown).await.unwrap();
+    f.assert_retired();
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.hooks.cleanup_counts().started, 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(finalized.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.inner.read("child").await.unwrap(),
+        history,
+        "retirement rewrote committed history"
+    );
+    assert_eq!(
+        fault_count(),
+        usize::from(fail_driver),
+        "turn fault was reported again during retirement"
+    );
+    assert!(history.iter().any(|event| matches!(&event.kind,
+        EventKind::OrchestrationFailed { details: duroxide::ErrorDetails::Application {
+            kind: duroxide::AppErrorKind::Cancelled { reason }, ..
+        }} if reason == "controlled cancellation"
+    )));
+    assert_eq!(
+        outcome,
+        if fail_driver {
+            Err(RuntimeShutdownError::Failed { quiescent: true })
+        } else {
+            Ok(ShutdownOutcome::Forced)
+        }
+    );
+    assert_eq!(
+        early_start,
+        Err(if early_fault {
+            RuntimeStartError::ShutdownRequested
+        } else {
+            RuntimeStartError::AlreadyStarted
+        })
+    );
+    early_fault
+}
+
+#[tokio::test]
+async fn driver_fault_precedes_a_held_legacy_parent_read() {
+    assert!(fault_before_parent_routing(false, true).await);
+}
+
+#[tokio::test]
+async fn stamped_parent_routes_without_waiting_for_a_legacy_read() {
+    assert!(fault_before_parent_routing(true, true).await);
+}
+
+#[tokio::test]
+async fn legacy_parent_routing_without_a_fault_keeps_the_runtime_running() {
+    assert!(!fault_before_parent_routing(false, false).await);
+}
+
+#[tokio::test]
+async fn panicking_fault_diagnostics_preserve_the_decision_and_retained_cleanup() {
+    use tracing_subscriber::prelude::*;
+
+    struct PanicOnce {
+        panicked: Arc<AtomicBool>,
+        observed_fault: Arc<AtomicBool>,
+        observer: RuntimeStopObserver,
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PanicOnce {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::ERROR && !self.panicked.swap(true, Ordering::SeqCst) {
+                self.observed_fault
+                    .store(self.observer.state() == RuntimeStopStatus::Faulted, Ordering::SeqCst);
+                panic!("diagnostic failure after turn destruction");
+            }
+        }
+    }
+
+    let expected = without_creation_times(captured_turn(Turn::Continue, true, false).await);
+    let f = Fixture::new().await;
+    let foreign = MockForeign::default();
+    let force = f.hold(LifecyclePoint::BeforeForce);
+    let committed = f.hold(LifecyclePoint::ProviderCommit(
+        ProviderOperation::AcknowledgeOrchestration,
+    ));
+    let mut config = options();
+    config.worker_concurrency = 0;
+    let runtime = f.prepare(
+        ActivityRegistry::builder().build(),
+        foreign.registry(Turn::Continue, true, true, false),
+        config,
+    );
+    let panicked = Arc::new(AtomicBool::new(false));
+    let observed_fault = Arc::new(AtomicBool::new(false));
+    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(PanicOnce {
+        panicked: Arc::clone(&panicked),
+        observed_fault: Arc::clone(&observed_fault),
+        observer: runtime.stop_observer(),
+    }));
+    Arc::clone(&runtime).start_execution().await.unwrap();
+    f.client().start_orchestration("turn", "flow", "").await.unwrap();
+    entered(&committed).await;
+    entered(&force).await;
+    bounded(foreign.cleanup_entered.cancelled()).await;
+    assert!(panicked.load(Ordering::SeqCst));
+    assert!(
+        observed_fault.load(Ordering::SeqCst),
+        "fault was not published before diagnostics"
+    );
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::Faulted);
+    let history = f.inner.read("turn").await.unwrap();
+    assert_eq!(without_creation_times(history.clone()), expected);
+    committed.release();
+    force.release();
+    let mut shutdown = tokio::spawn(runtime.shutdown_with_grace(Duration::ZERO));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.hooks.cleanup_counts().active, 1);
+    foreign.release.cancel();
+    assert_eq!(
+        bounded(shutdown).await.unwrap(),
+        Err(RuntimeShutdownError::Failed { quiescent: true })
+    );
+    assert_eq!(f.hooks.cleanup_counts().started, 1);
+    assert_eq!(f.inner.read("turn").await.unwrap(), history);
+    f.assert_retired();
 }
 
 #[tokio::test]
@@ -559,7 +904,7 @@ async fn foreign_retirement_count_tracks_independent_tails_until_success_or_erro
 }
 
 #[tokio::test]
-async fn finalization_admits_scheduling_and_continue_as_new_before_the_durable_snapshot() {
+async fn finalization_admits_scheduling_and_continue_as_new_to_the_first_snapshot() {
     for continue_as_new in [false, true] {
         let f = Fixture::new().await;
         let finalizations = Arc::new(AtomicUsize::new(0));
@@ -666,6 +1011,276 @@ async fn finalization_admits_scheduling_and_continue_as_new_before_the_durable_s
         );
         f.assert_retired();
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinalizationReplay {
+    FinalizerOnly,
+    ActivityOnlyFinalizer,
+    NormalReplay,
+    ReplayAdmittedBatch,
+}
+
+async fn finalization_over_two_turns(protocol: FinalizationReplay) {
+    use duroxide::{ConfigErrorKind, ErrorDetails, OrchestrationStatus};
+
+    let f = Fixture::new().await;
+    let release = CancellationToken::new();
+    let _release_on_exit = release.clone().drop_guard();
+    let finalizations = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let activity_calls = Arc::new(AtomicUsize::new(0));
+    let child_calls = Arc::new(AtomicUsize::new(0));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let replay_flags = Arc::new(Mutex::new(Vec::new()));
+    let include_child = protocol != FinalizationReplay::ActivityOnlyFinalizer;
+    let activities = {
+        let calls = Arc::clone(&activity_calls);
+        ActivityRegistry::builder()
+            .register("admitted-work", move |_, input: String| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    assert_eq!(input, "activity-input");
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok("activity-output".to_string())
+                }
+            })
+            .build()
+    };
+    let registry = {
+        let release = release.clone();
+        let finalizations = Arc::clone(&finalizations);
+        let invocations = Arc::clone(&invocations);
+        let contexts = Arc::clone(&contexts);
+        let replay_flags = Arc::clone(&replay_flags);
+        let child_calls = Arc::clone(&child_calls);
+        OrchestrationRegistry::builder()
+            .register("flow", move |ctx: OrchestrationContext, _: String| {
+                let final_ctx = ctx.clone();
+                let release = release.clone();
+                let finalizations = Arc::clone(&finalizations);
+                let invocations = Arc::clone(&invocations);
+                let contexts = Arc::clone(&contexts);
+                let replay_flags = Arc::clone(&replay_flags);
+                let admitted = Arc::new(Mutex::new(None));
+                let held_activity = Arc::clone(&admitted);
+                let replay_activity = Arc::clone(&admitted);
+                let pending_batch = Arc::new(AtomicBool::new(false));
+                let final_pending_batch = Arc::clone(&pending_batch);
+                let dropped = CancellationToken::new();
+                let cleanup_dropped = dropped.clone();
+                async move {
+                    ctx.register_invocation_cleanup_with_finalization(
+                        async move {
+                            assert!(cleanup_dropped.is_cancelled());
+                            release.cancelled().await;
+                            drop(held_activity.lock().unwrap().take());
+                            Ok(())
+                        },
+                        move || {
+                            finalizations.fetch_add(1, Ordering::SeqCst);
+                            if matches!(
+                                protocol,
+                                FinalizationReplay::FinalizerOnly | FinalizationReplay::ActivityOnlyFinalizer
+                            ) || final_pending_batch.load(Ordering::SeqCst)
+                            {
+                                final_ctx.set_kv_value("finalization", "admitted");
+                                final_ctx.set_custom_status("admitted-status");
+                                if include_child {
+                                    final_ctx.schedule_orchestration("child", "admitted-detached", "child-input");
+                                }
+                                *admitted.lock().unwrap() =
+                                    Some(final_ctx.schedule_activity("admitted-work", "activity-input"));
+                            }
+                        },
+                    )
+                    .unwrap();
+                    let _driver = DriverDrop { dropped, panic: false };
+                    invocations.fetch_add(1, Ordering::SeqCst);
+                    contexts.lock().unwrap().push(ctx.clone());
+                    if protocol == FinalizationReplay::NormalReplay {
+                        replay_flags.lock().unwrap().push(ctx.is_replaying());
+                        ctx.set_kv_value("finalization", "admitted");
+                        ctx.set_custom_status("admitted-status");
+                        ctx.schedule_orchestration("child", "admitted-detached", "child-input");
+                        ctx.schedule_activity("admitted-work", "activity-input").await
+                    } else {
+                        let replaying = ctx.is_replaying();
+                        let pause = ctx.schedule_wait("pause");
+                        if protocol == FinalizationReplay::ReplayAdmittedBatch {
+                            replay_flags.lock().unwrap().push(replaying);
+                            if replaying {
+                                ctx.set_kv_value("finalization", "admitted");
+                                ctx.set_custom_status("admitted-status");
+                                ctx.schedule_orchestration("child", "admitted-detached", "child-input");
+                                *replay_activity.lock().unwrap() =
+                                    Some(ctx.schedule_activity("admitted-work", "activity-input"));
+                            } else {
+                                pending_batch.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        pause.await;
+                        Ok(String::new())
+                    }
+                }
+            })
+            .register("child", move |_, input: String| {
+                let calls = Arc::clone(&child_calls);
+                async move {
+                    assert_eq!(input, "child-input");
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok("child-output".to_string())
+                }
+            })
+            .build()
+    };
+    let worker = f.hold(LifecyclePoint::ProviderEnter(ProviderOperation::FetchActivity));
+    let runtime = f.prepare(activities, registry, options());
+    Arc::clone(&runtime).start_execution().await.unwrap();
+    entered(&worker).await;
+    f.client().start_orchestration("two-turns", "flow", "").await.unwrap();
+    until(|| {
+        f.hooks.cleanup_counts().active == 1
+            && f.hooks.hits(LifecyclePoint::ProviderCommit(
+                ProviderOperation::AcknowledgeOrchestration,
+            )) >= 1
+    })
+    .await;
+    let first = f.inner.read("two-turns").await.unwrap();
+    assert!(matches!(
+        f.client().get_orchestration_status("two-turns").await.unwrap(),
+        OrchestrationStatus::Running { .. }
+    ));
+    assert_eq!(finalizations.load(Ordering::SeqCst), 1);
+    assert_eq!(activity_calls.load(Ordering::SeqCst), 0);
+    let scheduled: Vec<_> = first
+        .iter()
+        .filter(|event| {
+            matches!(&event.kind,
+                EventKind::ActivityScheduled { name, input, .. } if name == "admitted-work" && input == "activity-input"
+            )
+        })
+        .collect();
+    assert_eq!(scheduled.len(), 1);
+    let activity_id = scheduled[0].event_id;
+    if include_child {
+        assert!(matches!(
+            bounded(f.client().wait_for_orchestration("admitted-detached", Duration::from_secs(3))).await.unwrap(),
+            OrchestrationStatus::Completed { output, .. } if output == "child-output"
+        ));
+    }
+    worker.release();
+    let second = bounded(async {
+        loop {
+            let history = f.inner.read("two-turns").await.unwrap();
+            if history
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::ActivityCompleted { .. }))
+            {
+                break history;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let status = f.client().get_orchestration_status("two-turns").await.unwrap();
+    until(|| f.hooks.cleanup_counts().active == 2).await;
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    assert_eq!(finalizations.load(Ordering::SeqCst), 2);
+    assert_eq!(activity_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(child_calls.load(Ordering::SeqCst), usize::from(include_child));
+    assert_eq!(&second[..first.len()], &first);
+    assert_eq!(
+        second
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::ActivityScheduled { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        second
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::OrchestrationChained { .. }))
+            .count(),
+        usize::from(include_child)
+    );
+    for ctx in contexts.lock().unwrap().iter() {
+        assert_eq!(
+            ctx.register_invocation_cleanup(async { Ok(()) }),
+            Err(InvocationCleanupError::Closed)
+        );
+    }
+    let delta = &second[first.len()..];
+    assert!(matches!(&delta[0].kind, EventKind::ActivityCompleted { result } if result == "activity-output"));
+    assert_eq!(delta[0].source_event_id, Some(activity_id));
+    match protocol {
+        FinalizationReplay::NormalReplay => {
+            assert_eq!(delta.len(), 2);
+            assert!(matches!(status, OrchestrationStatus::Completed { output, .. } if output == "activity-output"));
+            assert!(
+                matches!(&delta[1].kind, EventKind::OrchestrationCompleted { output } if output == "activity-output")
+            );
+            assert_eq!(*replay_flags.lock().unwrap(), [false, true]);
+        }
+        FinalizationReplay::ReplayAdmittedBatch => {
+            assert_eq!(delta.len(), 1);
+            assert!(matches!(status, OrchestrationStatus::Running { .. }));
+            assert_eq!(*replay_flags.lock().unwrap(), [false, true]);
+        }
+        FinalizationReplay::FinalizerOnly | FinalizationReplay::ActivityOnlyFinalizer => {
+            let expected = ErrorDetails::Configuration {
+                kind: ConfigErrorKind::Nondeterminism,
+                resource: String::new(),
+                message: Some(
+                    if protocol == FinalizationReplay::FinalizerOnly {
+                        "history OrchestrationChained but no emitted action"
+                    } else {
+                        "history schedule but no emitted action"
+                    }
+                    .to_string(),
+                ),
+            };
+            assert_eq!(delta.len(), 3);
+            assert!(matches!(delta[1].kind, EventKind::ExternalSubscribedCancelled { .. }));
+            assert_eq!(delta[1].source_event_id, Some(2));
+            assert!(matches!(status, OrchestrationStatus::Failed { details, .. } if details == expected));
+            assert_eq!(delta[2].kind, EventKind::OrchestrationFailed { details: expected });
+        }
+    }
+    let mut shutdown = tokio::spawn(runtime.shutdown_with_grace(Duration::from_secs(1)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.hooks.cleanup_counts().completed, 0);
+    release.cancel();
+    assert_eq!(bounded(shutdown).await.unwrap(), Ok(ShutdownOutcome::Drained));
+    assert_eq!(f.hooks.cleanup_counts().completed, 2);
+    assert_eq!(f.hooks.hits(LifecyclePoint::ForceRequested), 0);
+    assert_eq!(f.inner.read("two-turns").await.unwrap(), second);
+    f.assert_retired();
+}
+
+#[tokio::test]
+async fn finalizer_only_detached_start_fails_normal_replay_locally() {
+    finalization_over_two_turns(FinalizationReplay::FinalizerOnly).await;
+}
+
+#[tokio::test]
+async fn finalizer_only_activity_fails_normal_replay_locally() {
+    finalization_over_two_turns(FinalizationReplay::ActivityOnlyFinalizer).await;
+}
+
+#[tokio::test]
+async fn normal_replay_completes_two_turns_with_independently_retained_cleanup() {
+    finalization_over_two_turns(FinalizationReplay::NormalReplay).await;
+}
+
+#[tokio::test]
+async fn normal_replay_reproduces_the_batch_admitted_by_first_turn_finalization() {
+    finalization_over_two_turns(FinalizationReplay::ReplayAdmittedBatch).await;
 }
 
 #[tokio::test]

@@ -165,18 +165,96 @@ Legacy `shutdown(None)` retains the unit return and one-second grace;
 `Some(0)` requests immediate force. Both wait for actual cleanup without a total limit.
 They log operational failures instead of raising shutdown-timeout panics.
 
+### Native stop observation (unreleased)
+
+Use `Runtime::stop_status()` to read the current stop state.
+Use `Runtime::stop_observer()` to obtain an owned, read-only `RuntimeStopObserver`.
+The observer retains status metadata, not the Runtime, provider, registries, or callbacks.
+It adds no task to the runtime's cleanup tracker.
+
+| `RuntimeStopStatus` | Meaning |
+|---|---|
+| `NotRequested` | No stop has been accepted. The Runtime can be prepared, starting, or running. This is not a readiness or health check. |
+| `Requested` | Stop has been accepted. Fault-free graceful and forced shutdown both keep this state. |
+| `Faulted` | An internal or lifecycle failure was recorded. This state cannot return to `Requested` or `NotRequested`. |
+
+`Requested` can later change to `Faulted`, including during rollback.
+The current state remains available when no observers exist.
+Cloned observers read independently. Intermediate states can coalesce.
+
+Call `state()` for a snapshot. Call `changed(last_seen).await` to wait for a
+different state. An unchanged state waits while the source remains alive,
+including after stop or fault. When the source closes, the observer returns an
+unseen final state before it returns `None`.
+
+Pass only the observer to a monitoring task, rather than an `Arc<Runtime>`:
+
+```rust
+use duroxide::{RuntimeStopObserver, RuntimeStopStatus};
+
+async fn report_fault(mut observer: RuntimeStopObserver) {
+    let mut status = observer.state();
+    loop {
+        if status == RuntimeStopStatus::Faulted {
+            eprintln!("Runtime fault recorded; cleanup can still be active");
+            return;
+        }
+        match observer.changed(status).await {
+            Some(next) => status = next,
+            None => return,
+        }
+    }
+}
+```
+
+Obtain this observer from the existing Runtime with `runtime.stop_observer()`.
+Cancel the monitoring wait when its owner no longer needs it.
+Dropping the wait does not request shutdown, cancel cleanup, or change a shutdown budget.
+Keep the runtime's executor running. Do not block the sole thread of a
+current-thread executor while waiting for a change.
+
+**Status and source closure do not prove cleanup or permit resource release.**
+The shutdown owner must still drive cleanup and inspect its typed result.
+A language SDK must also finish its own notification and release checks.
+
+```mermaid
+flowchart TD
+    Stop["Accept stop or record a fault"] --> Signal["Publish Requested or Faulted"]
+    Stop --> Owner["Shutdown owner drives cleanup"]
+    Owner --> Native["Confirm native and registered foreign cleanup"]
+    Native --> SDK["SDK confirms its own release conditions"]
+    Signal -. "does not prove" .-> Native
+    Signal -. "does not authorize" .-> SDK
+```
+
+This observer is a native Rust API. The current .NET, Node, and Python wrappers
+do not expose a dedicated spontaneous-fault notification.
+The default .NET service is an `IHostedService`, not a `BackgroundService`
+with a long-running execution task that Generic Host supervises.
+SDK fault observation and default-host monitoring remain separate follow-up work.
+This API does not stop the host, terminate the process, or restart a worker.
+
 ### Fault shutdown and recovery
 
 An internal lifecycle fault stops the affected Runtime.
-This policy covers internal execution, destruction, finalization, and registered-cleanup faults.
+This policy covers faults caught at protected internal execution, destruction,
+finalization, and registered-cleanup boundaries.
 The runtime stops accepting work and requests zero-grace shutdown.
 This can interrupt unrelated work already admitted by the same worker.
 There is no selective catch-and-continue mode.
 
 Ordinary activity and orchestration errors still affect only that operation.
 This includes ordinary panics while polling a handler.
+A destructor that runs inside that handler-poll catch can also fail locally.
+Protected driver or task destruction outside that catch can stop the Runtime.
+The catch boundary determines fault scope, not the presence of a `Drop` implementation.
+Failure while destroying a panic payload can also cause runtime-wide shutdown.
 Rust activity panic history keeps the actual task-panic message from Tokio.
 Normal returned `Result` errors do not change.
+
+A missing cleanup attachment does not prove that execution is native-only.
+For example, the Node and Python adapters call foreign code without the .NET
+adapter's registered-cleanup protocol. This does not exempt them from fault containment.
 
 Zero grace requests force. It does not complete cleanup immediately.
 The runtime retains native code that does not yield and foreign work that has not ended.
@@ -215,6 +293,14 @@ retire a turn. They do not automatically force runtime shutdown.
 Normal finalization includes actions that the turn already accepted.
 The existing rules still apply to scheduling and continue-as-new.
 
+Finalization is an admission boundary, **not another replay stage**.
+A durable schedule or detached start admitted by a finalizer can enter the first snapshot.
+On the next turn, normal handler replay must reproduce that operation before
+history matching reaches it. The replay engine does not use finalization as a
+substitute for normal replay. Finalizer-only work can therefore fail a later
+turn with nondeterminism, even if the first turn committed.
+That nondeterminism is an orchestration failure, not by itself a runtime-wide fault.
+
 A **detected finalization failure before the snapshot** rejects the new durable
 batch from that attempt. This includes failure while destroying the callback's
 captured data. The runtime does not attempt to acknowledge that batch's history,
@@ -239,7 +325,11 @@ It finalizes and destroys the driver outside active unwinding, then resumes the 
 It does not wait for foreign completion first.
 
 A later driver or cleanup failure does not rewrite a valid decision or undo a committed acknowledgement.
-Shutdown can race an acknowledgement already in progress.
+After normal replay returns, the runtime reports known turn faults before later
+provider waits. It records the fault before protected diagnostics run.
+Registered foreign cleanup remains owned independently.
+A valid decision does not guarantee a later commit: earlier zero-grace shutdown
+can cancel an acknowledgement that has not committed.
 There is no additional provider transaction or compensation guarantee for external effects.
 
 Before a native turn leaves the task tracker, it transfers registered cleanup

@@ -414,6 +414,55 @@ pub enum ShutdownOutcome {
     Forced,
 }
 
+/// Retained stop/fault state, not readiness or proof of cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeStopStatus {
+    /// No stop has been accepted. The runtime can be prepared, starting or running.
+    NotRequested,
+    /// Stop has been accepted, including fault-free graceful or forced shutdown.
+    Requested,
+    /// An internal or lifecycle failure was recorded. This state is permanent.
+    Faulted,
+}
+
+/// Read-only observation that does not retain the runtime or its execution resources.
+///
+/// Clones observe independently. Intermediate states can coalesce. Neither a
+/// status value nor source closure proves that native or foreign cleanup finished.
+#[derive(Clone, Debug)]
+pub struct RuntimeStopObserver {
+    state: watch::Receiver<RuntimeStopStatus>,
+}
+
+impl RuntimeStopObserver {
+    /// Read the retained state without an executor.
+    pub fn state(&self) -> RuntimeStopStatus {
+        *self.state.borrow()
+    }
+
+    /// Wait for a state different from `last_seen`.
+    ///
+    /// Returns an unseen final state before returning `None` when the source
+    /// closes. With a live source, an unchanged terminal state still waits.
+    /// Dropping this future is cancellation-safe: it requests no shutdown and
+    /// changes no cleanup ownership or shutdown budget.
+    ///
+    /// The executor that runs the runtime must keep making progress. In
+    /// particular, do not block the sole thread of a current-thread executor.
+    pub async fn changed(&mut self, last_seen: RuntimeStopStatus) -> Option<RuntimeStopStatus> {
+        loop {
+            let current = *self.state.borrow_and_update();
+            if current != last_seen {
+                return Some(current);
+            }
+            if self.state.changed().await.is_err() {
+                let current = self.state();
+                return (current != last_seen).then_some(current);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeStartError {
     InvalidSessionIdleTimeout,
@@ -601,6 +650,7 @@ pub struct Runtime {
     lifecycle: StdMutex<Lifecycle>,
     lifecycle_id: u64,
     startup_result: watch::Sender<Option<Result<(), RuntimeStartError>>>,
+    stop_status: watch::Sender<RuntimeStopStatus>,
     history_store: Arc<dyn Provider>,
     activity_registry: Arc<registry::ActivityRegistry>,
     orchestration_registry: OrchestrationRegistry,
@@ -1136,6 +1186,7 @@ impl Runtime {
             }),
             lifecycle_id: NEXT_LIFECYCLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             startup_result: watch::channel(None).0,
+            stop_status: watch::channel(RuntimeStopStatus::NotRequested).0,
             history_store,
             activity_registry,
             orchestration_registry,
@@ -1161,7 +1212,11 @@ impl Runtime {
             match state.phase {
                 RuntimePhase::Created => {}
                 RuntimePhase::Starting | RuntimePhase::Running => return Err(RuntimeStartError::AlreadyStarted),
-                RuntimePhase::Stopping | RuntimePhase::Stopped => return Err(RuntimeStartError::ShutdownRequested),
+                RuntimePhase::Stopping | RuntimePhase::Stopped => {
+                    drop(state);
+                    self.request_shutdown();
+                    return Err(RuntimeStartError::ShutdownRequested);
+                }
             }
             let executor = tokio::runtime::Handle::try_current().map_err(|_| RuntimeStartError::NoExecutor)?;
             state.phase = RuntimePhase::Starting;
@@ -1178,9 +1233,11 @@ impl Runtime {
         };
         let mut result = self.startup_result.subscribe();
         loop {
-            if let Some(result) = *result.borrow_and_update() {
+            let published = *result.borrow_and_update();
+            if let Some(result) = published {
                 waiter.armed = false;
                 return if result.is_ok() && self.cancel.is_cancelled() {
+                    self.request_shutdown();
                     Err(if self.lifecycle.lock().unwrap().failures.is_empty() {
                         RuntimeStartError::ShutdownRequested
                     } else {
@@ -1269,6 +1326,9 @@ impl Runtime {
                 Err(RuntimeStartError::ShutdownRequested)
             }
         };
+        if result.is_err() {
+            self.request_shutdown();
+        }
         self.publish_start(result);
     }
 
@@ -1391,10 +1451,11 @@ impl Runtime {
         let executor = {
             let mut state = self.lifecycle.lock().unwrap();
             if state.rollback_requested {
-                return;
+                None
+            } else {
+                state.rollback_requested = true;
+                state.executor.clone()
             }
-            state.rollback_requested = true;
-            state.executor.clone()
         };
         self.request_shutdown();
         if let Some(executor) = executor {
@@ -1409,12 +1470,48 @@ impl Runtime {
         }
     }
 
+    /// Read retained stop/fault state without an executor.
+    ///
+    /// `NotRequested` is not a readiness or health signal. No value proves
+    /// cleanup; drive shutdown to its result before releasing execution resources.
+    pub fn stop_status(&self) -> RuntimeStopStatus {
+        *self.stop_status.borrow()
+    }
+
+    /// Observe stop/fault state without retaining this runtime or its callbacks.
+    ///
+    /// Observation is passive. The caller still owns shutdown and cleanup.
+    /// Language bindings must separately own notification delivery and cancellation;
+    /// this native API does not automatically supervise an SDK or application host.
+    pub fn stop_observer(&self) -> RuntimeStopObserver {
+        RuntimeStopObserver {
+            state: self.stop_status.subscribe(),
+        }
+    }
+
+    fn publish_stop_status(&self, status: RuntimeStopStatus) {
+        self.stop_status.send_if_modified(|current| {
+            if matches!(
+                (*current, status),
+                (
+                    RuntimeStopStatus::NotRequested,
+                    RuntimeStopStatus::Requested | RuntimeStopStatus::Faulted
+                ) | (RuntimeStopStatus::Requested, RuntimeStopStatus::Faulted)
+            ) {
+                *current = status;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     /// Stop admission promptly, including before or during activation.
     ///
     /// This is acceptance, not completion. A caller must drive a shutdown future
     /// to enforce grace and observe cleanup; language adapters retain that future.
     pub fn request_shutdown(&self) {
-        let result = {
+        let (result, status) = {
             let mut state = self.lifecycle.lock().unwrap();
             if state.phase != RuntimePhase::Stopped {
                 state.phase = RuntimePhase::Stopping;
@@ -1422,11 +1519,12 @@ impl Runtime {
             self.cancel.cancel();
             self.task_tracker.close();
             if state.failures.is_empty() {
-                RuntimeStartError::ShutdownRequested
+                (RuntimeStartError::ShutdownRequested, RuntimeStopStatus::Requested)
             } else {
-                RuntimeStartError::StartupFailed
+                (RuntimeStartError::StartupFailed, RuntimeStopStatus::Faulted)
             }
         };
+        self.publish_stop_status(status);
         self.publish_start(Err(result));
     }
 
@@ -1588,16 +1686,21 @@ impl Runtime {
             // await can itself be cancelled by a shutdown caller.
             tasks.pop();
         }
-        let mut state = self.lifecycle.lock().unwrap();
-        state.phase = RuntimePhase::Stopped;
-        state.startup_owner = None;
-        if !state.failures.is_empty() {
-            Err(RuntimeShutdownError::Failed { quiescent: true })
-        } else if state.forced {
-            Ok(ShutdownOutcome::Forced)
-        } else {
-            Ok(ShutdownOutcome::Drained)
-        }
+        let result = {
+            let mut state = self.lifecycle.lock().unwrap();
+            state.phase = RuntimePhase::Stopped;
+            state.startup_owner = None;
+            if !state.failures.is_empty() {
+                Err(RuntimeShutdownError::Failed { quiescent: true })
+            } else if state.forced {
+                Ok(ShutdownOutcome::Forced)
+            } else {
+                Ok(ShutdownOutcome::Drained)
+            }
+        };
+        drop(tasks);
+        self.request_shutdown();
+        result
     }
 
     #[cfg(feature = "test-hooks")]

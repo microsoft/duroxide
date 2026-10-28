@@ -432,7 +432,8 @@ pub mod provider_stress_test;
 pub use client::{Client, ClientError};
 pub use runtime::{
     InvocationCleanupError, OrchestrationHandler, OrchestrationRegistry, OrchestrationRegistryBuilder,
-    OrchestrationStatus, RuntimeOptions, RuntimeShutdownError, RuntimeStartError, ShutdownOutcome,
+    OrchestrationStatus, RuntimeOptions, RuntimeShutdownError, RuntimeStartError, RuntimeStopObserver,
+    RuntimeStopStatus, ShutdownOutcome,
 };
 
 // Re-export management types for convenience
@@ -2524,7 +2525,14 @@ impl OrchestrationContext {
     /// rejects the new durable effects from this attempt and stops the affected Runtime.
     /// Previously committed history does not change. Foreign completion remains owned.
     /// A later driver or cleanup failure does not rewrite a valid decision or undo a committed acknowledgement.
+    /// Earlier fault reporting can force shutdown before an uncommitted acknowledgement completes.
     /// This adds no transaction or compensation guarantee for external effects.
+    ///
+    /// Finalization is an admission boundary, not another replay stage. If it
+    /// admits durable schedules or detached starts, the handler must reproduce
+    /// those operations during normal replay, before history matching reaches
+    /// them. A finalizer-only schedule can enter the first snapshot but fail the
+    /// next turn with nondeterminism.
     ///
     /// Existing handlers need not opt into this notification.
     ///

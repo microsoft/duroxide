@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use duroxide::OrchestrationRegistry;
 use duroxide::runtime::registry::ActivityRegistry;
-use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
-use duroxide::runtime::{Runtime, RuntimeStartError, ShutdownOutcome};
+use duroxide::runtime::test_hooks::{LifecyclePoint, LifecycleTask, ProviderOperation};
+use duroxide::runtime::{Runtime, RuntimeShutdownError, RuntimeStartError, RuntimeStopStatus, ShutdownOutcome};
 use futures_util::FutureExt;
 use support::{Fixture, SECRET, bounded, entered, options, until};
 use tokio_util::sync::CancellationToken;
@@ -32,6 +32,7 @@ fn prepared_start_rejects_a_missing_executor_without_consuming_the_created_state
         futures::executor::block_on(runtime.clone().start_execution()),
         Err(RuntimeStartError::NoExecutor)
     );
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
     f.assert_retired();
     executor.block_on(async {
         runtime.clone().start_execution().await.unwrap();
@@ -41,6 +42,188 @@ fn prepared_start_rejects_a_missing_executor_without_consuming_the_created_state
         );
     });
     f.assert_retired();
+}
+
+#[test]
+fn owned_stop_observers_retain_final_state_without_retaining_runtime_or_callbacks() {
+    for (subscribe_before_stop, request_stop) in [(false, true), (true, true), (true, false)] {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let f = executor.block_on(Fixture::new());
+        let root = Arc::new(());
+        let weak_root = Arc::downgrade(&root);
+        let registry = OrchestrationRegistry::builder()
+            .register("flow", move |_, _: String| {
+                let root = Arc::clone(&root);
+                async move {
+                    std::hint::black_box(root);
+                    Ok(String::new())
+                }
+            })
+            .build();
+        let runtime = f.prepare(ActivityRegistry::builder().build(), registry, options());
+        let weak_runtime = Arc::downgrade(&runtime);
+        assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
+        let early = subscribe_before_stop.then(|| runtime.stop_observer());
+        if request_stop {
+            runtime.request_shutdown();
+        }
+        let mut observer = early.unwrap_or_else(|| runtime.stop_observer());
+        drop(runtime);
+        assert!(weak_runtime.upgrade().is_none());
+        assert!(weak_root.upgrade().is_none());
+        let expected = if request_stop {
+            RuntimeStopStatus::Requested
+        } else {
+            RuntimeStopStatus::NotRequested
+        };
+        assert_eq!(observer.state(), expected);
+        assert_eq!(
+            futures::executor::block_on(observer.changed(RuntimeStopStatus::NotRequested)),
+            request_stop.then_some(RuntimeStopStatus::Requested)
+        );
+        assert_eq!(futures::executor::block_on(observer.changed(expected)), None);
+        f.assert_retired();
+    }
+}
+
+#[tokio::test]
+async fn cancelled_and_independent_stop_observers_do_not_change_lifecycle_ownership() {
+    let f = Fixture::new().await;
+    let runtime = f.empty();
+    let mut observer = runtime.stop_observer();
+    let mut independent = observer.clone();
+    assert!(
+        observer
+            .changed(RuntimeStopStatus::NotRequested)
+            .now_or_never()
+            .is_none()
+    );
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
+    runtime.clone().start_execution().await.unwrap();
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
+    assert_eq!(
+        runtime.clone().start_execution().await,
+        Err(RuntimeStartError::AlreadyStarted)
+    );
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
+    runtime.request_shutdown();
+    for observer in [&mut observer, &mut independent] {
+        assert_eq!(
+            bounded(observer.changed(RuntimeStopStatus::NotRequested)).await,
+            Some(RuntimeStopStatus::Requested)
+        );
+        assert!(observer.changed(RuntimeStopStatus::Requested).now_or_never().is_none());
+    }
+    assert_eq!(
+        bounded(runtime.clone().shutdown_with_grace(Duration::from_secs(1))).await,
+        Ok(ShutdownOutcome::Drained)
+    );
+    assert!(observer.changed(RuntimeStopStatus::Requested).now_or_never().is_none());
+    drop(runtime);
+    assert_eq!(bounded(observer.changed(RuntimeStopStatus::Requested)).await, None);
+    assert_eq!(bounded(independent.changed(RuntimeStopStatus::Requested)).await, None);
+    f.assert_retired();
+}
+
+#[tokio::test]
+async fn stop_observers_see_fault_escalation_after_rollback_was_already_requested() {
+    let f = Fixture::new().await;
+    let startup = f.hold(LifecyclePoint::StartupAfterSpawn(LifecycleTask::WorkerSlot));
+    let worker_point = LifecyclePoint::ParentWork(LifecycleTask::WorkerSlot);
+    let worker = f.hold(worker_point);
+    let force = f.hold(LifecyclePoint::BeforeForce);
+    f.hooks.fail_once(worker_point).unwrap();
+    let runtime = f.empty();
+    let mut observer = runtime.stop_observer();
+    let starter = tokio::spawn(runtime.clone().start_execution());
+    entered(&startup).await;
+    entered(&worker).await;
+    assert_eq!(observer.state(), RuntimeStopStatus::NotRequested);
+    starter.abort();
+    assert!(bounded(starter).await.unwrap_err().is_cancelled());
+    entered(&force).await;
+    assert_eq!(observer.state(), RuntimeStopStatus::Requested);
+    assert!(observer.changed(RuntimeStopStatus::Requested).now_or_never().is_none());
+    worker.release();
+    assert_eq!(
+        bounded(observer.changed(RuntimeStopStatus::Requested)).await,
+        Some(RuntimeStopStatus::Faulted)
+    );
+    assert_eq!(
+        runtime.clone().start_execution().await,
+        Err(RuntimeStartError::ShutdownRequested)
+    );
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::Faulted);
+    let mut late = runtime.stop_observer();
+    assert_eq!(
+        bounded(late.changed(RuntimeStopStatus::NotRequested)).await,
+        Some(RuntimeStopStatus::Faulted)
+    );
+    runtime.request_shutdown();
+    assert_eq!(observer.state(), RuntimeStopStatus::Faulted);
+    force.release();
+    startup.release();
+    assert_eq!(
+        bounded(runtime.clone().shutdown_with_grace(Duration::ZERO)).await,
+        Err(RuntimeShutdownError::Failed { quiescent: true })
+    );
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::Faulted);
+    drop(runtime);
+    until(|| Arc::strong_count(&f.provider) == 1).await;
+    assert_eq!(
+        bounded(late.changed(RuntimeStopStatus::Requested)).await,
+        Some(RuntimeStopStatus::Faulted)
+    );
+    assert_eq!(bounded(observer.changed(RuntimeStopStatus::Faulted)).await, None);
+    assert_eq!(bounded(late.changed(RuntimeStopStatus::Faulted)).await, None);
+    f.assert_retired();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn racing_stop_and_fault_publish_monotonic_status() {
+    for _ in 0..20 {
+        let f = Fixture::new().await;
+        let point = LifecyclePoint::ParentWork(LifecycleTask::WorkerSlot);
+        let worker = f.hold(point);
+        f.hooks.fail_once(point).unwrap();
+        let runtime = f.empty();
+        runtime.clone().start_execution().await.unwrap();
+        entered(&worker).await;
+        let mut observer = runtime.stop_observer();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let stop_barrier = Arc::clone(&barrier);
+        let stop_runtime = Arc::clone(&runtime);
+        let stop = tokio::spawn(async move {
+            stop_barrier.wait().await;
+            stop_runtime.request_shutdown();
+        });
+        let fault_barrier = Arc::clone(&barrier);
+        let fault = tokio::spawn(async move {
+            fault_barrier.wait().await;
+            worker.release();
+        });
+        barrier.wait().await;
+        let first = bounded(observer.changed(RuntimeStopStatus::NotRequested))
+            .await
+            .unwrap();
+        if first == RuntimeStopStatus::Requested {
+            assert_eq!(bounded(observer.changed(first)).await, Some(RuntimeStopStatus::Faulted));
+        } else {
+            assert_eq!(first, RuntimeStopStatus::Faulted);
+        }
+        bounded(stop).await.unwrap();
+        bounded(fault).await.unwrap();
+        assert_eq!(
+            bounded(runtime.clone().shutdown_with_grace(Duration::ZERO)).await,
+            Err(RuntimeShutdownError::Failed { quiescent: true })
+        );
+        assert_eq!(runtime.stop_status(), RuntimeStopStatus::Faulted);
+        assert_eq!(observer.state(), RuntimeStopStatus::Faulted);
+        f.assert_retired();
+    }
 }
 
 #[tokio::test]
@@ -211,11 +394,13 @@ async fn fallible_and_legacy_startup_failures_are_sanitized_and_release_owned_ro
     let runtime = f.empty();
     let error = runtime.clone().start_execution().await.unwrap_err();
     assert_eq!(error, RuntimeStartError::StartupFailed);
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::Faulted);
     assert!(!format!("{error:?}: {error}").contains("sentinel"));
     let error = bounded(runtime.clone().shutdown_with_grace(Duration::ZERO))
         .await
         .unwrap_err();
     assert!(error.is_quiescent());
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::Faulted);
     runtime.clone().shutdown(None).await;
     f.assert_retired();
     drop(runtime);
@@ -325,6 +510,8 @@ async fn shorter_native_call_can_force_an_existing_grace_period_100_times() {
         bounded(active.cancelled()).await;
         let mut first = Box::pin(runtime.clone().shutdown_with_grace(Duration::from_secs(30)));
         assert!(first.as_mut().now_or_never().is_none());
+        let observer = runtime.stop_observer();
+        assert_eq!(observer.state(), RuntimeStopStatus::Requested);
         let second = tokio::spawn(runtime.shutdown_with_grace(Duration::ZERO));
         support::entered(&force).await;
         assert_eq!(f.hooks.hits(LifecyclePoint::ForceRequested), 0);
@@ -332,6 +519,7 @@ async fn shorter_native_call_can_force_an_existing_grace_period_100_times() {
         force.release();
         assert_eq!(bounded(second).await.unwrap(), Ok(ShutdownOutcome::Forced));
         assert_eq!(bounded(first).await, Ok(ShutdownOutcome::Forced));
+        assert_eq!(observer.state(), RuntimeStopStatus::Requested);
         assert_eq!(f.hooks.hits(LifecyclePoint::ForceRequested), 1);
         f.assert_retired();
     }
@@ -401,12 +589,14 @@ async fn startup_stop_order_closes_production_before_any_dispatch_100_times() {
         let runtime = f.empty();
         let starter = tokio::spawn(runtime.clone().start_execution());
         entered(&held).await;
+        assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
         runtime.request_shutdown();
         held.release();
         assert_eq!(
             bounded(starter).await.unwrap(),
             Err(RuntimeStartError::ShutdownRequested)
         );
+        assert_eq!(runtime.stop_status(), RuntimeStopStatus::Requested);
         assert_eq!(
             bounded(runtime.shutdown_with_grace(Duration::from_secs(1))).await,
             Ok(ShutdownOutcome::Drained)

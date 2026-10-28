@@ -20,11 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New runtimes do not reset pending counts from other runtimes.
   Structured events provide each Runtime's identity and count.
   Broken completion observers remain counted. A zero count does not prove cleanup.
+- **Native stop/fault observation** - Add `Runtime::stop_status()` and an owned,
+  read-only `RuntimeStopObserver` that does not retain worker resources.
+  Keep terminal state for late observers and preserve fault escalation during rollback.
+  Report known turn faults before later provider waits, with protected diagnostics.
+  Status and source closure do not prove cleanup. SDK and host monitoring remain
+  separate follow-up work.
 
 ### Changed
 
-- **Internal lifecycle fault shutdown** - Internal, destruction, finalization,
-  and registered-cleanup faults stop new work and request zero-grace shutdown of that Runtime.
+- **Internal lifecycle fault shutdown** - Faults caught at protected internal,
+  destruction, finalization, and registered-cleanup boundaries stop new work and
+  request zero-grace shutdown of that Runtime.
   This can interrupt unrelated admitted work. Ordinary application failures still
   affect only their operation. The failed worker cannot restart and must still
   finish cleanup. Existing recovery and retry rules can repeat external effects.
@@ -32,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Finalization failure before the snapshot** - A detected failure rejects the
   new durable batch from that attempt. It does not publish an ordinary failed turn.
   Foreign cleanup remains owned. Later driver or cleanup faults do not rewrite a
-  valid decision or undo a committed acknowledgement.
+  valid decision or undo a committed acknowledgement. Earlier force can cancel
+  an acknowledgement that has not committed.
+  Finalizer-admitted durable work must be reproduced during normal replay;
+  finalization is not another replay stage.
 
 ### Fixed
 

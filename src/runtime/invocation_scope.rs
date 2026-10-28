@@ -192,6 +192,13 @@ impl InvocationScope {
 }
 
 impl CleanupAttachment {
+    pub(super) fn take_failures(&self) -> Vec<TaskFailure> {
+        self.0
+            .as_ref()
+            .map(|state| std::mem::take(&mut state.lock().unwrap().failures))
+            .unwrap_or_default()
+    }
+
     pub(super) fn attach(&self, cleanup: impl Future<Output = TaskResult> + Send + 'static) -> Result<(), AttachError> {
         self.attach_with_finalization(cleanup, None)
     }
@@ -309,11 +316,6 @@ impl CleanupAttachment {
                 FailureKind::DestructionPanicked,
                 payload,
                 &mut failures,
-            );
-            tracing::error!(
-                target: "duroxide::runtime::lifecycle",
-                category = "invocation_destruction_failed",
-                "Orchestration driver destruction failed; invocation cleanup remains owned"
             );
             state.lock().unwrap().failures.extend(failures);
         }
@@ -446,6 +448,79 @@ mod tests {
         let reported = failure.clone();
         scope.attachment().attach(async move { Err(vec![reported]) }).unwrap();
         assert_eq!(scope.retire().await, Err(vec![failure]));
+    }
+
+    #[tokio::test]
+    async fn destruction_fault_is_recorded_before_any_diagnostic_can_panic() {
+        use tracing_subscriber::prelude::*;
+
+        struct PanicOnError;
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PanicOnError {
+            fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::ERROR {
+                    panic!("diagnostic failure");
+                }
+            }
+        }
+        struct BrokenDriver;
+        impl Drop for BrokenDriver {
+            fn drop(&mut self) {
+                panic!("driver destruction failure");
+            }
+        }
+
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(PanicOnError));
+        let scope = InvocationScope::new();
+        let result = catch_unwind(AssertUnwindSafe(|| scope.attachment().destroy_driver(BrokenDriver)));
+        assert!(result.is_ok(), "diagnostics escaped the protected driver destruction");
+        assert_eq!(
+            scope.retire().await,
+            Err(vec![TaskFailure {
+                task: "orchestration-driver",
+                kind: FailureKind::DestructionPanicked,
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_turn_failures_preserves_finalization_and_pending_completion() {
+        let scope = InvocationScope::new();
+        let attachment = scope.attachment();
+        let finalized = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&finalized);
+        let (release, held) = oneshot::channel();
+        let (entered, started) = oneshot::channel();
+        attachment
+            .register_with_finalization(
+                async move {
+                    entered.send(()).unwrap();
+                    held.await.unwrap();
+                    Ok(())
+                },
+                move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    panic!("finalization failure");
+                },
+            )
+            .unwrap();
+        assert!(attachment.finalize());
+        assert_eq!(
+            attachment.take_failures(),
+            vec![TaskFailure {
+                task: "invocation-finalization",
+                kind: FailureKind::PollPanicked,
+            }]
+        );
+        assert!(attachment.take_failures().is_empty());
+        assert!(attachment.finalization_failed());
+        let retirement = tokio::spawn(scope.retire_reporting(|failures| assert!(failures.is_empty())));
+        started.await.unwrap();
+        assert!(!retirement.is_finished());
+        assert_eq!(finalized.load(Ordering::SeqCst), 1);
+        assert_eq!(attachment.attach(async { Ok(()) }), Err(AttachError::Closed));
+        release.send(()).unwrap();
+        assert_eq!(retirement.await.unwrap(), Ok(()));
+        assert_eq!(finalized.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

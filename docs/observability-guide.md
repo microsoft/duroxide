@@ -217,6 +217,25 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 
 **Note**: Internal dispatcher metrics use dot notation and milliseconds (not exported to Prometheus by default).
 
+### Native stop observation (unreleased)
+
+`Runtime::stop_status()` reports `NotRequested`, `Requested`, or `Faulted`.
+This is retained stop/fault state, not readiness or a health check.
+Fault-free forced shutdown remains `Requested`. A later lifecycle fault changes
+it to `Faulted`, and that state cannot change back.
+
+Use an owned `RuntimeStopObserver` from `stop_observer()` to wait for changes
+without retaining the Runtime or its callbacks.
+Independent observers can miss intermediate states but read the latest state.
+Canceling a wait does not change shutdown or cleanup ownership.
+Source closure returns an unseen final state before `None`; neither proves cleanup.
+
+Use the typed cleanup result and the SDK's release checks to decide when resources
+can be released. The current SDKs and default .NET host do not automatically
+monitor this native API.
+See [native stop observation](ORCHESTRATION-GUIDE.md#native-stop-observation-unreleased)
+for the state contract, cancellation rules, example, and ownership diagram.
+
 ### Pending foreign retirements (unreleased)
 
 `duroxide_pending_foreign_retirements` counts registered foreign completions that
