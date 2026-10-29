@@ -48,6 +48,7 @@ pub struct PoisonInjectingProvider {
     successful_ignored_abandons: AtomicU32,
     counted_abandon_delays: std::sync::Mutex<Vec<Duration>>,
     orchestration_fetches: std::sync::Mutex<Vec<(String, String, u32)>>,
+    work_abandons: std::sync::Mutex<Vec<(Option<Duration>, bool)>>,
 }
 
 impl PoisonInjectingProvider {
@@ -68,6 +69,7 @@ impl PoisonInjectingProvider {
             successful_ignored_abandons: AtomicU32::new(0),
             counted_abandon_delays: std::sync::Mutex::new(Vec::new()),
             orchestration_fetches: std::sync::Mutex::new(Vec::new()),
+            work_abandons: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -168,6 +170,11 @@ impl PoisonInjectingProvider {
     /// Delays of successful orchestration abandons that kept their attempt (`ignore_attempt = false`).
     pub fn counted_abandon_delays(&self) -> Vec<Duration> {
         self.counted_abandon_delays.lock().expect("delays lock").clone()
+    }
+
+    /// (delay, ignore_attempt) for each work item abandonment.
+    pub fn work_abandons(&self) -> Vec<(Option<Duration>, bool)> {
+        self.work_abandons.lock().expect("work abandons lock").clone()
     }
 }
 
@@ -341,6 +348,10 @@ impl Provider for PoisonInjectingProvider {
         delay: Option<Duration>,
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
+        self.work_abandons
+            .lock()
+            .expect("work abandons lock")
+            .push((delay, ignore_attempt));
         self.inner.abandon_work_item(token, delay, ignore_attempt).await
     }
 

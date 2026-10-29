@@ -275,9 +275,10 @@ task is dropped, including error, panic, and cancellation. If several limits
 apply, reserve all of them atomically or defer holding none. Detached work is
 not protected after the handler finishes.
 
-`Defer(delay)` requires a positive delay. It leaves the original activity
-pending in durable storage, frees the worker to fetch other work, and does not
-record an activity result or consume the poison-message fetch-attempt budget.
+`Defer(delay)` requires a positive delay. Positive sub-millisecond delays are
+rounded up to one millisecond. Deferral leaves the original activity pending in
+durable storage, frees the worker to fetch other work, and does not record an
+activity result or consume the poison-message fetch-attempt budget.
 It is not a retry of an executed activity. An admission error, panic, or invalid
 delay fails the activity rather than invoking the handler. Storage errors during
 deferral are reported as infrastructure errors.

@@ -572,7 +572,10 @@ async fn run_activity_with_cancellation(
             ActivityAdmission::Defer(delay) if delay.is_zero() => {
                 return Err("Activity admission deferral requires a positive retry delay".to_string());
             }
-            ActivityAdmission::Defer(delay) => return Ok(ActivityInvocation::Deferred(delay)),
+            ActivityAdmission::Defer(delay) => {
+                // Keep positive delays nonzero in millisecond-resolution storage.
+                return Ok(ActivityInvocation::Deferred(delay.max(Duration::from_millis(1))));
+            }
         };
         handler
             .invoke(activity_ctx, input)

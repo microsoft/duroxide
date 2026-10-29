@@ -5,10 +5,12 @@
 
 mod common;
 
+use common::fault_injection::PoisonInjectingProvider;
+use duroxide::providers::sqlite::SqliteProvider;
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{ActivityAdmission, Runtime, RuntimeOptions};
 use duroxide::{ActivityContext, Client, EventKind, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 
@@ -90,7 +92,12 @@ async fn deferred_admission_frees_worker_without_consuming_attempts_and_survives
     )));
 
     drop(held);
-    let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations(), options()).await;
+    // Shutdown can cancel a fetch after its attempt has already been committed.
+    let restart_options = RuntimeOptions {
+        max_attempts: 2,
+        ..options()
+    };
+    let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations(), restart_options).await;
     assert!(matches!(
         client.wait_for_orchestration("limited", Duration::from_secs(5)).await.unwrap(),
         OrchestrationStatus::Completed { output, .. } if output == "payload"
@@ -104,6 +111,45 @@ async fn deferred_admission_frees_worker_without_consuming_attempts_and_survives
             .count(),
         1
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admission_deferral_delays_are_clamped_before_reaching_storage() {
+    let store = Arc::new(PoisonInjectingProvider::new(Arc::new(
+        SqliteProvider::new_in_memory().await.unwrap(),
+    )));
+    let cases = [
+        (Duration::from_nanos(1), Duration::from_millis(1)),
+        (Duration::from_micros(500), Duration::from_millis(1)),
+        (Duration::from_nanos(999_999), Duration::from_millis(1)),
+        (Duration::from_millis(1), Duration::from_millis(1)),
+        (Duration::from_micros(1500), Duration::from_micros(1500)),
+        (Duration::from_millis(10), Duration::from_millis(10)),
+    ];
+    let delays = Mutex::new(cases.into_iter());
+    let activities = ActivityRegistry::builder()
+        .register_with_admission(
+            "Limited",
+            move |_ctx, _input| {
+                Ok(match delays.lock().unwrap().next() {
+                    Some((delay, _)) => ActivityAdmission::Defer(delay),
+                    None => ActivityAdmission::admit(()),
+                })
+            },
+            |_ctx, input| async move { Ok(input) },
+        )
+        .build();
+    let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations(), options()).await;
+    let client = Client::new(store.clone());
+    client.start_orchestration("clamped", "Run", "Limited").await.unwrap();
+    let status = client.wait_for_orchestration("clamped", Duration::from_secs(5)).await;
+    runtime.shutdown(None).await;
+
+    assert!(matches!(
+        status.unwrap(),
+        OrchestrationStatus::Completed { output, .. } if output == "payload"
+    ));
+    assert_eq!(store.work_abandons(), cases.map(|(_, expected)| (Some(expected), true)));
 }
 
 #[tokio::test(flavor = "current_thread")]

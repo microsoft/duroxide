@@ -461,6 +461,7 @@ pub enum ActivityAdmission {
     Admit(Box<dyn Send>),
     /// Leave the activity pending and retry admission after a positive delay.
     ///
+    /// Positive sub-millisecond delays are rounded up to one millisecond.
     /// Deferral releases the worker slot without recording a history event or
     /// consuming a fetch attempt. It does not retry an executed activity.
     Defer(Duration),
