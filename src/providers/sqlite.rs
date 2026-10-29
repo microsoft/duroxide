@@ -98,8 +98,7 @@ impl SqliteProvider {
 
         // Calculate visible_at based on delay
         let visible_at = if let Some(delay) = delay {
-            let delay_ms = delay.as_millis().min(i64::MAX as u128) as i64;
-            Self::now_millis().saturating_add(delay_ms)
+            Self::timestamp_after(delay)
         } else {
             Self::now_millis()
         };
@@ -505,9 +504,10 @@ impl SqliteProvider {
             .as_millis() as i64
     }
 
-    /// Get future timestamp in milliseconds
+    /// Get a future timestamp in milliseconds, saturating at `i64::MAX`.
     fn timestamp_after(duration: Duration) -> i64 {
-        Self::now_millis() + duration.as_millis() as i64
+        let delay_ms = duration.as_millis().min(i64::MAX as u128) as i64;
+        Self::now_millis().saturating_add(delay_ms)
     }
 
     /// Build a SQL WHERE clause fragment for tag filtering.
@@ -2242,8 +2242,7 @@ impl Provider for SqliteProvider {
         // Optionally delay only the messages this fetch locked. Rows that became visible
         // after the fetch (for example a continue-as-new start) keep their visibility.
         if let Some(delay) = delay {
-            let delay_ms = delay.as_millis().min(i64::MAX as u128) as i64;
-            let visible_at = Self::now_millis().saturating_add(delay_ms);
+            let visible_at = Self::timestamp_after(delay);
             sqlx::query("UPDATE orchestrator_queue SET visible_at = ? WHERE lock_token = ?")
                 .bind(visible_at)
                 .bind(lock_token)
@@ -4345,6 +4344,54 @@ mod tests {
             .unwrap();
         assert!(matches!(dequeued2, WorkItem::ActivityExecute { instance, .. } if instance == "test-abandon-work"));
         assert_ne!(lock_token2, lock_token); // Different lock token
+    }
+
+    #[tokio::test]
+    async fn test_abandon_work_item_with_oversized_delay() {
+        for delay in [
+            Duration::MAX,
+            Duration::from_millis(i64::MAX as u64),
+            Duration::from_millis(i64::MAX as u64 + 1),
+        ] {
+            let store = create_test_store().await;
+            for instance in ["deferred", "ready"] {
+                store
+                    .enqueue_for_worker(WorkItem::ActivityExecute {
+                        instance: instance.to_string(),
+                        execution_id: 1,
+                        id: 1,
+                        name: "TestActivity".to_string(),
+                        input: String::new(),
+                        session_id: None,
+                        tag: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let (item, lock_token, _) = store
+                .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(item, WorkItem::ActivityExecute { instance, .. } if instance == "deferred"));
+
+            store.abandon_work_item(&lock_token, Some(delay), true).await.unwrap();
+
+            let deferred_state: (i64, i64, Option<String>) =
+                sqlx::query_as("SELECT visible_at, attempt_count, lock_token FROM worker_queue ORDER BY id LIMIT 1")
+                    .fetch_one(&store.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(deferred_state, (i64::MAX, 0, None), "{delay:?}");
+
+            let (item, _, _) = store
+                .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(item, WorkItem::ActivityExecute { instance, .. } if instance == "ready"));
+        }
     }
 
     #[tokio::test]

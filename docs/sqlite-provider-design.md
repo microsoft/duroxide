@@ -101,6 +101,11 @@ CREATE TABLE sessions (
 5. **Session table as a flow table** — routes session-bound activities to owning workers (analogous to network flow affinity)
 5. **JSON storage** for flexible event/work item serialization
 
+Delayed visibility is stored as signed 64-bit Unix timestamps in milliseconds.
+If a delay would exceed that range, the visibility timestamp saturates at
+`i64::MAX`. Oversized delays therefore remain in the future rather than wrapping
+around and becoming immediately eligible for delivery.
+
 ## Implementation Plan
 
 ### Phase 1: Core Provider Structure
