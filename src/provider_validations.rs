@@ -62,6 +62,7 @@ pub use crate::provider_validation::race_replay;
 /// - `test_multi_operation_atomic_ack` - Verify complex ack succeeds atomically
 /// - `test_lock_released_only_on_successful_ack` - Verify lock only released on success
 /// - `test_concurrent_ack_prevention` - Verify only one ack succeeds with same token
+/// - `test_ack_work_item_duplicate_rejected` - Verify a repeated worker ack cannot enqueue another completion
 ///
 /// **Error Handling Tests:**
 /// - `test_invalid_lock_token_on_ack` - Verify invalid lock tokens are rejected
@@ -140,8 +141,8 @@ pub use crate::provider_validation::instance_creation::{
 
 #[cfg(feature = "provider-test")]
 pub use crate::provider_validation::atomicity::{
-    test_atomicity_failure_rollback, test_concurrent_ack_prevention, test_lock_released_only_on_successful_ack,
-    test_multi_operation_atomic_ack,
+    test_ack_work_item_duplicate_rejected, test_atomicity_failure_rollback, test_concurrent_ack_prevention,
+    test_lock_released_only_on_successful_ack, test_multi_operation_atomic_ack,
 };
 
 #[cfg(feature = "provider-test")]

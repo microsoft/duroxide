@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::provider_validation::{Event, EventKind, ExecutionMetadata, start_item};
+use crate::provider_validation::{Event, EventKind, ExecutionMetadata, create_instance, start_item};
 use crate::provider_validations::ProviderFactory;
 use crate::providers::{TagFilter, WorkItem};
 use std::sync::Arc;
@@ -462,4 +462,69 @@ pub async fn test_concurrent_ack_prevention<F: ProviderFactory>(factory: &F) {
     let failures: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
     assert_eq!(failures.len(), 1, "Exactly one ack should fail");
     tracing::info!("✓ Test passed: concurrent ack prevention verified");
+}
+
+/// Test 2.5: Duplicate Worker Ack
+/// Goal: Reject a repeated completion ack without enqueueing a duplicate completion.
+pub async fn test_ack_work_item_duplicate_rejected<F: ProviderFactory>(factory: &F) {
+    let provider = factory.create_provider().await;
+    let instance = "instance-duplicate-ack";
+    create_instance(provider.as_ref(), instance).await.unwrap();
+
+    provider
+        .enqueue_for_worker(WorkItem::ActivityExecute {
+            instance: instance.to_string(),
+            execution_id: 1,
+            id: 2,
+            name: "TestActivity".to_string(),
+            input: "{}".to_string(),
+            session_id: None,
+            tag: None,
+        })
+        .await
+        .unwrap();
+    let (_, token, _) = provider
+        .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
+        .await
+        .unwrap()
+        .unwrap();
+    let completion = WorkItem::ActivityCompleted {
+        instance: instance.to_string(),
+        execution_id: 1,
+        id: 2,
+        result: "done".to_string(),
+    };
+    provider.ack_work_item(&token, Some(completion.clone())).await.unwrap();
+    let error = provider
+        .ack_work_item(&token, Some(completion.clone()))
+        .await
+        .expect_err("A second ack with the same token must fail");
+    assert!(!error.is_retryable(), "A repeated ack must fail permanently: {error}");
+
+    let (item, token, _) = provider
+        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.messages, vec![completion], "Exactly one completion must be queued");
+    provider
+        .ack_orchestration_item(&token, 1, vec![], vec![], vec![], ExecutionMetadata::default(), vec![])
+        .await
+        .unwrap();
+    assert!(
+        provider
+            .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "No duplicate completion may remain outside the first batch"
+    );
+    assert!(
+        provider
+            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
+            .await
+            .unwrap()
+            .is_none(),
+        "The acknowledged worker item must be removed"
+    );
 }

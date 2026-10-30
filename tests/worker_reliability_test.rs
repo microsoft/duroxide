@@ -7,8 +7,8 @@
 
 use common::fault_injection::{FailingProvider, WorkItemCall};
 use duroxide::EventKind;
+use duroxide::providers::WorkItem;
 use duroxide::providers::sqlite::SqliteProvider;
-use duroxide::providers::{Provider, WorkItem};
 use duroxide::runtime;
 use duroxide::runtime::registry::{ActivityRegistry, OrchestrationRegistry};
 use duroxide::*;
@@ -538,7 +538,7 @@ async fn worker_retries_application_error_ack_without_reexecuting_activity() {
 }
 
 #[tokio::test]
-async fn worker_retries_cancelled_activity_ack_without_completion() {
+async fn worker_does_not_retry_cancelled_activity_ack() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let activity_entered = entered.clone();
     let execution_count = Arc::new(AtomicU32::new(0));
@@ -559,7 +559,7 @@ async fn worker_retries_cancelled_activity_ack_without_completion() {
     tokio::time::timeout(Duration::from_secs(5), entered.notified())
         .await
         .unwrap();
-    test.provider.fail_next_ack_work_item_retryable(3);
+    test.provider.fail_next_ack_work_item_retryable(1);
     test.client
         .cancel_instance("ack-test", "test cancellation")
         .await
@@ -579,7 +579,7 @@ async fn worker_retries_cancelled_activity_ack_without_completion() {
     assert_eq!(execution_count.load(Ordering::SeqCst), 1);
 
     let calls = test.provider.work_item_calls();
-    assert_eq!(calls.len(), 5);
+    assert_eq!(calls.len(), 2);
     let WorkItemCall::Ack {
         token,
         completion: None,
@@ -587,13 +587,59 @@ async fn worker_retries_cancelled_activity_ack_without_completion() {
     else {
         panic!("Cancellation must acknowledge without a completion: {calls:?}");
     };
-    assert!(calls[..4].iter().all(|call| call == &calls[0]), "{calls:?}");
-    // Cancellation deleted the queue entry, so the final ack fails permanently.
-    assert_eq!(calls[4], WorkItemCall::Abandon { token: token.clone() });
+    assert_eq!(calls[1], WorkItemCall::Abandon { token: token.clone() });
 }
 
-#[tokio::test]
-async fn worker_retryable_ack_error_after_commit_does_not_duplicate_completion() {
+#[tokio::test(flavor = "current_thread")]
+async fn worker_redelivers_after_transient_renewal_and_cancellation_ack_failures() {
+    let execution_count = Arc::new(AtomicU32::new(0));
+    let counter = execution_count.clone();
+    let activities = ActivityRegistry::builder()
+        .register("CountingActivity", move |_ctx: ActivityContext, _input: String| {
+            let counter = counter.clone();
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok("done".to_string())
+            }
+        })
+        .build();
+    let test = AckTest::new(activities).await;
+    test.provider.fail_next_renew_work_item_lock();
+    test.provider.fail_next_ack_work_item_retryable(1);
+    test.start().await;
+
+    assert!(matches!(
+        test.finish().await,
+        runtime::OrchestrationStatus::Completed { output, .. } if output == "done"
+    ));
+    assert_eq!(test.provider.remaining_retryable_ack_failures(), 0);
+    assert_eq!(execution_count.load(Ordering::SeqCst), 2);
+
+    let calls = test.provider.work_item_calls();
+    let [
+        WorkItemCall::Ack {
+            token,
+            completion: None,
+        },
+        WorkItemCall::Abandon { token: abandoned },
+        WorkItemCall::Ack {
+            token: redelivered,
+            completion: Some(WorkItem::ActivityCompleted { result, .. }),
+        },
+    ] = calls.as_slice()
+    else {
+        panic!("A failed cancellation ack must allow the live activity to be redelivered: {calls:?}");
+    };
+    assert_eq!(token, abandoned);
+    assert_ne!(token, redelivered);
+    assert_eq!(result, "done");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_retryable_ack_error_after_commit_is_reported_as_uncertain() {
+    let (captured, _guard) = common::tracing_capture::install_tracing_capture();
     let (activities, execution_count) = counting_activity(Ok("done".to_string()));
     let test = AckTest::new(activities).await;
     test.provider.set_ack_then_fail(true);
@@ -608,25 +654,63 @@ async fn worker_retryable_ack_error_after_commit_does_not_duplicate_completion()
     assert_eq!(execution_count.load(Ordering::SeqCst), 1);
 
     let calls = test.provider.work_item_calls();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 2);
     let WorkItemCall::Ack {
-        token,
         completion: Some(WorkItem::ActivityCompleted { result, .. }),
+        ..
     } = &calls[0]
     else {
         panic!("Expected an activity completion: {calls:?}");
     };
     assert_eq!(result, "done");
     assert_eq!(calls[0], calls[1]);
-    assert_eq!(calls[2], WorkItemCall::Abandon { token: token.clone() });
+    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_infra_errors, 0);
 
-    let history = test.provider.read("ack-test").await.unwrap();
-    assert_eq!(
-        history
+    let events = captured.lock().unwrap();
+    assert!(
+        events
             .iter()
-            .filter(|event| matches!(event.kind, EventKind::ActivityCompleted { .. }))
-            .count(),
-        1,
-        "An ambiguous commit must not produce duplicate activity completions"
+            .any(|event| event.field("ack_outcome").as_deref() == Some("uncertain")),
+        "The runtime must report an uncertain acknowledgement outcome"
     );
+    assert!(
+        !events.iter().any(|event| event.message.contains("atomic ack failed")),
+        "An uncertain acknowledgement must not be reported as a confirmed failure"
+    );
+}
+
+#[tokio::test]
+async fn worker_uncertain_ack_before_commit_recovers_after_lock_expiry() {
+    let (activities, execution_count) = counting_activity(Ok("done".to_string()));
+    let test = AckTest::new(activities).await;
+    test.provider.fail_next_ack_work_item_retryable(1);
+    test.provider.fail_next_ack_work_item();
+    test.start().await;
+
+    assert!(matches!(
+        test.finish().await,
+        runtime::OrchestrationStatus::Completed { output, .. } if output == "done"
+    ));
+    assert_eq!(execution_count.load(Ordering::SeqCst), 2);
+    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_infra_errors, 0);
+
+    let calls = test.provider.work_item_calls();
+    assert_eq!(
+        calls.len(),
+        3,
+        "Two uncertain ack attempts, then redelivery without abandon"
+    );
+    let WorkItemCall::Ack { token, completion } = &calls[0] else {
+        panic!("Expected an acknowledgement: {calls:?}");
+    };
+    assert_eq!(calls[0], calls[1]);
+    let WorkItemCall::Ack {
+        token: redelivered,
+        completion: retried_completion,
+    } = &calls[2]
+    else {
+        panic!("Expected acknowledgement after lock expiry: {calls:?}");
+    };
+    assert_ne!(token, redelivered);
+    assert_eq!(completion, retried_completion);
 }
