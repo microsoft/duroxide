@@ -1704,15 +1704,15 @@ fn test_metrics_activity_ack_uncertain() {
 
     let metrics = MetricsProvider::new(&ObservabilityConfig::default()).unwrap();
     let recorder = DebuggingRecorder::new();
-    let mut expected = metrics.snapshot();
-    assert_eq!(expected.activity_ack_uncertain, 0);
+    let expected = metrics.snapshot();
+    assert_eq!(metrics.activity_ack_uncertain(), 0);
 
     metrics::with_local_recorder(&recorder, || {
         metrics.record_activity_ack_uncertain();
         metrics.record_activity_ack_uncertain();
     });
 
-    expected.activity_ack_uncertain = 2;
+    assert_eq!(metrics.activity_ack_uncertain(), 2);
     assert_eq!(
         metrics.snapshot(),
         expected,

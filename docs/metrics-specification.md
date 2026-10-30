@@ -497,7 +497,8 @@ after a retryable error. Incremented once per uncertain outcome, not per retry.
 infrastructure failures. An earlier attempt may have committed or the lock may
 have been lost; redelivery is not guaranteed. This counter does not increment
 `duroxide_activity_executions_total` or `duroxide_activity_infrastructure_errors_total`.
-The runtime metrics snapshot exposes it as `activity_ack_uncertain`.
+Read the in-process count through `MetricsProvider::activity_ack_uncertain()`;
+the public fields of `MetricsSnapshot` are unchanged.
 
 ---
 
@@ -951,3 +952,4 @@ RuntimeOptions {
 ---
 
 **Document Status:** This specification reflects the **current implementation** as of 2025-12-13. Client metrics are defined but not yet instrumented. All implemented metrics have test coverage in `tests/observability_tests.rs`. Poison message handling was added in v1.1.
+
