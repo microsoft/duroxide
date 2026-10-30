@@ -659,6 +659,13 @@ impl Runtime {
     }
 
     #[inline]
+    fn record_activity_ack_uncertain(&self) {
+        if let Some(provider) = self.metrics_provider() {
+            provider.record_activity_ack_uncertain();
+        }
+    }
+
+    #[inline]
     fn record_orchestration_poison(&self) {
         if let Some(provider) = self.metrics_provider() {
             provider.record_orchestration_poison();

@@ -470,6 +470,7 @@ async fn worker_retries_retryable_ack_failure_without_reexecuting_activity() {
         } if result == "done"
     ));
     assert_eq!(calls, vec![calls[0].clone(); 5]);
+    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_ack_uncertain, 0);
 }
 
 #[tokio::test]
@@ -664,7 +665,9 @@ async fn worker_retryable_ack_error_after_commit_is_reported_as_uncertain() {
     };
     assert_eq!(result, "done");
     assert_eq!(calls[0], calls[1]);
-    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_infra_errors, 0);
+    let metrics = test.rt.metrics_snapshot().unwrap();
+    assert_eq!(metrics.activity_infra_errors, 0);
+    assert_eq!(metrics.activity_ack_uncertain, 1);
 
     let events = captured.lock().unwrap();
     assert!(
@@ -676,6 +679,10 @@ async fn worker_retryable_ack_error_after_commit_is_reported_as_uncertain() {
     assert!(
         !events.iter().any(|event| event.message.contains("atomic ack failed")),
         "An uncertain acknowledgement must not be reported as a confirmed failure"
+    );
+    assert!(
+        !events.iter().any(|event| event.message.contains("will be redelivered")),
+        "An uncertain acknowledgement must not promise redelivery when the row may be gone"
     );
 }
 
@@ -692,7 +699,9 @@ async fn worker_uncertain_ack_before_commit_recovers_after_lock_expiry() {
         runtime::OrchestrationStatus::Completed { output, .. } if output == "done"
     ));
     assert_eq!(execution_count.load(Ordering::SeqCst), 2);
-    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_infra_errors, 0);
+    let metrics = test.rt.metrics_snapshot().unwrap();
+    assert_eq!(metrics.activity_infra_errors, 0);
+    assert_eq!(metrics.activity_ack_uncertain, 1);
 
     let calls = test.provider.work_item_calls();
     assert_eq!(

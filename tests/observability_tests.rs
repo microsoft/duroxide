@@ -1516,6 +1516,37 @@ async fn test_metrics_activity_outcomes() {
     assert_eq!(metrics.snapshot().activity_config_errors, 1);
 }
 
+#[test]
+fn test_metrics_activity_ack_uncertain() {
+    use duroxide::runtime::observability::{MetricsProvider, ObservabilityConfig};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let metrics = MetricsProvider::new(&ObservabilityConfig::default()).unwrap();
+    let recorder = DebuggingRecorder::new();
+    let mut expected = metrics.snapshot();
+    assert_eq!(expected.activity_ack_uncertain, 0);
+
+    metrics::with_local_recorder(&recorder, || {
+        metrics.record_activity_ack_uncertain();
+        metrics.record_activity_ack_uncertain();
+    });
+
+    expected.activity_ack_uncertain = 2;
+    assert_eq!(
+        metrics.snapshot(),
+        expected,
+        "Other activity outcome counters must not change"
+    );
+
+    let recorded = recorder.snapshotter().snapshot().into_vec();
+    let [(key, _, _, value)] = recorded.as_slice() else {
+        panic!("Only the dedicated uncertainty counter should be emitted: {recorded:?}");
+    };
+    assert_eq!(key.key().name(), "duroxide_activity_ack_uncertain_total");
+    assert_eq!(key.key().labels().count(), 0);
+    assert_eq!(value, &DebugValue::Counter(2));
+}
+
 /// Test: MetricsProvider poison message tracking
 #[tokio::test]
 async fn test_metrics_poison_messages() {

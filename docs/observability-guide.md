@@ -197,6 +197,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_activity_executions_total` | Counter | Activity | activity_name, outcome, retry_attempt | Track success/failure rates |
 | `duroxide_activity_duration_seconds` | Histogram | Activity | activity_name, outcome | Activity latency p95/p99 |
 | `duroxide_activity_errors_total` | Counter | Activity | activity_name, error_type, retryable | Detailed error tracking |
+| `duroxide_activity_ack_uncertain_total` | Counter | Activity | _(none)_ | Track uncertain acknowledgement outcomes separately from failures |
 | **Sub-Orchestration** |
 | `duroxide_suborchestration_calls_total` | Counter | Sub-Orch | parent_orchestration, child_orchestration, outcome | Track sub-orch calls |
 | `duroxide_suborchestration_duration_seconds` | Histogram | Sub-Orch | parent_orchestration, child_orchestration, outcome | Sub-orch latency |
@@ -280,6 +281,11 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 - **Description**: Detailed activity error tracking
 - **Labels**: `activity_name`, `error_type` (app_error|infrastructure_error|config_error), `retryable` (true|false)
 - **Use**: Distinguish transient vs permanent errors
+
+**`duroxide_activity_ack_uncertain_total`** (Counter)
+- **Description**: Activity completion acknowledgements ending in a permanent error after a retryable error
+- **Labels**: _(none)_
+- **Use**: Track uncertainty separately from confirmed infrastructure failures. Counted once per uncertain outcome, not per retry. An earlier attempt may have committed or the lock may have been lost; redelivery is not guaranteed.
 
 #### Sub-Orchestration Metrics
 

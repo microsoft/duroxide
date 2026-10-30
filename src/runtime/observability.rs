@@ -131,6 +131,7 @@ pub struct MetricsSnapshot {
     pub activity_success: u64,
     pub activity_app_errors: u64,
     pub activity_infra_errors: u64,
+    pub activity_ack_uncertain: u64,
     pub activity_config_errors: u64,
     pub activity_poison: u64,
     pub orch_dispatcher_items_fetched: u64,
@@ -157,6 +158,7 @@ pub struct MetricsProvider {
     activity_success_atomic: AtomicU64,
     activity_app_errors_atomic: AtomicU64,
     activity_infra_errors_atomic: AtomicU64,
+    activity_ack_uncertain_atomic: AtomicU64,
     activity_config_errors_atomic: AtomicU64,
     activity_poison_atomic: AtomicU64,
 
@@ -195,6 +197,7 @@ impl MetricsProvider {
             activity_success_atomic: AtomicU64::new(0),
             activity_app_errors_atomic: AtomicU64::new(0),
             activity_infra_errors_atomic: AtomicU64::new(0),
+            activity_ack_uncertain_atomic: AtomicU64::new(0),
             activity_config_errors_atomic: AtomicU64::new(0),
             activity_poison_atomic: AtomicU64::new(0),
             orch_dispatcher_items_fetched_atomic: AtomicU64::new(0),
@@ -452,6 +455,12 @@ impl MetricsProvider {
     }
 
     #[inline]
+    pub fn record_activity_ack_uncertain(&self) {
+        counter!("duroxide_activity_ack_uncertain_total").increment(1);
+        self.activity_ack_uncertain_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn record_activity_config_error(&self) {
         counter!("duroxide_activity_executions_total", "outcome" => "config_error").increment(1);
         counter!("duroxide_activity_configuration_errors_total").increment(1);
@@ -623,6 +632,7 @@ impl MetricsProvider {
             activity_success: self.activity_success_atomic.load(Ordering::Relaxed),
             activity_app_errors: self.activity_app_errors_atomic.load(Ordering::Relaxed),
             activity_infra_errors: self.activity_infra_errors_atomic.load(Ordering::Relaxed),
+            activity_ack_uncertain: self.activity_ack_uncertain_atomic.load(Ordering::Relaxed),
             activity_config_errors: self.activity_config_errors_atomic.load(Ordering::Relaxed),
             activity_poison: self.activity_poison_atomic.load(Ordering::Relaxed),
             orch_dispatcher_items_fetched: self.orch_dispatcher_items_fetched_atomic.load(Ordering::Relaxed),

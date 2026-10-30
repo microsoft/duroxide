@@ -941,9 +941,11 @@ delete-and-enqueue operation and lock validation described below.
 A permanent error after a retryable acknowledgement error is reported as an
 **uncertain outcome**, not as a confirmed activity infrastructure failure. The
 runtime cannot distinguish an earlier commit from lock loss or another permanent
-error. It does not attempt another abandonment or count an activity infrastructure
-error in this case; any uncommitted work remains eligible for redelivery after
-its lock expires.
+error. It increments `duroxide_activity_ack_uncertain_total` once for this outcome,
+without attempting abandonment or counting an activity infrastructure error.
+Redelivery is not guaranteed: the work item may already be gone. If uncommitted
+work remains in the queue, it can become eligible for redelivery after its lock
+expires.
 
 Acknowledgement retries do not extend the shutdown grace period. The default
 `shutdown(None)` grace is 1 second, shorter than the full 1.5-second backoff budget,

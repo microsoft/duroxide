@@ -822,8 +822,9 @@ async fn handle_activity_outcome(
                 worker_id = %ctx.worker_id,
                 ack_outcome = "uncertain",
                 error = %e,
-                "worker: acknowledgement outcome uncertain after retry; any uncommitted work will be redelivered after lock expiry"
+                "worker: acknowledgement outcome uncertain after retry; an earlier attempt may have committed or the lock may have been lost"
             );
+            rt.record_activity_ack_uncertain();
         }
         Err(ActivityAckError::Failed(e)) => {
             warn!(
