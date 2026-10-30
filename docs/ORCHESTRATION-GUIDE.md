@@ -275,6 +275,14 @@ task is dropped, including error, panic, and cancellation. If several limits
 apply, reserve all of them atomically or defer holding none. Detached work is
 not protected after the handler finishes.
 
+For typed input and output, use
+`register_typed_with_admission(name, admission, handler)`. The admission callback
+receives `&In`; the handler receives an owned `In` and returns `Result<Out, String>`.
+It uses the same codec as `register_typed`, including raw-string compatibility.
+Invalid input fails before either callback runs. Input is decoded for each
+admission check and again when invoking an admitted handler, so deserialization
+must be side-effect-free.
+
 `Defer(delay)` requires a positive delay. The runtime clamps it to 1 ms through
 24 hours (`ActivityAdmission::MAX_DEFER_DELAY`) before passing it to any provider.
 Deferral leaves the original activity pending in durable storage, frees the

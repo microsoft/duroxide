@@ -682,6 +682,31 @@ fn test_activity_register_typed() {
 }
 
 #[test]
+fn test_typed_admission_registration_validation() {
+    let admission = |_ctx: &ActivityContext, _input: &String| Ok(runtime::ActivityAdmission::admit(()));
+    let handler = |_ctx: ActivityContext, input: String| async move { Ok(input) };
+
+    let registry = ActivityRegistry::builder()
+        .register_typed_with_admission("typed-admission", admission, handler)
+        .build();
+    assert_eq!(
+        registry.resolve_version("typed-admission"),
+        Some(semver::Version::new(1, 0, 0))
+    );
+
+    let duplicate = ActivityRegistry::builder()
+        .register_typed("duplicate", handler)
+        .register_typed_with_admission("duplicate", admission, handler)
+        .build_result();
+    assert!(duplicate.err().unwrap().contains("duplicate activity registration"));
+
+    let reserved = ActivityRegistry::builder()
+        .register_typed_with_admission("__duroxide_syscall:typed", admission, handler)
+        .build_result();
+    assert!(reserved.err().unwrap().contains("uses reserved prefix"));
+}
+
+#[test]
 fn test_register_all() {
     let handler = |_ctx: OrchestrationContext, input: String| async move { Ok(format!("processed: {input}")) };
 

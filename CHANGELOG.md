@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Opt-in activity resource admission through `register_with_admission`.
+- Opt-in activity resource admission through `register_with_admission` and
+  `register_typed_with_admission` for typed input and output.
   Admission can retain a guard for the handler's lifetime or durably defer
   execution without occupying a worker slot or recording an activity result.
   Positive retry delays are clamped to 1 ms–24 hours. Only committed deferrals

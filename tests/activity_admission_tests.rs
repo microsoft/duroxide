@@ -37,6 +37,153 @@ fn orchestrations() -> OrchestrationRegistry {
         .build()
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TypedInput {
+    value: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TypedOutput {
+    doubled: u32,
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typed_admission_defers_then_invokes_with_decoded_input() {
+    let (store, _dir) = common::create_sqlite_store_disk().await;
+    let capacity = Arc::new(Semaphore::new(1));
+    let held = capacity.clone().acquire_owned().await.unwrap();
+    let admission_capacity = capacity.clone();
+    let handler_capacity = capacity.clone();
+    let (deferred, mut deferrals) = mpsc::unbounded_channel();
+    let activities = ActivityRegistry::builder()
+        .register_typed_with_admission(
+            "Limited",
+            move |ctx, input: &TypedInput| {
+                assert_eq!(ctx.instance_id(), "typed");
+                assert_eq!(input.value, 7);
+                match admission_capacity.clone().try_acquire_owned() {
+                    Ok(permit) => Ok(ActivityAdmission::admit(permit)),
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        deferred.send(()).unwrap();
+                        Ok(ActivityAdmission::Defer(Duration::from_millis(10)))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+            move |_ctx, input: TypedInput| {
+                let capacity = handler_capacity.clone();
+                async move {
+                    assert_eq!(capacity.available_permits(), 0);
+                    Ok(TypedOutput {
+                        doubled: input.value * 2,
+                    })
+                }
+            },
+        )
+        .build();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register("Run", |ctx: OrchestrationContext, _input: String| async move {
+            let output: TypedOutput = ctx.schedule_activity_typed("Limited", &TypedInput { value: 7 }).await?;
+            Ok(output.doubled.to_string())
+        })
+        .build();
+    let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations, options()).await;
+    let client = Client::new(store);
+    client.start_orchestration("typed", "Run", "").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), deferrals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(held);
+    let status = client.wait_for_orchestration("typed", Duration::from_secs(5)).await;
+    runtime.shutdown(None).await;
+    assert!(matches!(
+        status.unwrap(),
+        OrchestrationStatus::Completed { output, .. } if output == "14"
+    ));
+    assert_eq!(capacity.available_permits(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typed_admission_invalid_input_skips_both_callbacks() {
+    let (store, _dir) = common::create_sqlite_store_disk().await;
+    let activities = ActivityRegistry::builder()
+        .register_typed_with_admission::<TypedInput, TypedOutput, _, _, _>(
+            "Limited",
+            |_ctx, _input| panic!("admission must not run for invalid input"),
+            |_ctx, _input| async move { panic!("handler must not run for invalid input") },
+        )
+        .build();
+    let orchestrations = OrchestrationRegistry::builder()
+        .register("Run", |ctx: OrchestrationContext, input: String| async move {
+            ctx.schedule_activity("Limited", input).await
+        })
+        .build();
+    let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations, options()).await;
+    let client = Client::new(store);
+    for (instance, input) in [("malformed", "{"), ("wrong-type", r#"{"value":"not a number"}"#)] {
+        client.start_orchestration(instance, "Run", input).await.unwrap();
+        let status = client
+            .wait_for_orchestration(instance, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, OrchestrationStatus::Failed { ref details, .. } if details.display_message().contains("invalid type")),
+            "unexpected status: {status:?}"
+        );
+    }
+    runtime.shutdown(None).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typed_admission_preserves_raw_strings_and_releases_guard_on_encoding_error() {
+    let (store, _dir) = common::create_sqlite_store_disk().await;
+    let capacity = Arc::new(Semaphore::new(1));
+    let admission_capacity = capacity.clone();
+    let activities = ActivityRegistry::builder()
+        .register_typed_with_admission(
+            "String",
+            |_ctx, input: &String| {
+                assert_eq!(input, "payload");
+                Ok(ActivityAdmission::admit(()))
+            },
+            |_ctx, input: String| async move { Ok(input) },
+        )
+        .register_typed_with_admission(
+            "InvalidOutput",
+            move |_ctx, input: &String| {
+                assert_eq!(input, "payload");
+                admission_capacity
+                    .clone()
+                    .try_acquire_owned()
+                    .map(ActivityAdmission::admit)
+                    .map_err(|error| error.to_string())
+            },
+            |_ctx, _input: String| async move { Ok(std::collections::BTreeMap::from([((1, 2), 3)])) },
+        )
+        .build();
+    let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations(), options()).await;
+    let client = Client::new(store);
+    client.start_orchestration("string", "Run", "String").await.unwrap();
+    assert!(matches!(
+        client.wait_for_orchestration("string", Duration::from_secs(5)).await.unwrap(),
+        OrchestrationStatus::Completed { output, .. } if output == "payload"
+    ));
+    client
+        .start_orchestration("encoding-error", "Run", "InvalidOutput")
+        .await
+        .unwrap();
+    let status = client
+        .wait_for_orchestration("encoding-error", Duration::from_secs(5))
+        .await;
+    runtime.shutdown(None).await;
+    assert!(matches!(
+        status.unwrap(),
+        OrchestrationStatus::Failed { details, .. } if details.display_message().contains("key must be a string")
+    ));
+    assert_eq!(capacity.available_permits(), 1);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn deferred_admission_frees_worker_without_consuming_attempts_and_survives_restart() {
     let (store, _dir) = common::create_sqlite_store_disk().await;
