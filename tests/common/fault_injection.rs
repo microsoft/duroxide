@@ -51,6 +51,7 @@ pub struct PoisonInjectingProvider {
     work_abandons: std::sync::Mutex<Vec<(Option<Duration>, bool)>>,
     work_abandon_failures: AtomicU32,
     history_reads: AtomicU32,
+    execution_history_read_failures: AtomicU32,
     hide_management: AtomicBool,
 }
 
@@ -75,6 +76,7 @@ impl PoisonInjectingProvider {
             work_abandons: std::sync::Mutex::new(Vec::new()),
             work_abandon_failures: AtomicU32::new(0),
             history_reads: AtomicU32::new(0),
+            execution_history_read_failures: AtomicU32::new(0),
             hide_management: AtomicBool::new(false),
         }
     }
@@ -189,6 +191,10 @@ impl PoisonInjectingProvider {
 
     pub fn history_reads(&self) -> u32 {
         self.history_reads.load(Ordering::SeqCst)
+    }
+
+    pub fn fail_execution_history_reads(&self, count: u32) {
+        self.execution_history_read_failures.store(count, Ordering::SeqCst);
     }
 
     pub fn hide_management_capability(&self) {
@@ -415,6 +421,16 @@ impl Provider for PoisonInjectingProvider {
 
     async fn read_with_execution(&self, instance: &str, execution_id: u64) -> Result<Vec<Event>, ProviderError> {
         self.history_reads.fetch_add(1, Ordering::SeqCst);
+        if self
+            .execution_history_read_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ProviderError::retryable(
+                "read_with_execution",
+                "injected history read failure",
+            ));
+        }
         self.inner.read_with_execution(instance, execution_id).await
     }
 

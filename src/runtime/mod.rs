@@ -247,6 +247,8 @@ pub struct RuntimeOptions {
     ///
     /// After this many fetch attempts, the runtime will immediately fail
     /// the orchestration/activity with a Poison error instead of processing.
+    /// Fetches can consume this budget before a handler starts, including metadata
+    /// read failures and shutdown during an uncommitted admission deferral.
     ///
     /// Default: 10
     pub max_attempts: u32,
@@ -465,7 +467,9 @@ pub enum ActivityAdmission {
     /// Positive delays are clamped to one millisecond through [`Self::MAX_DEFER_DELAY`].
     /// Deferral releases the worker slot without recording a history event or
     /// consuming a fetch attempt once the deferral commits. Interrupted or failed
-    /// deferrals can still consume attempts. It does not retry an executed activity.
+    /// deferrals can still consume attempts and be redelivered on lock expiry
+    /// before the requested delay. An activity may become poison without starting
+    /// its handler. Deferral does not retry an executed activity.
     Defer(Duration),
 }
 

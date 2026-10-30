@@ -267,7 +267,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 #### Activity Execution Metrics
 
 **`duroxide_activity_admission_deferrals_total`** (Counter)
-- **Description**: Admission deferrals successfully committed to storage, including a successful fallback after an abandon error
+- **Description**: Admission deferrals whose abandon returned success, including a successful fallback after an abandon error
 - **Labels**: `activity_name`, `tag`
 - **Use**: Identify resource-constrained activities without counting deferrals as executions
 
@@ -275,7 +275,10 @@ The "Activity started" log appears only after admission succeeds. Admission
 rejections, panics, and zero retry delays count as `app_error`; storage failures
 while deferring count as `infra_error`, even if the fallback abandon succeeds.
 Uncommitted deferrals do not increment the deferral counter and may consume a
-fetch attempt on recovery.
+fetch attempt on recovery. A deferral that commits before shutdown or a lost
+response can restore its attempt without incrementing this counter. The counter
+is not a durable audit of all storage commits. Activity metadata-read failures
+before admission count as infrastructure errors, not deferrals.
 
 **`duroxide_activity_executions_total`** (Counter)
 - **Description**: Activity execution attempts

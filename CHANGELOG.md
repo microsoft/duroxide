@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   execution without occupying a worker slot or recording an activity result.
   Positive retry delays are clamped to 1 ms–24 hours. Only committed deferrals
   restore their fetch attempt; failed or interrupted deferrals may still use
-  the poison-message budget. Committed deferrals have a separate
-  `duroxide_activity_admission_deferrals_total` metric. (#74)
+  the poison-message budget, even when the handler never starts. Uncommitted
+  deferral delays may be lost on lock expiry. Successfully observed deferrals
+  have a separate `duroxide_activity_admission_deferrals_total` metric. (#74)
 
 ### Fixed
 

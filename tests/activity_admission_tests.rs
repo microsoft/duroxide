@@ -6,12 +6,13 @@
 mod common;
 
 use common::fault_injection::PoisonInjectingProvider;
+use common::long_polling::{LongPollingSqliteProvider, ProviderGate, ProviderOperation};
 use duroxide::providers::sqlite::SqliteProvider;
 use duroxide::providers::{Provider, WorkItem};
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{ActivityAdmission, Runtime, RuntimeOptions};
 use duroxide::{ActivityContext, Client, EventKind, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
@@ -442,6 +443,198 @@ fn admission_debug_does_not_require_a_debug_guard() {
         "Defer(1s)"
     );
     assert_eq!(ActivityAdmission::MAX_DEFER_DELAY, Duration::from_secs(24 * 60 * 60));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_before_deferral_commit_can_poison_without_a_handler_start() {
+    let (store, _dir) = common::create_sqlite_store_disk().await;
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let callback_admissions = admissions.clone();
+    let activities = ActivityRegistry::builder()
+        .register_with_admission(
+            "Limited",
+            move |_ctx, _input| {
+                callback_admissions.fetch_add(1, Ordering::SeqCst);
+                Ok(ActivityAdmission::Defer(Duration::from_secs(60)))
+            },
+            |_ctx, _input| async move { panic!("no handler should start") },
+        )
+        .build();
+    let opts = RuntimeOptions {
+        max_attempts: 2,
+        worker_lock_timeout: Duration::from_millis(100),
+        ..options()
+    };
+    let client = Client::new(store.clone());
+    client
+        .start_orchestration("stopped-deferral", "Run", "Limited")
+        .await
+        .unwrap();
+    for attempt in 1..=2 {
+        let gate = Arc::new(ProviderGate::default());
+        let provider = Arc::new(
+            LongPollingSqliteProvider::new(store.clone()).with_gate(ProviderOperation::BeforeWorkAbandon, gate.clone()),
+        );
+        let runtime = Runtime::start_with_options(provider, activities.clone(), orchestrations(), opts.clone()).await;
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_entered())
+            .await
+            .expect("deferral must reach its uncommitted abandon");
+        runtime.clone().shutdown(Some(0)).await;
+        assert_eq!(admissions.load(Ordering::SeqCst), attempt);
+        assert_eq!(runtime.metrics_snapshot().unwrap().activity_admission_deferrals, 0);
+        assert!(
+            !store
+                .read("stopped-deferral")
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    EventKind::ActivityCompleted { .. } | EventKind::ActivityFailed { .. }
+                ))
+        );
+    }
+
+    let runtime = Runtime::start_with_options(store, activities, orchestrations(), opts).await;
+    let status = client
+        .wait_for_orchestration("stopped-deferral", Duration::from_secs(5))
+        .await;
+    runtime.shutdown(None).await;
+    assert!(matches!(
+        status.unwrap(),
+        OrchestrationStatus::Failed {
+            details: duroxide::ErrorDetails::Poison {
+                attempt_count: 3,
+                max_attempts: 2,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(
+        admissions.load(Ordering::SeqCst),
+        2,
+        "poison is checked before admission"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_after_deferral_commit_preserves_attempt_refund_without_a_response() {
+    let (store, _dir) = common::create_sqlite_store_disk().await;
+    let gate = Arc::new(ProviderGate::default());
+    let provider = Arc::new(
+        LongPollingSqliteProvider::new(store.clone()).with_gate(ProviderOperation::AfterWorkAbandon, gate.clone()),
+    );
+    let admitted = Arc::new(AtomicBool::new(false));
+    let callback_admitted = admitted.clone();
+    let activities = ActivityRegistry::builder()
+        .register_with_admission(
+            "Limited",
+            move |_ctx, _input| {
+                Ok(if callback_admitted.load(Ordering::SeqCst) {
+                    ActivityAdmission::admit(())
+                } else {
+                    ActivityAdmission::Defer(Duration::from_millis(25))
+                })
+            },
+            |_ctx, input| async move { Ok(input) },
+        )
+        .build();
+    let runtime = Runtime::start_with_options(provider, activities.clone(), orchestrations(), options()).await;
+    let client = Client::new(store.clone());
+    client
+        .start_orchestration("committed-deferral", "Run", "Limited")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_until_entered())
+        .await
+        .expect("deferral must commit before its response is blocked");
+    runtime.clone().shutdown(Some(0)).await;
+    assert_eq!(runtime.metrics_snapshot().unwrap().activity_admission_deferrals, 0);
+    assert!(
+        !store
+            .read("committed-deferral")
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event.kind,
+                EventKind::ActivityCompleted { .. } | EventKind::ActivityFailed { .. }
+            ))
+    );
+
+    admitted.store(true, Ordering::SeqCst);
+    let runtime = Runtime::start_with_options(store, activities, orchestrations(), options()).await;
+    let status = client
+        .wait_for_orchestration("committed-deferral", Duration::from_secs(5))
+        .await;
+    runtime.shutdown(None).await;
+    assert!(matches!(
+        status.unwrap(),
+        OrchestrationStatus::Completed { output, .. } if output == "payload"
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_read_failure_consumes_an_attempt_before_admission() {
+    for max_attempts in [1, 2] {
+        let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+        let store = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
+        store.hide_management_capability();
+        store.fail_execution_history_reads(1);
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let callback_admissions = admissions.clone();
+        let activities = ActivityRegistry::builder()
+            .register_with_admission(
+                "Limited",
+                move |ctx, _input| {
+                    callback_admissions.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(ctx.orchestration_name(), "Run");
+                    assert_eq!(ctx.orchestration_version(), "1.0.0");
+                    Ok(ActivityAdmission::admit(()))
+                },
+                |_ctx, input| async move { Ok(input) },
+            )
+            .build();
+        let runtime = Runtime::start_with_options(
+            store.clone(),
+            activities,
+            orchestrations(),
+            RuntimeOptions {
+                max_attempts,
+                ..options()
+            },
+        )
+        .await;
+        let client = Client::new(sqlite);
+        client
+            .start_orchestration("metadata-failure", "Run", "Limited")
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("metadata-failure", Duration::from_secs(5))
+            .await
+            .unwrap();
+        runtime.clone().shutdown(None).await;
+        if max_attempts == 1 {
+            assert!(matches!(
+                status,
+                OrchestrationStatus::Failed {
+                    details: duroxide::ErrorDetails::Poison { attempt_count: 2, .. },
+                    ..
+                }
+            ));
+            assert_eq!(admissions.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(matches!(status, OrchestrationStatus::Completed { output, .. } if output == "payload"));
+            assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(store.work_abandons(), vec![(Some(Duration::from_millis(100)), false)]);
+        let metrics = runtime.metrics_snapshot().unwrap();
+        assert_eq!(metrics.activity_infra_errors, 1);
+        assert_eq!(metrics.activity_app_errors, 0);
+        assert_eq!(metrics.activity_admission_deferrals, 0);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

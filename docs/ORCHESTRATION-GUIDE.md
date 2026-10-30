@@ -289,14 +289,20 @@ Deferral leaves the original activity pending in durable storage, frees the
 worker to fetch other work, and does not record an activity result.
 A **committed** deferral restores its fetch attempt. Crashes, shutdown aborts,
 and failed abandons can still consume the poison-message attempt budget, so
-leave room for recovery attempts. Deferral is not a retry of an executed activity.
+leave room for recovery attempts. This is a fetch-attempt budget, not a count of
+handler starts: an activity can become poison without ever invoking its handler.
+Failures loading activity metadata before admission also consume attempts.
+Deferral is not a retry of an executed activity.
 
 An admission error, panic, or zero delay fails the activity rather than invoking
 the handler and is reported as an application error. Storage errors during
 deferral are infrastructure errors; an immediate fallback abandon preserves the
 same delay and attempt-restoration flag. If that also fails, recovery waits for
-the work lock to expire. Successfully committed deferrals increment
-`duroxide_activity_admission_deferrals_total`, not the activity execution counter.
+the work lock to expire, which can happen before the requested delay. A requested
+delay is not a durable "not before" guarantee until its abandon commits.
+Deferrals whose abandon returns success increment
+`duroxide_activity_admission_deferrals_total`, not the activity execution counter;
+a commit whose response is lost can restore the attempt without being counted.
 The "Activity started" log is emitted only after admission succeeds.
 
 Admission runs outside orchestration replay; completed results are unaffected.

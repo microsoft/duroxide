@@ -1448,12 +1448,19 @@ that was already ready, even after their delay expires. Order eligible rows by
 Apply the same ordering to session-aware and tag-filtered fetches. Admission
 deferral restores an attempt only when `abandon_work_item(..., true)` commits;
 failed or interrupted abandons can still consume attempts.
+If no abandon commits, lock expiry can make the item eligible before its requested
+retry delay. Conversely, if the commit succeeds but its response is lost, the
+stored delay and restored attempt survive even though the runtime did not observe
+success. Neither fetch counts nor a durable admission/start-intent write can prove
+that a handler actually began executing across a process crash.
 
 The worker uses `ProviderAdmin::get_instance_info` for lightweight activity
 metadata when it describes the activity's execution. Providers without that
 capability, and activities from an earlier execution, fall back to
 `read_with_execution`. Metadata must describe the requested execution, not a
-newer continue-as-new execution.
+newer continue-as-new execution. If the execution-history read fails, the worker
+abandons the fetch without restoring its attempt and does not invoke admission
+or the handler.
 
 ### ack_work_item() — Complete Implementation
 
