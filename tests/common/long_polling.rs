@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProviderOperation {
+    BeforeOrchestrationFetch,
     AfterOrchestrationFetch,
     AfterWorkFetch,
     BeforeOrchestrationAck,
@@ -134,6 +135,7 @@ impl Provider for LongPollingSqliteProvider {
         poll_timeout: Duration,
         _filter: Option<&DispatcherCapabilityFilter>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
+        self.wait_at(ProviderOperation::BeforeOrchestrationFetch).await;
         self.poll_until(poll_timeout, ProviderOperation::AfterOrchestrationFetch, || {
             self.inner.fetch_orchestration_item(lock_timeout, Duration::ZERO, None)
         })

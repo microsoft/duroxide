@@ -691,21 +691,20 @@ pub async fn test_multi_threaded_lock_expiration_recovery<F: ProviderFactory>(fa
     // Capture timeout value before spawning tasks
     let lock_timeout = factory.lock_timeout();
 
-    // Barrier ensures all threads start at exactly the same time,
-    // eliminating race conditions from connection pool cold-start latency
-    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    // Connection acquisition can exceed the expiry margin. Measure from the
+    // completed claim, not from when the competing tasks were spawned.
+    let (claimed_tx, claimed_rx) = tokio::sync::watch::channel(None);
 
     // Thread 1: Fetch and hold lock (don't ack) - simulates crashed worker
     let provider1 = provider.clone();
-    let barrier1 = barrier.clone();
     let handle1 = tokio::spawn(async move {
-        barrier1.wait().await;
         let (item, lock_token, _attempt_count) = provider1
             .fetch_orchestration_item(lock_timeout, Duration::ZERO, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(item.instance, "expiration-instance");
+        claimed_tx.send(Some(tokio::time::Instant::now())).unwrap();
         // Hold lock but don't ack - simulate crashed worker
         tokio::time::sleep(lock_timeout + Duration::from_millis(200)).await;
         lock_token
@@ -713,11 +712,10 @@ pub async fn test_multi_threaded_lock_expiration_recovery<F: ProviderFactory>(fa
 
     // Thread 2: Try to fetch while lock is held (should fail)
     let provider2 = provider.clone();
-    let barrier2 = barrier.clone();
+    let mut claimed2 = claimed_rx.clone();
     let handle2 = tokio::spawn(async move {
-        barrier2.wait().await;
-        // 200ms delay gives thread 1 time to acquire lock
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let claimed_at = claimed2.wait_for(Option::is_some).await.unwrap().unwrap();
+        tokio::time::sleep_until(claimed_at + Duration::from_millis(200)).await;
         let result = provider2
             .fetch_orchestration_item(lock_timeout, Duration::ZERO, None)
             .await
@@ -728,11 +726,10 @@ pub async fn test_multi_threaded_lock_expiration_recovery<F: ProviderFactory>(fa
 
     // Thread 3: Wait for expiration, then fetch (should succeed - lock recovery)
     let provider3 = provider.clone();
-    let barrier3 = barrier.clone();
+    let mut claimed3 = claimed_rx;
     let handle3 = tokio::spawn(async move {
-        barrier3.wait().await;
-        // Wait for lock to expire (lock_timeout + margin)
-        tokio::time::sleep(lock_timeout + Duration::from_millis(100)).await;
+        let claimed_at = claimed3.wait_for(Option::is_some).await.unwrap().unwrap();
+        tokio::time::sleep_until(claimed_at + lock_timeout + Duration::from_millis(100)).await;
         provider3
             .fetch_orchestration_item(lock_timeout, Duration::ZERO, None)
             .await
@@ -741,13 +738,13 @@ pub async fn test_multi_threaded_lock_expiration_recovery<F: ProviderFactory>(fa
 
     // Wait for all threads
     let (lock_token1, result2, result3) = futures::future::join3(handle1, handle2, handle3).await;
-    let _lock_token1 = lock_token1.unwrap();
+    let lock_token1 = lock_token1.unwrap();
     assert!(result2.unwrap().is_none());
     let (item3, lock_token3, _attempt_count3) = result3.unwrap().unwrap();
 
     // Thread 3 should have successfully acquired the lock after expiration
     assert_eq!(item3.instance, "expiration-instance");
-    assert_ne!(lock_token3, "expired-token"); // Should be a new token
+    assert_ne!(lock_token3, lock_token1);
 
     tracing::info!("✓ Test passed: multi-threaded lock expiration recovery verified");
 }
