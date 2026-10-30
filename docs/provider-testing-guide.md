@@ -422,6 +422,7 @@ use duroxide::providers::Provider;
 use duroxide::provider_validations::{
     ProviderFactory,
     // Atomicity tests
+    test_ack_work_item_duplicate_rejected,
     test_atomicity_failure_rollback,
     test_multi_operation_atomic_ack,
     // Locking tests
@@ -509,13 +510,14 @@ async fn test_my_provider_worker_queue_fifo_ordering() {
 
 ### What the Tests Validate
 
-The validation test suite includes **169 individual test functions** organized into 18 categories:
+The following categories summarize the reusable provider validation tests:
 
-1. **Atomicity Tests (4 tests)**
+1. **Atomicity Tests (5 tests)**
    - `test_atomicity_failure_rollback` - All-or-nothing commit semantics, rollback on failure
    - `test_multi_operation_atomic_ack` - Complex ack succeeds atomically
    - `test_lock_released_only_on_successful_ack` - Lock only released on success
    - `test_concurrent_ack_prevention` - Only one ack succeeds with same token
+   - `test_ack_work_item_duplicate_rejected` - Repeating `ack_work_item(Some(...))` with the same token fails non-retryably and leaves exactly one completion queued, without relying on replay deduplication
 
 2. **Error Handling Tests (5 tests)**
    - `test_invalid_lock_token_on_ack` - Invalid lock token rejection
@@ -1095,7 +1097,7 @@ This generates `stress-test-results.md` with:
 
 - **Test Implementation**: `src/provider_validation/` (individual test modules)
 - **Test API**: `src/provider_validations.rs` (test function exports)
-- **Example Usage**: `tests/sqlite_provider_validations.rs` (complete example with all 202 tests)
+- **Example Usage**: `tests/sqlite_provider_validations.rs` (complete example)
 - **Test Specification**: See individual test function documentation
 - **Provider Guide**: `docs/provider-implementation-guide.md`
 - **Built-in Providers**: `src/providers/sqlite.rs`

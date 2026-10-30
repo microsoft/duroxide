@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Activity acknowledgement retries** - Retry transient provider errors when
+  acknowledging activity success or application errors, up to five attempts with
+  lock renewal retained. This avoids unnecessary activity re-execution.
+  Cancellation acknowledgements remain single-attempt, and retries do not extend
+  the shutdown grace period. A permanent error after a transient acknowledgement
+  error is reported as an uncertain outcome rather than a confirmed infrastructure
+  failure; neither commit nor redelivery is guaranteed. Uncertain outcomes are
+  counted separately in `duroxide_activity_ack_uncertain_total`. (#72)
+
 ## [0.1.32] - 2026-10-11
 
 **Release:** <https://crates.io/crates/duroxide/0.1.32>

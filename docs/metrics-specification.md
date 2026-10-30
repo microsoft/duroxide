@@ -31,6 +31,7 @@ This document provides a complete reference of all metrics emitted by duroxide v
 | `duroxide_activity_duration_seconds` | Histogram | Activity | `activity_name`, `outcome`, `tag` | ✅ `test_activity_duration_tracking` | ✅ Code Review | Buckets: 0.01-300s |
 | `duroxide_activity_infrastructure_errors_total` | Counter | Activity | `activity_name` | ✅ `metrics_capture_activity_and_orchestration_outcomes` | ✅ Code Review | Infra-specific errors |
 | `duroxide_activity_configuration_errors_total` | Counter | Activity | `activity_name` | ✅ `test_error_classification_metrics` | ✅ Code Review | Config-specific errors |
+| `duroxide_activity_ack_uncertain_total` | Counter | Activity | _(none)_ | ✅ `test_metrics_activity_ack_uncertain` | ✅ Emitted | Counts uncertain acknowledgement outcomes, not confirmed failures |
 | **Poison Message** |
 | `duroxide_orchestration_poison_total` | Counter | Poison | _(none)_ | ✅ `test_poison_message_metrics` | ✅ Code Review | Orchestrations exceeding max_attempts |
 | `duroxide_activity_poison_total` | Counter | Poison | _(none)_ | ✅ `test_poison_message_metrics` | ✅ Code Review | Activities exceeding max_attempts |
@@ -458,6 +459,22 @@ topk(5,
 **Purpose:** Track deployment/configuration issues separately
 
 **Note:** Unregistered activities no longer result in immediate config errors. They use exponential backoff and eventually fail as poison messages, which supports rolling deployments where activities may not be registered on all nodes yet.
+
+---
+
+### 2.5 `duroxide_activity_ack_uncertain_total` (Counter)
+
+**Description:** Activity completion acknowledgements ending in a permanent error
+after a retryable error. Incremented once per uncertain outcome, not per retry.
+
+**Labels:** _(none)_
+
+**Purpose:** Track uncertain acknowledgements separately from confirmed activity
+infrastructure failures. An earlier attempt may have committed or the lock may
+have been lost; redelivery is not guaranteed. This counter does not increment
+`duroxide_activity_executions_total` or `duroxide_activity_infrastructure_errors_total`.
+Read the in-process count through `MetricsProvider::activity_ack_uncertain()`;
+the public fields of `MetricsSnapshot` are unchanged.
 
 ---
 

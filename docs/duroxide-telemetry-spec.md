@@ -184,6 +184,22 @@ by (activity_name)
 
 ---
 
+#### `duroxide_activity_ack_uncertain_total` (Counter)
+
+**Description:** Activity completion acknowledgements ending in a permanent error
+after a retryable error. Incremented once per uncertain outcome, not per retry.
+
+**Labels:** _(none)_
+
+**Use Case:** Track uncertain acknowledgements separately from confirmed
+infrastructure failures. An earlier attempt may have committed or the lock may
+have been lost; redelivery is not guaranteed. Successful retries and confirmed
+acknowledgement failures do not increment this counter.
+
+Read the in-process count through `MetricsProvider::activity_ack_uncertain()`.
+
+---
+
 ### 1.3 Provider (Storage) Metrics
 
 #### `duroxide_provider_operation_duration_seconds` (Histogram)

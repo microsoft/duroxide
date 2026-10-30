@@ -1804,6 +1804,9 @@ pub trait Provider: Any + Send + Sync {
     /// - The activity was cancelled (the backing entry was removed/invalidated by orchestration)
     /// - The lock was stolen by another worker (lock expired and work-item was re-fetched/completed)
     /// - The lock expired (worker took too long without renewing)
+    /// - An earlier acknowledgement committed, but its response was lost
+    ///
+    /// Repeating an acknowledgement with the same token MUST NOT enqueue another completion.
     ///
     /// The worker dispatcher uses this error to detect cancellation races and log appropriately.
     ///

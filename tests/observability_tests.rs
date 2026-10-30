@@ -1516,6 +1516,64 @@ async fn test_metrics_activity_outcomes() {
     assert_eq!(metrics.snapshot().activity_config_errors, 1);
 }
 
+#[test]
+fn test_metrics_snapshot_struct_literal_compatibility() {
+    use duroxide::runtime::observability::MetricsSnapshot;
+
+    // Keep this exhaustive: adding public fields breaks downstream struct literals.
+    let snapshot = MetricsSnapshot {
+        orch_starts: 0,
+        orch_completions: 0,
+        orch_failures: 0,
+        orch_application_errors: 0,
+        orch_infrastructure_errors: 0,
+        orch_configuration_errors: 0,
+        orch_poison: 0,
+        activity_success: 0,
+        activity_app_errors: 0,
+        activity_infra_errors: 0,
+        activity_config_errors: 0,
+        activity_poison: 0,
+        orch_dispatcher_items_fetched: 0,
+        worker_dispatcher_items_fetched: 0,
+        orch_continue_as_new: 0,
+        suborchestration_calls: 0,
+        provider_errors: 0,
+    };
+    assert_eq!(snapshot, MetricsSnapshot::default());
+}
+
+#[test]
+fn test_metrics_activity_ack_uncertain() {
+    use duroxide::runtime::observability::{MetricsProvider, ObservabilityConfig};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let metrics = MetricsProvider::new(&ObservabilityConfig::default()).unwrap();
+    let recorder = DebuggingRecorder::new();
+    let expected = metrics.snapshot();
+    assert_eq!(metrics.activity_ack_uncertain(), 0);
+
+    metrics::with_local_recorder(&recorder, || {
+        metrics.record_activity_ack_uncertain();
+        metrics.record_activity_ack_uncertain();
+    });
+
+    assert_eq!(metrics.activity_ack_uncertain(), 2);
+    assert_eq!(
+        metrics.snapshot(),
+        expected,
+        "Other activity outcome counters must not change"
+    );
+
+    let recorded = recorder.snapshotter().snapshot().into_vec();
+    let [(key, _, _, value)] = recorded.as_slice() else {
+        panic!("Only the dedicated uncertainty counter should be emitted: {recorded:?}");
+    };
+    assert_eq!(key.key().name(), "duroxide_activity_ack_uncertain_total");
+    assert_eq!(key.key().labels().count(), 0);
+    assert_eq!(value, &DebugValue::Counter(2));
+}
+
 /// Test: MetricsProvider poison message tracking
 #[tokio::test]
 async fn test_metrics_poison_messages() {

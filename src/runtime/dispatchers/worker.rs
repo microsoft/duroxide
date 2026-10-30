@@ -31,7 +31,7 @@
 //! 3. The worker dispatcher waits up to the grace period for the activity to complete
 //! 4. If the activity doesn't complete, it's aborted and the work item is dropped
 
-use crate::providers::WorkItem;
+use crate::providers::{ProviderError, WorkItem};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -123,6 +123,11 @@ enum ActivityOutcome {
     AppError,
     /// Orchestration was cancelled, activity result dropped
     Cancelled,
+}
+
+enum ActivityAckError {
+    Failed(ProviderError),
+    Uncertain(ProviderError),
 }
 
 /// Context for processing a single activity work item.
@@ -555,7 +560,7 @@ async fn run_activity_with_cancellation(
     cancellation_token: CancellationToken,
     _manager_handle: AbortOnDropHandle<()>,
     start_time: std::time::Instant,
-) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
+) -> (Result<(), ActivityAckError>, ActivityOutcome) {
     let input = ctx.input.clone();
     // Abort-on-drop so the invocation cannot outlive this task if the worker is
     // aborted mid-activity during shutdown.
@@ -604,10 +609,10 @@ async fn run_activity_with_cancellation(
                 let _ = activity_handle.await;
             }
 
-            // Record metrics and ack (drop result since orchestration is terminal)
             let duration_seconds = start_time.elapsed().as_secs_f64();
             rt.record_activity_execution(&ctx.activity_name, "cancelled", duration_seconds, 0, ctx.tag.as_deref());
 
+            // Renewal errors can falsely signal cancellation; retrying ack(None) could delete live work.
             let result = rt.history_store.ack_work_item(&ctx.lock_token, None).await;
             if let Err(e) = &result {
                 tracing::warn!(
@@ -618,7 +623,7 @@ async fn run_activity_with_cancellation(
                     "Failed to ack cancelled activity work item"
                 );
             }
-            (result, ActivityOutcome::Cancelled)
+            (result.map_err(ActivityAckError::Failed), ActivityOutcome::Cancelled)
         }
     }
 }
@@ -627,13 +632,61 @@ async fn run_activity_with_cancellation(
 // Activity Completion Handlers
 // ============================================================================
 
+/// Maximum number of attempts when acking an activity completion.
+const MAX_ACK_ATTEMPTS: u32 = 5;
+
+/// Ack an activity completion, retrying transient provider failures with exponential backoff.
+///
+/// Activities have at-least-once semantics, so an ack failure is not a correctness
+/// violation — but it is expensive: the caller abandons the work item, the activity is
+/// redelivered, and the handler runs again. Retryable provider errors (database lock
+/// contention, transient connection failures) usually clear within milliseconds, so
+/// retrying here avoids most redundant re-executions. Unlike fetch retries, these
+/// retries are bounded and retain the activity's lock renewal.
+async fn ack_activity_completion_with_retry(
+    rt: &Arc<Runtime>,
+    ctx: &ActivityWorkContext,
+    completion: WorkItem,
+) -> Result<(), ActivityAckError> {
+    let mut attempt = 1;
+    loop {
+        match rt
+            .history_store
+            .ack_work_item(&ctx.lock_token, Some(completion.clone()))
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if e.is_retryable() && attempt < MAX_ACK_ATTEMPTS => {
+                let backoff_ms = 50 * 2_u64.pow(attempt);
+                warn!(
+                    instance = %ctx.instance,
+                    execution_id = ctx.execution_id,
+                    activity_id = ctx.activity_id,
+                    worker_id = %ctx.worker_id,
+                    attempt = attempt,
+                    max_attempts = MAX_ACK_ATTEMPTS,
+                    error = %e,
+                    "worker: ack failed (retryable), backing off {}ms",
+                    backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                attempt += 1;
+            }
+            // A missing token after a transient error can mean the earlier ack committed.
+            // ProviderError cannot distinguish that from lock loss or other permanent errors.
+            Err(e) if !e.is_retryable() && attempt > 1 => return Err(ActivityAckError::Uncertain(e)),
+            Err(e) => return Err(ActivityAckError::Failed(e)),
+        }
+    }
+}
+
 /// Handle successful activity completion.
 async fn handle_activity_success(
     rt: &Arc<Runtime>,
     ctx: &ActivityWorkContext,
     result: String,
     start_time: std::time::Instant,
-) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
+) -> (Result<(), ActivityAckError>, ActivityOutcome) {
     let duration_ms = start_time.elapsed().as_millis() as u64;
     let duration_seconds = duration_ms as f64 / 1000.0;
 
@@ -653,18 +706,17 @@ async fn handle_activity_success(
 
     rt.record_activity_execution(&ctx.activity_name, "success", duration_seconds, 0, ctx.tag.as_deref());
 
-    let ack_result = rt
-        .history_store
-        .ack_work_item(
-            &ctx.lock_token,
-            Some(WorkItem::ActivityCompleted {
-                instance: ctx.instance.clone(),
-                execution_id: ctx.execution_id,
-                id: ctx.activity_id,
-                result,
-            }),
-        )
-        .await;
+    let ack_result = ack_activity_completion_with_retry(
+        rt,
+        ctx,
+        WorkItem::ActivityCompleted {
+            instance: ctx.instance.clone(),
+            execution_id: ctx.execution_id,
+            id: ctx.activity_id,
+            result,
+        },
+    )
+    .await;
 
     (ack_result, ActivityOutcome::Success)
 }
@@ -675,7 +727,7 @@ async fn handle_activity_error(
     ctx: &ActivityWorkContext,
     error: String,
     start_time: std::time::Instant,
-) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
+) -> (Result<(), ActivityAckError>, ActivityOutcome) {
     let duration_ms = start_time.elapsed().as_millis() as u64;
     let duration_seconds = duration_ms as f64 / 1000.0;
 
@@ -695,22 +747,21 @@ async fn handle_activity_error(
 
     rt.record_activity_execution(&ctx.activity_name, "app_error", duration_seconds, 0, ctx.tag.as_deref());
 
-    let ack_result = rt
-        .history_store
-        .ack_work_item(
-            &ctx.lock_token,
-            Some(WorkItem::ActivityFailed {
-                instance: ctx.instance.clone(),
-                execution_id: ctx.execution_id,
-                id: ctx.activity_id,
-                details: crate::ErrorDetails::Application {
-                    kind: crate::AppErrorKind::ActivityFailed,
-                    message: error,
-                    retryable: false,
-                },
-            }),
-        )
-        .await;
+    let ack_result = ack_activity_completion_with_retry(
+        rt,
+        ctx,
+        WorkItem::ActivityFailed {
+            instance: ctx.instance.clone(),
+            execution_id: ctx.execution_id,
+            id: ctx.activity_id,
+            details: crate::ErrorDetails::Application {
+                kind: crate::AppErrorKind::ActivityFailed,
+                message: error,
+                retryable: false,
+            },
+        },
+    )
+    .await;
 
     (ack_result, ActivityOutcome::AppError)
 }
@@ -754,7 +805,7 @@ async fn abandon_unregistered_activity(rt: &Arc<Runtime>, ctx: &ActivityWorkCont
 async fn handle_activity_outcome(
     rt: &Arc<Runtime>,
     ctx: &ActivityWorkContext,
-    ack_result: Result<(), crate::providers::ProviderError>,
+    ack_result: Result<(), ActivityAckError>,
     outcome: ActivityOutcome,
 ) {
     match ack_result {
@@ -763,7 +814,19 @@ async fn handle_activity_outcome(
             ActivityOutcome::AppError => rt.record_activity_app_error(),
             ActivityOutcome::Cancelled => {}
         },
-        Err(e) => {
+        Err(ActivityAckError::Uncertain(e)) => {
+            warn!(
+                instance = %ctx.instance,
+                execution_id = ctx.execution_id,
+                activity_id = ctx.activity_id,
+                worker_id = %ctx.worker_id,
+                ack_outcome = "uncertain",
+                error = %e,
+                "worker: acknowledgement outcome uncertain after retry; an earlier attempt may have committed or the lock may have been lost"
+            );
+            rt.record_activity_ack_uncertain();
+        }
+        Err(ActivityAckError::Failed(e)) => {
             warn!(
                 instance = %ctx.instance,
                 execution_id = ctx.execution_id,
