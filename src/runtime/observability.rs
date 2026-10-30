@@ -127,6 +127,7 @@ pub struct MetricsSnapshot {
     pub orch_application_errors: u64,
     pub orch_infrastructure_errors: u64,
     pub orch_configuration_errors: u64,
+    /// Confirmed poison acknowledgements.
     pub orch_poison: u64,
     pub activity_success: u64,
     pub activity_app_errors: u64,
@@ -154,6 +155,7 @@ pub struct MetricsProvider {
     orch_infrastructure_errors_atomic: AtomicU64,
     orch_configuration_errors_atomic: AtomicU64,
     orch_poison_atomic: AtomicU64,
+    orch_poison_failed_atomic: AtomicU64,
     activity_success_atomic: AtomicU64,
     activity_app_errors_atomic: AtomicU64,
     activity_infra_errors_atomic: AtomicU64,
@@ -192,6 +194,7 @@ impl MetricsProvider {
             orch_infrastructure_errors_atomic: AtomicU64::new(0),
             orch_configuration_errors_atomic: AtomicU64::new(0),
             orch_poison_atomic: AtomicU64::new(0),
+            orch_poison_failed_atomic: AtomicU64::new(0),
             activity_success_atomic: AtomicU64::new(0),
             activity_app_errors_atomic: AtomicU64::new(0),
             activity_infra_errors_atomic: AtomicU64::new(0),
@@ -458,10 +461,20 @@ impl MetricsProvider {
         self.activity_config_errors_atomic.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a confirmed orchestration poison acknowledgement.
     #[inline]
     pub fn record_orchestration_poison(&self) {
         self.orch_poison_atomic.fetch_add(1, Ordering::Relaxed);
         counter!("duroxide_orchestration_poison_total").increment(1);
+    }
+
+    /// Record a poison acknowledgement that returned an error after runtime retries.
+    ///
+    /// The disposition may still have committed, for example if its response was lost.
+    #[inline]
+    pub fn record_orchestration_poison_failed(&self) {
+        self.orch_poison_failed_atomic.fetch_add(1, Ordering::Relaxed);
+        counter!("duroxide_orchestration_poison_failed_total").increment(1);
     }
 
     #[inline]
@@ -610,6 +623,14 @@ impl MetricsProvider {
     // ========================================================================
     // Snapshot for testing
     // ========================================================================
+
+    /// Number of poison acknowledgements that returned an error after runtime retries.
+    ///
+    /// The disposition may still have committed. This count is exposed separately
+    /// to preserve source compatibility for callers constructing [`MetricsSnapshot`].
+    pub fn orchestration_poison_failed(&self) -> u64 {
+        self.orch_poison_failed_atomic.load(Ordering::Relaxed)
+    }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
