@@ -195,7 +195,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_active_orchestrations` | Gauge | Orchestration | _(none)_ | **Current** active count |
 | **Activity Execution** |
 | `duroxide_activity_executions_total` | Counter | Activity | activity_name, outcome, retry_attempt | Track success/failure rates |
-| `duroxide_activity_admission_deferrals_total` | Counter | Activity | activity_name, tag | Track committed resource-admission deferrals |
+| `duroxide_activity_admission_deferrals_total` | Counter | Activity | activity_name, tag | Track admission deferrals whose abandon returned success |
 | `duroxide_activity_duration_seconds` | Histogram | Activity | activity_name, outcome | Activity latency p95/p99 |
 | `duroxide_activity_errors_total` | Counter | Activity | activity_name, error_type, retryable | Detailed error tracking |
 | **Sub-Orchestration** |

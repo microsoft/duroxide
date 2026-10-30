@@ -283,8 +283,26 @@ Invalid input fails before either callback runs. Input is decoded for each
 admission check and again when invoking an admitted handler, so deserialization
 must be side-effect-free.
 
+Using the imports above, the same semaphore limit can protect a typed activity:
+
+```rust
+let capacity = Arc::new(Semaphore::new(4));
+let activities = ActivityRegistry::builder().register_typed_with_admission(
+    "Limited",
+    move |_ctx, _input: &u32| match capacity.clone().try_acquire_owned() {
+        Ok(permit) => Ok(ActivityAdmission::admit(permit)),
+        Err(TryAcquireError::NoPermits) => Ok(ActivityAdmission::Defer(Duration::from_millis(100))),
+        Err(error) => Err(error.to_string()),
+    },
+    |_ctx, input: u32| async move { Ok(input) },
+).build();
+```
+
 `Defer(delay)` requires a positive delay. The runtime clamps it to 1 ms through
 24 hours (`ActivityAdmission::MAX_DEFER_DELAY`) before passing it to any provider.
+Computed delays such as `deadline.saturating_duration_since(now)` can become zero
+and fail that activity attempt; use `.max(Duration::from_millis(1))` when zero
+should mean retry soon.
 Deferral leaves the original activity pending in durable storage, frees the
 worker to fetch other work, and does not record an activity result.
 A **committed** deferral restores its fetch attempt. Crashes, shutdown aborts,
@@ -302,6 +320,9 @@ permanent rejection, while panic and zero delay indicate faulty admission logic.
 Automatically retrying those failures as infrastructure backpressure could
 repeat invalid input or broken configuration indefinitely. The orchestration
 can catch the activity failure and choose its own recovery.
+`schedule_activity_with_retry` receives only an error message, so it retries
+admission failures regardless of `retryable: false`, scheduling fresh attempts
+and rerunning admission up to the policy's attempt limit.
 
 Storage errors during deferral are infrastructure errors; an immediate fallback
 abandon preserves the same delay and attempt-restoration flag. If that also
