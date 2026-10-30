@@ -29,6 +29,8 @@ pub enum ProviderOperation {
     AfterOrchestrationAck,
     BeforeWorkAck,
     AfterWorkAck,
+    BeforeWorkAbandon,
+    AfterWorkAbandon,
     BeforeOrchestrationRenewal,
     BeforeWorkRenewal,
 }
@@ -232,7 +234,10 @@ impl Provider for LongPollingSqliteProvider {
         delay: Option<Duration>,
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
-        self.inner.abandon_work_item(token, delay, ignore_attempt).await
+        self.wait_at(ProviderOperation::BeforeWorkAbandon).await;
+        self.inner.abandon_work_item(token, delay, ignore_attempt).await?;
+        self.wait_at(ProviderOperation::AfterWorkAbandon).await;
+        Ok(())
     }
 
     async fn renew_session_lock(

@@ -498,6 +498,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sqlite_worker_deferred_item_does_not_starve_ready_work() {
+        duroxide::provider_validations::test_worker_deferred_item_does_not_starve_ready_work(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
     async fn test_sqlite_worker_peek_lock_semantics() {
         test_worker_peek_lock_semantics(&SqliteTestFactory).await;
     }

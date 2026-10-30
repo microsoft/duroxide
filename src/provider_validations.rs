@@ -111,6 +111,7 @@ pub use crate::provider_validation::race_replay;
 /// - `test_lost_lock_token_handling` - Verify locked items become available after expiration
 /// - `test_worker_item_immediate_visibility` - Verify newly enqueued items are immediately visible
 /// - `test_worker_delayed_visibility_skips_future_items` - Verify items with future visible_at are skipped
+/// - `test_worker_deferred_item_does_not_starve_ready_work` - Verify expired deferrals yield to already-ready work
 /// - `test_orphan_queue_messages_dropped` - Verify QueueMessage for non-existent instance is dropped; kept for existing instance
 ///
 /// **Management Tests:**
@@ -178,8 +179,9 @@ pub use crate::provider_validation::multi_execution::{
 #[cfg(feature = "provider-test")]
 pub use crate::provider_validation::queue_semantics::{
     test_lost_lock_token_handling, test_orphan_queue_messages_dropped, test_timer_delayed_visibility,
-    test_worker_ack_atomicity, test_worker_delayed_visibility_skips_future_items,
-    test_worker_item_immediate_visibility, test_worker_peek_lock_semantics, test_worker_queue_fifo_ordering,
+    test_worker_ack_atomicity, test_worker_deferred_item_does_not_starve_ready_work,
+    test_worker_delayed_visibility_skips_future_items, test_worker_item_immediate_visibility,
+    test_worker_peek_lock_semantics, test_worker_queue_fifo_ordering,
 };
 
 #[cfg(feature = "provider-test")]

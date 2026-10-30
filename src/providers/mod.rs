@@ -1606,13 +1606,14 @@ pub trait Provider: Any + Send + Sync {
     /// The runtime hot path uses `fetch_orchestration_item()` which loads history internally.
     async fn read(&self, instance: &str) -> Result<Vec<Event>, ProviderError>;
 
-    // ===== History Reading and Testing Methods (NOT used by runtime hot path) =====
-    // These methods are NOT called by the main runtime during orchestration execution.
-    // They are used by testing, validation suites, client APIs, and debugging tools.
+    // ===== History Reading and Testing Methods =====
+    // Execution-history reads also support activity metadata fallback.
 
     /// Read the full event history for a specific execution within an instance.
     ///
-    /// **NOT called in runtime hot path.** Used by testing, validation suites, and debugging tools.
+    /// Also used for activity metadata when management metadata is unavailable or
+    /// describes a different execution. In that case the worker reads the full
+    /// history on every attempt, including repeated admission deferrals.
     ///
     /// # Parameters
     ///
@@ -1726,6 +1727,12 @@ pub trait Provider: Any + Send + Sync {
     /// 1. Find an available task in the worker queue (visible_at <= now, not locked)
     /// 2. Lock it with a unique token
     /// 3. Return item + token (item stays in queue until ack)
+    ///
+    /// # Ordering
+    ///
+    /// Deferred items must not repeatedly overtake already-ready work after their
+    /// visibility delay expires. Order eligible items by `visible_at`, then queue ID,
+    /// or use an equivalent requeue policy. This also applies to session and tagged work.
     ///
     /// # Parameters
     ///

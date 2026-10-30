@@ -184,6 +184,31 @@ by (activity_name)
 
 ---
 
+#### `duroxide_activity_admission_deferrals_total` (Counter)
+
+**Description:** Admission deferrals whose abandon returned success, including
+a successful fallback after an abandon error.
+
+**Labels:**
+- `activity_name` - Registered activity name
+- `tag` - Routing tag, or `"default"` for untagged work
+
+**Semantics:** This counts observed successful deferrals, not handler executions.
+Deferrals do not contribute activity execution counts or duration samples.
+A commit with a lost response may not be counted. Abandon failures count as
+`infra_error`; admission `Err`, panic, and zero delay produce terminal
+`ActivityFailed` application results and count as `app_error`.
+
+The in-process accessor is `MetricsProvider::activity_admission_deferrals()`,
+without adding fields to the existing public `MetricsSnapshot`.
+
+**Example:**
+```promql
+sum by (activity_name, tag) (rate(duroxide_activity_admission_deferrals_total[5m]))
+```
+
+---
+
 ### 1.3 Provider (Storage) Metrics
 
 #### `duroxide_provider_operation_duration_seconds` (Histogram)
@@ -195,6 +220,11 @@ by (activity_name)
 **Buckets:** `[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5]` seconds
 
 **Use Case:** Database performance monitoring, identify slow queries
+
+Activity metadata is included with `operation="get_instance_info"` for the
+lightweight lookup and `operation="read_with_execution"` for the history
+fallback, each with `status="success"` or `"error"`. Errors also increment
+`duroxide_provider_errors_total` with the same operation label.
 
 **Example:**
 ```promql
