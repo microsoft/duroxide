@@ -234,10 +234,6 @@ async fn activity_duplicate_completion_workitems_dedup() {
 
     rt.shutdown(None).await;
 }
-// merged file: imports above already declared; avoid reimporting
-
-// Simulate crash windows by interleaving dequeue and persistence.
-// We approximate by injecting duplicates around the same window; idempotence + peek-lock should ensure correctness.
 
 #[tokio::test]
 async fn crash_after_dequeue_before_append_completion() {

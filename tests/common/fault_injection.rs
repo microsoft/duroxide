@@ -55,6 +55,8 @@ pub struct PoisonInjectingProvider {
     hide_management: AtomicBool,
     reject_orchestration_acks: AtomicBool,
     fail_next_orchestration_ack_after_commit: AtomicBool,
+    retryable_orchestration_ack_failures_remaining: AtomicU32,
+    orchestration_ack_calls: AtomicU32,
 }
 
 impl PoisonInjectingProvider {
@@ -82,6 +84,8 @@ impl PoisonInjectingProvider {
             hide_management: AtomicBool::new(false),
             reject_orchestration_acks: AtomicBool::new(false),
             fail_next_orchestration_ack_after_commit: AtomicBool::new(false),
+            retryable_orchestration_ack_failures_remaining: AtomicU32::new(0),
+            orchestration_ack_calls: AtomicU32::new(0),
         }
     }
 
@@ -94,6 +98,16 @@ impl PoisonInjectingProvider {
     pub fn fail_next_orchestration_ack_after_commit(&self) {
         self.fail_next_orchestration_ack_after_commit
             .store(true, Ordering::SeqCst);
+    }
+
+    /// Reject the next `count` acknowledgements with a retryable error before committing.
+    pub fn fail_orchestration_acks_retryably(&self, count: u32) {
+        self.retryable_orchestration_ack_failures_remaining
+            .store(count, Ordering::SeqCst);
+    }
+
+    pub fn orchestration_ack_calls(&self) -> u32 {
+        self.orchestration_ack_calls.load(Ordering::SeqCst)
     }
 
     /// Next orchestration fetch will return this attempt_count instead of real one.
@@ -154,6 +168,8 @@ impl PoisonInjectingProvider {
         self.reject_orchestration_acks.store(false, Ordering::SeqCst);
         self.fail_next_orchestration_ack_after_commit
             .store(false, Ordering::SeqCst);
+        self.retryable_orchestration_ack_failures_remaining
+            .store(0, Ordering::SeqCst);
     }
 
     pub fn fail_orchestration_abandon_persistently(&self) {
@@ -302,6 +318,17 @@ impl Provider for PoisonInjectingProvider {
         metadata: ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
+        self.orchestration_ack_calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .retryable_orchestration_ack_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ProviderError::retryable(
+                "ack_orchestration_item",
+                "injected retryable turn-ack failure",
+            ));
+        }
         if self.reject_orchestration_acks.load(Ordering::SeqCst) {
             return Err(ProviderError::permanent("ack_orchestration_item", "Invalid lock token"));
         }

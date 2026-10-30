@@ -226,6 +226,67 @@ async fn lost_corrupted_history_poison_ack_response_does_not_prove_the_dispositi
     check_disposition(true, AckOutcome::ResponseLost).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn retryable_poison_ack_error_followed_by_success_is_counted_once() {
+    let (events, _capture) = install_tracing_capture();
+    let (sqlite, provider) = setup(false).await;
+    provider.fail_orchestration_acks_retryably(1);
+    let rt = start(provider.clone()).await;
+
+    wait_for_dispositions(&rt, 1, 0).await;
+    rt.clone().shutdown(None).await;
+
+    assert_eq!(provider.orchestration_ack_calls(), 2);
+    assert_eq!(provider.orchestration_fetches(INSTANCE).len(), 1);
+    assert_eq!(rt.metrics_snapshot().unwrap().orch_poison, 1);
+    assert_eq!(poison_failures(&rt), 0);
+    assert_stored_disposition(&sqlite, true).await;
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| event.level != tracing::Level::ERROR),
+        "a successful acknowledgement retry must not emit an error"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exhausted_poison_ack_retries_are_counted_once_before_redelivery() {
+    let (events, _capture) = install_tracing_capture();
+    let (sqlite, provider) = setup(false).await;
+    // The initial acknowledgement and all five retries fail; redelivery can then succeed.
+    provider.fail_orchestration_acks_retryably(6);
+    let rt = start(provider.clone()).await;
+
+    wait_for_dispositions(&rt, 1, 1).await;
+    rt.clone().shutdown(None).await;
+
+    assert_eq!(provider.orchestration_ack_calls(), 7);
+    let fetches = provider.orchestration_fetches(INSTANCE);
+    assert_eq!(fetches.len(), 2);
+    assert_ne!(fetches[0].0, fetches[1].0, "redelivery must use a fresh lease");
+    assert_eq!(fetches[1].1, fetches[0].1 + 1);
+    assert_eq!(rt.metrics_snapshot().unwrap().orch_poison, 1);
+    assert_eq!(poison_failures(&rt), 1);
+    assert_stored_disposition(&sqlite, true).await;
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.level == tracing::Level::ERROR)
+            .count(),
+        1
+    );
+    assert_failure_logs(
+        &events,
+        1,
+        INJECTED_ATTEMPT_COUNT,
+        MAX_ATTEMPTS,
+        "ack_orchestration_item: injected retryable turn-ack failure",
+    );
+}
+
 async fn check_recovery(corrupted_history: bool) {
     let (events, _capture) = install_tracing_capture();
     let (sqlite, provider) = setup(corrupted_history).await;
