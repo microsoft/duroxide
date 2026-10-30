@@ -39,6 +39,60 @@ async fn create_sqlite_store_named(name: &str) -> (Arc<dyn Provider>, TempDir, S
 // ============================================================================
 
 #[tokio::test]
+async fn test_worker_ready_index_on_file_backed_create_and_upgrade() {
+    for upgrade in [false, true] {
+        let (mut store, _dir, url) = create_sqlite_store_named("worker-ready-index").await;
+        let item = WorkItem::ActivityExecute {
+            instance: "index-migration".to_string(),
+            execution_id: 1,
+            id: 1,
+            name: "Activity".to_string(),
+            input: "preserved".to_string(),
+            session_id: None,
+            tag: None,
+        };
+        store.enqueue_for_worker(item.clone()).await.unwrap();
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        if upgrade {
+            // This migration adds only the index, so removing both reproduces the previous schema.
+            sqlx::query("DROP INDEX IF EXISTS idx_worker_ready_order")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20240113000000")
+                .execute(&pool)
+                .await
+                .unwrap();
+            drop(store);
+            store = Arc::new(SqliteProvider::new(&url, None).await.unwrap());
+        }
+
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_index_info('idx_worker_ready_order') ORDER BY seqno")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(columns, ["visible_at", "id"], "upgrade={upgrade}");
+        let applied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 20240113000000 AND success = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applied, 1, "the migration must run, not the schema-creation fallback");
+
+        let (fetched, token, attempts) = store
+            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::DefaultOnly)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched, item);
+        assert_eq!(attempts, 1);
+        store.ack_work_item(&token, None).await.unwrap();
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
 async fn test_sqlite_provider_basic() {
     // Create in-memory SQLite store
     let store = SqliteProvider::new("sqlite::memory:", None)

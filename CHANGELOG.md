@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - SQLite worker selection now orders eligible items by visibility time, then
   queue ID, so a deferred backlog cannot repeatedly overtake already-ready work.
+  Migration `20240113000000` adds the supporting `visible_at, id` index to new
+  and existing file-backed databases.
   Other providers must implement equivalent queue progress semantics; existing
   stored histories and work-item formats are unchanged. SQLite workers must all
   be upgraded to provide this behavior in a mixed-version deployment. (#74)
