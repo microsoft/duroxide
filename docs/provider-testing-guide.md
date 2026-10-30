@@ -422,6 +422,7 @@ use duroxide::providers::Provider;
 use duroxide::provider_validations::{
     ProviderFactory,
     // Atomicity tests
+    test_ack_work_item_duplicate_rejected,
     test_atomicity_failure_rollback,
     test_multi_operation_atomic_ack,
     // Locking tests
@@ -511,11 +512,12 @@ async fn test_my_provider_worker_queue_fifo_ordering() {
 
 The validation test suite includes the following categories:
 
-1. **Atomicity Tests (4 tests)**
+1. **Atomicity Tests (5 tests)**
    - `test_atomicity_failure_rollback` - All-or-nothing commit semantics, rollback on failure
    - `test_multi_operation_atomic_ack` - Complex ack succeeds atomically
    - `test_lock_released_only_on_successful_ack` - Lock only released on success
    - `test_concurrent_ack_prevention` - Only one ack succeeds with same token
+   - `test_ack_work_item_duplicate_rejected` - Repeating `ack_work_item(Some(...))` with the same token fails non-retryably and leaves exactly one completion queued, without relying on replay deduplication
 
 2. **Error Handling Tests (5 tests)**
    - `test_invalid_lock_token_on_ack` - Invalid lock token rejection
