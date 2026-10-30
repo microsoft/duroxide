@@ -262,8 +262,8 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 
 `duroxide_orchestration_poison_total` counts poison acknowledgements confirmed by
 the provider. `duroxide_orchestration_poison_failed_total` counts those that return
-an error after the runtime's retry handling. Each disposition contributes to one
-counter, not once per acknowledgement retry. Neither counter has labels.
+an error after the runtime's retry handling. Each final acknowledgement result
+increments one counter, not once per acknowledgement retry. Neither counter has labels.
 
 Both counters include failures propagated from poisoned activities or child
 orchestrations, not just orchestrations that exceed their own attempt budget.
@@ -280,6 +280,12 @@ error. This reporting does not change retry, backoff, or lease behavior.
 For in-process diagnostics, the failed count is available through
 `MetricsProvider::orchestration_poison_failed()` on the runtime's existing
 observability handle. The public `MetricsSnapshot` layout is unchanged.
+
+Activity poison accounting is unchanged: `duroxide_activity_poison_total` counts
+poison detections regardless of the activity acknowledgement result. It can count
+the same work item again on redelivery and does not confirm that the item was
+removed from the queue. Activity poison detection does not increment
+`duroxide_activity_infrastructure_errors_total`.
 
 **`duroxide_active_orchestrations`** (Gauge) 🆕
 - **Description**: Current number of orchestration instances that are actively running (not completed/failed)

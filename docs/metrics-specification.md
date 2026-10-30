@@ -1,7 +1,7 @@
 # Duroxide Metrics Specification
 
 **Version:** 2.0  
-**Last Updated:** 2026-10-13\
+**Last Updated:** 2026-10-30\
 **Status:** Current Implementation (metrics facade)
 
 This document provides a complete reference of all metrics emitted by duroxide via the `metrics` facade crate, organized by functional area with detailed label specifications.
@@ -34,7 +34,7 @@ This document provides a complete reference of all metrics emitted by duroxide v
 | **Poison Message** |
 | `duroxide_orchestration_poison_total` | Counter | Poison | _(none)_ | ✅ `poison_acknowledgement_counters_are_exported` | ✅ Emitted | Confirmed poison acknowledgements, including propagated poison failures |
 | `duroxide_orchestration_poison_failed_total` | Counter | Poison | _(none)_ | ✅ `poison_acknowledgement_counters_are_exported` | ✅ Emitted | Poison acknowledgements returning an error after retry handling |
-| `duroxide_activity_poison_total` | Counter | Poison | _(none)_ | ✅ `test_poison_message_metrics` | ✅ Code Review | Activities exceeding max_attempts |
+| `duroxide_activity_poison_total` | Counter | Poison | _(none)_ | ✅ `test_poison_message_metrics` | ✅ Code Review | Activity poison detections, regardless of acknowledgement outcome |
 | **Sub-Orchestration** |
 | `duroxide_suborchestration_calls_total` | Counter | Sub-Orchestration | `parent_orchestration`, `child_orchestration`, `outcome` | ✅ `test_sub_orchestration_metrics` | ❌ Not Called | Method defined in `observability.rs:701` but never called from runtime |
 | `duroxide_suborchestration_duration_seconds` | Histogram | Sub-Orchestration | `parent_orchestration`, `child_orchestration`, `outcome` | ✅ `test_sub_orchestration_metrics` | ❌ Not Called | Method defined in `observability.rs:718` but never called from runtime |
@@ -445,7 +445,7 @@ topk(5,
 
 **Purpose:** Track infrastructure issues separately for alerting
 
-**Note:** **Poison messages** (activity messages that exceed `max_attempts`) are counted in this metric. When an activity message is detected as poison, this counter is incremented. See [Poison Message Handling](#poison-message-handling) for details.
+**Note:** Activity poison detection increments `duroxide_activity_poison_total`, not this counter. That poison counter does not distinguish successful from failed activity acknowledgements. See [Poison Message Handling](#poison-message-handling) for details.
 
 ---
 
@@ -865,7 +865,7 @@ Poison messages have dedicated metrics for direct observability:
 |-------------|------|-------------|
 | `duroxide_orchestration_poison_total` | Counter | Confirmed acknowledgements of orchestration poison failures |
 | `duroxide_orchestration_poison_failed_total` | Counter | Orchestration poison acknowledgements returning an error after retry handling |
-| `duroxide_activity_poison_total` | Counter | Count of activity items that exceeded max_attempts |
+| `duroxide_activity_poison_total` | Counter | Activity poison detections, regardless of acknowledgement outcome |
 
 The orchestration counters cover exceeded-attempt, corrupted-history, and propagated
 poison failures. Each final acknowledgement result increments one counter; retries
@@ -877,6 +877,12 @@ or another dispatcher may have completed the work after lease expiry. The error 
 therefore reports that termination was not confirmed and the message may be
 redelivered. These are operational counters, not an exact ledger of durable
 terminations. Retry, backoff, and lease behavior are unchanged.
+
+Activity poison accounting retains its existing detection-based semantics:
+`duroxide_activity_poison_total` increments regardless of the activity acknowledgement
+result. Repeated deliveries can count the same work item again, so this counter does
+not confirm removal from the queue. Activity poison detection does not increment
+`duroxide_activity_infrastructure_errors_total`.
 
 ### Error Details
 
@@ -898,7 +904,7 @@ duroxide_orchestration_poison_total
 # Unconfirmed orchestration poison acknowledgements
 duroxide_orchestration_poison_failed_total
 
-# Total poisoned activities
+# Activity poison detections, not confirmed acknowledgements
 duroxide_activity_poison_total
 
 # Poison acknowledgement and activity poison rates over time

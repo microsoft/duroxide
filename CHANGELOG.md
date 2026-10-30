@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Orchestration poison reporting** - Count `duroxide_orchestration_poison_total`
+  only when the provider confirms the acknowledgement. Errors after retry handling
+  increment the new `duroxide_orchestration_poison_failed_total` counter and emit a
+  correlated error log without claiming the write did not commit. This applies to
+  exceeded-attempt and corrupted-history handling as well as poison propagated from
+  activities or child orchestrations. The new count is also exposed through
+  `MetricsProvider::orchestration_poison_failed()` without changing `MetricsSnapshot`.
+  Retry, lease, and activity poison accounting behavior are unchanged. (#73)
+
 ## [0.1.32] - 2026-10-11
 
 **Release:** <https://crates.io/crates/duroxide/0.1.32>
