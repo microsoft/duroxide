@@ -49,6 +49,9 @@ pub struct PoisonInjectingProvider {
     counted_abandon_delays: std::sync::Mutex<Vec<Duration>>,
     orchestration_fetches: std::sync::Mutex<Vec<(String, String, u32)>>,
     work_abandons: std::sync::Mutex<Vec<(Option<Duration>, bool)>>,
+    work_abandon_failures: AtomicU32,
+    history_reads: AtomicU32,
+    hide_management: AtomicBool,
 }
 
 impl PoisonInjectingProvider {
@@ -70,6 +73,9 @@ impl PoisonInjectingProvider {
             counted_abandon_delays: std::sync::Mutex::new(Vec::new()),
             orchestration_fetches: std::sync::Mutex::new(Vec::new()),
             work_abandons: std::sync::Mutex::new(Vec::new()),
+            work_abandon_failures: AtomicU32::new(0),
+            history_reads: AtomicU32::new(0),
+            hide_management: AtomicBool::new(false),
         }
     }
 
@@ -175,6 +181,18 @@ impl PoisonInjectingProvider {
     /// (delay, ignore_attempt) for each work item abandonment.
     pub fn work_abandons(&self) -> Vec<(Option<Duration>, bool)> {
         self.work_abandons.lock().expect("work abandons lock").clone()
+    }
+
+    pub fn fail_work_abandons(&self, count: u32) {
+        self.work_abandon_failures.store(count, Ordering::SeqCst);
+    }
+
+    pub fn history_reads(&self) -> u32 {
+        self.history_reads.load(Ordering::SeqCst)
+    }
+
+    pub fn hide_management_capability(&self) {
+        self.hide_management.store(true, Ordering::SeqCst);
     }
 }
 
@@ -352,6 +370,16 @@ impl Provider for PoisonInjectingProvider {
             .lock()
             .expect("work abandons lock")
             .push((delay, ignore_attempt));
+        if self
+            .work_abandon_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ProviderError::retryable(
+                "abandon_work_item",
+                "injected abandon failure",
+            ));
+        }
         self.inner.abandon_work_item(token, delay, ignore_attempt).await
     }
 
@@ -381,10 +409,12 @@ impl Provider for PoisonInjectingProvider {
     }
 
     async fn read(&self, instance: &str) -> Result<Vec<Event>, ProviderError> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read(instance).await
     }
 
     async fn read_with_execution(&self, instance: &str, execution_id: u64) -> Result<Vec<Event>, ProviderError> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_with_execution(instance, execution_id).await
     }
 
@@ -400,8 +430,11 @@ impl Provider for PoisonInjectingProvider {
     }
 
     fn as_management_capability(&self) -> Option<&dyn ProviderAdmin> {
-        // Delegate to inner's management capability
-        self.inner.as_management_capability()
+        if self.hide_management.load(Ordering::SeqCst) {
+            None
+        } else {
+            self.inner.as_management_capability()
+        }
     }
 
     async fn get_custom_status(

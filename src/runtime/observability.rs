@@ -133,6 +133,7 @@ pub struct MetricsSnapshot {
     pub activity_infra_errors: u64,
     pub activity_config_errors: u64,
     pub activity_poison: u64,
+    pub activity_admission_deferrals: u64,
     pub orch_dispatcher_items_fetched: u64,
     pub worker_dispatcher_items_fetched: u64,
     pub orch_continue_as_new: u64,
@@ -159,6 +160,7 @@ pub struct MetricsProvider {
     activity_infra_errors_atomic: AtomicU64,
     activity_config_errors_atomic: AtomicU64,
     activity_poison_atomic: AtomicU64,
+    activity_admission_deferrals_atomic: AtomicU64,
 
     // Dispatcher counters
     orch_dispatcher_items_fetched_atomic: AtomicU64,
@@ -197,6 +199,7 @@ impl MetricsProvider {
             activity_infra_errors_atomic: AtomicU64::new(0),
             activity_config_errors_atomic: AtomicU64::new(0),
             activity_poison_atomic: AtomicU64::new(0),
+            activity_admission_deferrals_atomic: AtomicU64::new(0),
             orch_dispatcher_items_fetched_atomic: AtomicU64::new(0),
             worker_dispatcher_items_fetched_atomic: AtomicU64::new(0),
             orch_continue_as_new_atomic: AtomicU64::new(0),
@@ -459,6 +462,17 @@ impl MetricsProvider {
     }
 
     #[inline]
+    pub fn record_activity_admission_deferral(&self, activity_name: &str, tag: Option<&str>) {
+        counter!(
+            "duroxide_activity_admission_deferrals_total",
+            "activity_name" => activity_name.to_string(),
+            "tag" => tag.unwrap_or("default").to_string(),
+        )
+        .increment(1);
+        self.activity_admission_deferrals_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn record_orchestration_poison(&self) {
         self.orch_poison_atomic.fetch_add(1, Ordering::Relaxed);
         counter!("duroxide_orchestration_poison_total").increment(1);
@@ -625,6 +639,7 @@ impl MetricsProvider {
             activity_infra_errors: self.activity_infra_errors_atomic.load(Ordering::Relaxed),
             activity_config_errors: self.activity_config_errors_atomic.load(Ordering::Relaxed),
             activity_poison: self.activity_poison_atomic.load(Ordering::Relaxed),
+            activity_admission_deferrals: self.activity_admission_deferrals_atomic.load(Ordering::Relaxed),
             orch_dispatcher_items_fetched: self.orch_dispatcher_items_fetched_atomic.load(Ordering::Relaxed),
             worker_dispatcher_items_fetched: self.worker_dispatcher_items_fetched_atomic.load(Ordering::Relaxed),
             orch_continue_as_new: self.orch_continue_as_new_atomic.load(Ordering::Relaxed),

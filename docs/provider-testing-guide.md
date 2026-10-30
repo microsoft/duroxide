@@ -509,7 +509,7 @@ async fn test_my_provider_worker_queue_fifo_ordering() {
 
 ### What the Tests Validate
 
-The validation test suite includes **169 individual test functions** organized into 18 categories:
+The validation test suite includes the following categories:
 
 1. **Atomicity Tests (4 tests)**
    - `test_atomicity_failure_rollback` - All-or-nothing commit semantics, rollback on failure
@@ -559,8 +559,9 @@ The validation test suite includes **169 individual test functions** organized i
    - `test_continue_as_new_creates_new_execution` - ContinueAsNew creates new execution
    - `test_execution_history_persistence` - All executions' history persists independently
 
-6. **Queue Semantics Tests (8 tests)**
+6. **Queue Semantics Tests (9 tests)**
    - `test_worker_queue_fifo_ordering` - Worker items dequeued in FIFO order
+   - `test_worker_deferred_item_does_not_starve_ready_work` - Expired deferrals yield to already-ready work for session and non-session fetches, retaining attempt restoration
    - `test_worker_peek_lock_semantics` - Dequeue doesn't remove item until ack
    - `test_worker_ack_atomicity` - Ack_worker atomically removes item and enqueues completion
    - `test_timer_delayed_visibility` - TimerFired items only dequeued when visible
@@ -1095,7 +1096,7 @@ This generates `stress-test-results.md` with:
 
 - **Test Implementation**: `src/provider_validation/` (individual test modules)
 - **Test API**: `src/provider_validations.rs` (test function exports)
-- **Example Usage**: `tests/sqlite_provider_validations.rs` (complete example with all 202 tests)
+- **Example Usage**: `tests/sqlite_provider_validations.rs` (complete provider validation suite)
 - **Test Specification**: See individual test function documentation
 - **Provider Guide**: `docs/provider-implementation-guide.md`
 - **Built-in Providers**: `src/providers/sqlite.rs`

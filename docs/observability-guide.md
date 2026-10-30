@@ -195,6 +195,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_active_orchestrations` | Gauge | Orchestration | _(none)_ | **Current** active count |
 | **Activity Execution** |
 | `duroxide_activity_executions_total` | Counter | Activity | activity_name, outcome, retry_attempt | Track success/failure rates |
+| `duroxide_activity_admission_deferrals_total` | Counter | Activity | activity_name, tag | Track committed resource-admission deferrals |
 | `duroxide_activity_duration_seconds` | Histogram | Activity | activity_name, outcome | Activity latency p95/p99 |
 | `duroxide_activity_errors_total` | Counter | Activity | activity_name, error_type, retryable | Detailed error tracking |
 | **Sub-Orchestration** |
@@ -264,6 +265,17 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 - **Note**: Continue-as-new does NOT change this count (orchestration stays active)
 
 #### Activity Execution Metrics
+
+**`duroxide_activity_admission_deferrals_total`** (Counter)
+- **Description**: Admission deferrals successfully committed to storage, including a successful fallback after an abandon error
+- **Labels**: `activity_name`, `tag`
+- **Use**: Identify resource-constrained activities without counting deferrals as executions
+
+The "Activity started" log appears only after admission succeeds. Admission
+rejections, panics, and zero retry delays count as `app_error`; storage failures
+while deferring count as `infra_error`, even if the fallback abandon succeeds.
+Uncommitted deferrals do not increment the deferral counter and may consume a
+fetch attempt on recovery.
 
 **`duroxide_activity_executions_total`** (Counter)
 - **Description**: Activity execution attempts
@@ -645,4 +657,3 @@ Import this dashboard into Grafana to get:
 - [Library Observability Guide](library-observability.md) - For library developers
 - [examples/with_observability.rs](../examples/with_observability.rs) - Working example
 - [examples/grafana-dashboard.json](../examples/grafana-dashboard.json) - Production dashboard
-

@@ -124,7 +124,9 @@ enum ActivityOutcome {
     /// Orchestration was cancelled, activity result dropped
     Cancelled,
     /// Admission deferred without executing the handler
-    Deferred,
+    Deferred(Duration),
+    /// Activity setup failed before invocation
+    InfraError,
 }
 
 enum ActivityInvocation {
@@ -489,18 +491,13 @@ async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::Activity
         cancellation_token.clone(),
     );
 
-    let activity_ctx = build_activity_context(rt, &ctx, cancellation_token.clone()).await;
-
-    tracing::debug!(
-        target: "duroxide::runtime",
-        instance_id = %ctx.instance,
-        execution_id = %ctx.execution_id,
-        activity_name = %ctx.activity_name,
-        activity_id = %ctx.activity_id,
-        worker_id = %ctx.worker_id,
-        activity_tag = ?ctx.tag,
-        "Activity started"
-    );
+    let activity_ctx = match build_activity_context(rt, &ctx, cancellation_token.clone()).await {
+        Ok(activity_ctx) => activity_ctx,
+        Err(error) => {
+            handle_activity_outcome(rt, &ctx, Err(error), ActivityOutcome::InfraError).await;
+            return;
+        }
+    };
 
     let start_time = std::time::Instant::now();
 
@@ -532,13 +529,53 @@ async fn build_activity_context(
     rt: &Arc<Runtime>,
     ctx: &ActivityWorkContext,
     cancellation_token: CancellationToken,
-) -> crate::ActivityContext {
-    let descriptor = rt.get_orchestration_descriptor(&ctx.instance).await;
-    let (orch_name, orch_version) = descriptor
-        .map(|d| (d.name, d.version))
-        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+) -> Result<crate::ActivityContext, crate::providers::ProviderError> {
+    let metadata = if let Some(admin) = rt.history_store.as_management_capability() {
+        match admin.get_instance_info(&ctx.instance).await {
+            Ok(info) if info.current_execution_id == ctx.execution_id && info.orchestration_version != "unknown" => {
+                Some((info.orchestration_name, info.orchestration_version))
+            }
+            Ok(_) => None,
+            Err(error) => {
+                warn!(
+                    instance = %ctx.instance,
+                    execution_id = ctx.execution_id,
+                    %error,
+                    "Failed to read activity metadata; falling back to execution history"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (orch_name, orch_version) = match metadata {
+        Some(metadata) => metadata,
+        None => {
+            let history = rt
+                .history_store
+                .read_with_execution(&ctx.instance, ctx.execution_id)
+                .await?;
+            history
+                .iter()
+                .find_map(|event| match &event.kind {
+                    crate::EventKind::OrchestrationStarted { name, version, .. } => {
+                        Some((name.clone(), version.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    warn!(
+                        instance = %ctx.instance,
+                        execution_id = ctx.execution_id,
+                        "Orchestration metadata missing for activity"
+                    );
+                    ("unknown".to_string(), "unknown".to_string())
+                })
+        }
+    };
 
-    crate::ActivityContext::new_with_cancellation(
+    Ok(crate::ActivityContext::new_with_cancellation(
         ctx.instance.clone(),
         ctx.execution_id,
         orch_name,
@@ -550,7 +587,7 @@ async fn build_activity_context(
         ctx.tag.clone(),
         cancellation_token,
         Arc::clone(&rt.history_store),
-    )
+    ))
 }
 
 /// Run an activity with cancellation support using `tokio::select!`.
@@ -564,6 +601,7 @@ async fn run_activity_with_cancellation(
     start_time: std::time::Instant,
 ) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
     let input = ctx.input.clone();
+    let activity_id = ctx.activity_id;
     // Abort-on-drop so the invocation cannot outlive this task if the worker is
     // aborted mid-activity during shutdown.
     let mut activity_handle = AbortOnDropHandle::new(rt.task_tracker.spawn(async move {
@@ -573,10 +611,21 @@ async fn run_activity_with_cancellation(
                 return Err("Activity admission deferral requires a positive retry delay".to_string());
             }
             ActivityAdmission::Defer(delay) => {
-                // Keep positive delays nonzero in millisecond-resolution storage.
-                return Ok(ActivityInvocation::Deferred(delay.max(Duration::from_millis(1))));
+                return Ok(ActivityInvocation::Deferred(
+                    delay.clamp(Duration::from_millis(1), ActivityAdmission::MAX_DEFER_DELAY),
+                ));
             }
         };
+        tracing::debug!(
+            target: "duroxide::runtime",
+            instance_id = %activity_ctx.instance_id(),
+            execution_id = activity_ctx.execution_id(),
+            activity_name = %activity_ctx.activity_name(),
+            activity_id,
+            worker_id = %activity_ctx.worker_id(),
+            activity_tag = ?activity_ctx.tag(),
+            "Activity started"
+        );
         handler
             .invoke(activity_ctx, input)
             .await
@@ -602,7 +651,7 @@ async fn run_activity_with_cancellation(
                     let result = rt.history_store
                         .abandon_work_item(&ctx.lock_token, Some(delay), true)
                         .await;
-                    (result, ActivityOutcome::Deferred)
+                    (result, ActivityOutcome::Deferred(delay))
                 }
                 Ok(Err(error)) => handle_activity_error(rt, ctx, error, start_time).await,
                 Err(join_error) => handle_activity_error(rt, ctx, join_error.to_string(), start_time).await,
@@ -795,7 +844,11 @@ async fn handle_activity_outcome(
         Ok(()) => match outcome {
             ActivityOutcome::Success => rt.record_activity_success(),
             ActivityOutcome::AppError => rt.record_activity_app_error(),
-            ActivityOutcome::Cancelled | ActivityOutcome::Deferred => {}
+            ActivityOutcome::Deferred(_) => {
+                rt.record_activity_admission_deferral(&ctx.activity_name, ctx.tag.as_deref())
+            }
+            ActivityOutcome::InfraError => rt.record_activity_infra_error(),
+            ActivityOutcome::Cancelled => {}
         },
         Err(e) => {
             warn!(
@@ -807,13 +860,13 @@ async fn handle_activity_outcome(
                 outcome = ?outcome,
                 "worker: activity acknowledgment or deferral failed, abandoning work item"
             );
+            let (delay, ignore_attempt) = match outcome {
+                ActivityOutcome::Deferred(delay) => (delay, true),
+                _ => (Duration::from_millis(100), false),
+            };
             if let Err(error) = rt
                 .history_store
-                .abandon_work_item(
-                    &ctx.lock_token,
-                    Some(Duration::from_millis(100)),
-                    matches!(outcome, ActivityOutcome::Deferred),
-                )
+                .abandon_work_item(&ctx.lock_token, Some(delay), ignore_attempt)
                 .await
             {
                 warn!(
@@ -822,6 +875,8 @@ async fn handle_activity_outcome(
                     error = %error,
                     "Failed to abandon activity work item; waiting for lock expiry"
                 );
+            } else if matches!(outcome, ActivityOutcome::Deferred(_)) {
+                rt.record_activity_admission_deferral(&ctx.activity_name, ctx.tag.as_deref());
             }
             rt.record_activity_infra_error();
         }

@@ -425,6 +425,9 @@ impl SqliteProvider {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_worker_available ON worker_queue(lock_token, id)")
             .execute(pool)
             .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_worker_ready_order ON worker_queue(visible_at, id)")
+            .execute(pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_worker_identity ON worker_queue(instance_id, execution_id, activity_id)",
         )
@@ -1843,7 +1846,7 @@ impl Provider for SqliteProvider {
                     OR s.session_id IS NULL
                   )
                   AND ({tag_clause})
-                ORDER BY q.id
+                ORDER BY q.visible_at, q.id
                 LIMIT 1
                 "#,
             );
@@ -1864,7 +1867,7 @@ impl Provider for SqliteProvider {
                   AND (q.lock_token IS NULL OR q.locked_until <= ?1)
                   AND q.session_id IS NULL
                   AND ({tag_clause})
-                ORDER BY q.id
+                ORDER BY q.visible_at, q.id
                 LIMIT 1
                 "#,
             );

@@ -1727,6 +1727,12 @@ pub trait Provider: Any + Send + Sync {
     /// 2. Lock it with a unique token
     /// 3. Return item + token (item stays in queue until ack)
     ///
+    /// # Ordering
+    ///
+    /// Deferred items must not repeatedly overtake already-ready work after their
+    /// visibility delay expires. Order eligible items by `visible_at`, then queue ID,
+    /// or use an equivalent requeue policy. This also applies to session and tagged work.
+    ///
     /// # Parameters
     ///
     /// - `lock_timeout`: Duration to lock the item for processing.

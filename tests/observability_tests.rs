@@ -1514,6 +1514,13 @@ async fn test_metrics_activity_outcomes() {
     // Config error
     metrics.record_activity_execution("TestActivity", "config_error", 0.3, 0, Some("build"));
     assert_eq!(metrics.snapshot().activity_config_errors, 1);
+
+    metrics.record_activity_admission_deferral("TestActivity", Some("build"));
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.activity_admission_deferrals, 1);
+    assert_eq!(snapshot.activity_success, 1);
+    assert_eq!(snapshot.activity_app_errors, 1);
+    assert_eq!(snapshot.activity_infra_errors, 1);
 }
 
 /// Test: MetricsProvider poison message tracking

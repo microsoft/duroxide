@@ -456,18 +456,32 @@ where
 }
 
 /// A nonblocking admission decision made before invoking an activity.
+#[non_exhaustive]
 pub enum ActivityAdmission {
     /// The guard is held until the activity handler returns or its task is dropped.
     Admit(Box<dyn Send>),
     /// Leave the activity pending and retry admission after a positive delay.
     ///
-    /// Positive sub-millisecond delays are rounded up to one millisecond.
+    /// Positive delays are clamped to one millisecond through [`Self::MAX_DEFER_DELAY`].
     /// Deferral releases the worker slot without recording a history event or
-    /// consuming a fetch attempt. It does not retry an executed activity.
+    /// consuming a fetch attempt once the deferral commits. Interrupted or failed
+    /// deferrals can still consume attempts. It does not retry an executed activity.
     Defer(Duration),
 }
 
+impl std::fmt::Debug for ActivityAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admit(_) => f.debug_tuple("Admit").finish_non_exhaustive(),
+            Self::Defer(delay) => f.debug_tuple("Defer").field(delay).finish(),
+        }
+    }
+}
+
 impl ActivityAdmission {
+    /// Maximum admission retry delay: 24 hours, independent of the provider.
+    pub const MAX_DEFER_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+
     /// Admit an activity while retaining ownership of its resource reservation.
     pub fn admit(guard: impl Send + 'static) -> Self {
         Self::Admit(Box::new(guard))
@@ -688,6 +702,13 @@ impl Runtime {
     fn record_activity_infra_error(&self) {
         if let Some(provider) = self.metrics_provider() {
             provider.record_activity_infra_error();
+        }
+    }
+
+    #[inline]
+    fn record_activity_admission_deferral(&self, activity_name: &str, tag: Option<&str>) {
+        if let Some(provider) = self.metrics_provider() {
+            provider.record_activity_admission_deferral(activity_name, tag);
         }
     }
 

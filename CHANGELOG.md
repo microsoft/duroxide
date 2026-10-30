@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in activity resource admission through `register_with_admission`.
+  Admission can retain a guard for the handler's lifetime or durably defer
+  execution without occupying a worker slot or recording an activity result.
+  Positive retry delays are clamped to 1 ms–24 hours. Only committed deferrals
+  restore their fetch attempt; failed or interrupted deferrals may still use
+  the poison-message budget. Committed deferrals have a separate
+  `duroxide_activity_admission_deferrals_total` metric. (#74)
+
+### Fixed
+
+- SQLite worker selection now orders eligible items by visibility time, then
+  queue ID, so a deferred backlog cannot repeatedly overtake already-ready work.
+  Other providers must implement equivalent queue progress semantics; existing
+  stored histories and work-item formats are unchanged. SQLite workers must all
+  be upgraded to provide this behavior in a mixed-version deployment. (#74)
+- Activity metadata uses the lightweight instance lookup for the current
+  execution instead of re-reading its full history on every attempt. Activities
+  from earlier executions read their own execution's metadata. Failed deferral
+  retries preserve the requested delay and attempt-restoration flag. (#74)
+- Relative SQLite queue delays saturate instead of overflowing their timestamp
+  representation. (#74)
+
 ## [0.1.32] - 2026-10-11
 
 **Release:** <https://crates.io/crates/duroxide/0.1.32>

@@ -275,19 +275,29 @@ task is dropped, including error, panic, and cancellation. If several limits
 apply, reserve all of them atomically or defer holding none. Detached work is
 not protected after the handler finishes.
 
-`Defer(delay)` requires a positive delay. Positive sub-millisecond delays are
-rounded up to one millisecond. Deferral leaves the original activity pending in
-durable storage, frees the worker to fetch other work, and does not record an
-activity result or consume the poison-message fetch-attempt budget.
-It is not a retry of an executed activity. An admission error, panic, or invalid
-delay fails the activity rather than invoking the handler. Storage errors during
-deferral are reported as infrastructure errors.
+`Defer(delay)` requires a positive delay. The runtime clamps it to 1 ms through
+24 hours (`ActivityAdmission::MAX_DEFER_DELAY`) before passing it to any provider.
+Deferral leaves the original activity pending in durable storage, frees the
+worker to fetch other work, and does not record an activity result.
+A **committed** deferral restores its fetch attempt. Crashes, shutdown aborts,
+and failed abandons can still consume the poison-message attempt budget, so
+leave room for recovery attempts. Deferral is not a retry of an executed activity.
+
+An admission error, panic, or zero delay fails the activity rather than invoking
+the handler and is reported as an application error. Storage errors during
+deferral are infrastructure errors; an immediate fallback abandon preserves the
+same delay and attempt-restoration flag. If that also fails, recovery waits for
+the work lock to expire. Successfully committed deferrals increment
+`duroxide_activity_admission_deferrals_total`, not the activity execution counter.
+The "Activity started" log is emitted only after admission succeeds.
 
 Admission runs outside orchestration replay; completed results are unaffected.
 Each recovered execution attempt is admitted again. Resource counters belong
 to the application and are not automatically coordinated across runtimes.
 Keep total worker capacity above the admitted activity ceiling if other work
-needs headroom. Admission does not guarantee fair scheduling between workflows.
+needs headroom. Providers must allow already-ready work to progress past deferred
+items, including after a deferral's delay expires. This is not a guarantee of
+equal throughput or admission fairness between workflows.
 
 ### The Replay Model
 

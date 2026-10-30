@@ -101,10 +101,15 @@ CREATE TABLE sessions (
 5. **Session table as a flow table** — routes session-bound activities to owning workers (analogous to network flow affinity)
 5. **JSON storage** for flexible event/work item serialization
 
-Delayed visibility is stored as signed 64-bit Unix timestamps in milliseconds.
-If a delay would exceed that range, the visibility timestamp saturates at
-`i64::MAX`. Oversized delays therefore remain in the future rather than wrapping
-around and becoming immediately eligible for delivery.
+Visibility timestamps use signed 64-bit Unix milliseconds. Relative delays
+passed to queue enqueue/abandon operations saturate at `i64::MAX` if their
+future timestamp exceeds that range. This does not cover absolute
+`TimerFired.fire_at_ms` timestamps.
+
+Eligible worker items are ordered by `visible_at, id`, supported by the
+`idx_worker_ready_order` index. A deferred item goes behind already-ready work,
+even if its delay expires before the backlog drains. Session and tag filtering
+use the same ordering.
 
 ## Implementation Plan
 

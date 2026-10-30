@@ -7,9 +7,11 @@ mod common;
 
 use common::fault_injection::PoisonInjectingProvider;
 use duroxide::providers::sqlite::SqliteProvider;
+use duroxide::providers::{Provider, WorkItem};
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{ActivityAdmission, Runtime, RuntimeOptions};
 use duroxide::{ActivityContext, Client, EventKind, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
@@ -76,7 +78,8 @@ async fn deferred_admission_frees_worker_without_consuming_attempts_and_survives
         client.wait_for_orchestration("free", Duration::from_secs(5)).await.unwrap(),
         OrchestrationStatus::Completed { output, .. } if output == "payload"
     ));
-    runtime.shutdown(None).await;
+    runtime.clone().shutdown(None).await;
+    assert!(runtime.metrics_snapshot().unwrap().activity_admission_deferrals >= 20);
 
     let history = store.read("limited").await.unwrap();
     assert_eq!(
@@ -153,6 +156,272 @@ async fn admission_deferral_delays_are_clamped_before_reaching_storage() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn oversized_admission_delays_are_bounded_before_reaching_storage() {
+    let maximum = Duration::from_secs(24 * 60 * 60);
+    for delay in [maximum, maximum + Duration::from_nanos(1), Duration::MAX] {
+        let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+        let store = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
+        let (deferred, mut deferrals) = mpsc::unbounded_channel();
+        let activities = ActivityRegistry::builder()
+            .register_with_admission(
+                "Limited",
+                move |_ctx, _input| {
+                    deferred.send(()).unwrap();
+                    Ok(ActivityAdmission::Defer(delay))
+                },
+                |_ctx, _input| async move { panic!("deferred handler must not run") },
+            )
+            .build();
+        let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations(), options()).await;
+        Client::new(sqlite)
+            .start_orchestration("bounded", "Run", "Limited")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), deferrals.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.shutdown(None).await;
+        assert_eq!(store.work_abandons(), vec![(Some(maximum), true)], "{delay:?}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_deferral_retries_the_same_delay_and_restores_the_attempt() {
+    let (events, _guard) = common::tracing_capture::install_tracing_capture();
+    let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let store = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
+    store.fail_work_abandons(1);
+    let first_attempt = AtomicBool::new(true);
+    let delay = Duration::from_millis(25);
+    let activities = ActivityRegistry::builder()
+        .register_with_admission(
+            "Limited",
+            move |_ctx, _input| {
+                Ok(if first_attempt.swap(false, Ordering::SeqCst) {
+                    ActivityAdmission::Defer(delay)
+                } else {
+                    ActivityAdmission::admit(())
+                })
+            },
+            |_ctx, input| async move { Ok(input) },
+        )
+        .build();
+    let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations(), options()).await;
+    let client = Client::new(sqlite);
+    client.start_orchestration("retry", "Run", "Limited").await.unwrap();
+    let status = client.wait_for_orchestration("retry", Duration::from_secs(5)).await;
+    runtime.clone().shutdown(None).await;
+    assert!(matches!(
+        status.unwrap(),
+        OrchestrationStatus::Completed { output, .. } if output == "payload"
+    ));
+    assert_eq!(store.work_abandons(), vec![(Some(delay), true); 2]);
+    let metrics = runtime.metrics_snapshot().unwrap();
+    assert_eq!(metrics.activity_admission_deferrals, 1);
+    assert_eq!(metrics.activity_infra_errors, 1);
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.message == "Activity started")
+            .count(),
+        1,
+        "only the admitted invocation should be logged as started"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn uncommitted_deferral_consumes_attempt_and_is_not_counted_as_deferred() {
+    let (events, _guard) = common::tracing_capture::install_tracing_capture();
+    let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let store = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
+    store.fail_work_abandons(2);
+    let delay = Duration::from_secs(60);
+    let activities = ActivityRegistry::builder()
+        .register_with_admission(
+            "Limited",
+            move |_ctx, _input| Ok(ActivityAdmission::Defer(delay)),
+            |_ctx, _input| async move { panic!("deferred handler must not run") },
+        )
+        .build();
+    let runtime = Runtime::start_with_options(
+        store.clone(),
+        activities,
+        orchestrations(),
+        RuntimeOptions {
+            worker_lock_timeout: Duration::from_millis(100),
+            ..options()
+        },
+    )
+    .await;
+    let client = Client::new(sqlite);
+    client
+        .start_orchestration("failed-deferral", "Run", "Limited")
+        .await
+        .unwrap();
+    let status = client
+        .wait_for_orchestration("failed-deferral", Duration::from_secs(5))
+        .await;
+    runtime.clone().shutdown(None).await;
+    assert!(matches!(
+        status.unwrap(),
+        OrchestrationStatus::Failed {
+            details: duroxide::ErrorDetails::Poison { attempt_count: 2, .. },
+            ..
+        }
+    ));
+    assert_eq!(store.work_abandons(), vec![(Some(delay), true); 2]);
+    let metrics = runtime.metrics_snapshot().unwrap();
+    assert_eq!(metrics.activity_admission_deferrals, 0);
+    assert_eq!(metrics.activity_infra_errors, 1);
+    assert_eq!(metrics.activity_app_errors, 0);
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.message == "Activity started")
+    );
+}
+
+#[test]
+fn admission_debug_does_not_require_a_debug_guard() {
+    struct Guard;
+    assert_eq!(format!("{:?}", ActivityAdmission::admit(Guard)), "Admit(..)");
+    assert_eq!(
+        format!("{:?}", ActivityAdmission::Defer(Duration::from_secs(1))),
+        "Defer(1s)"
+    );
+    assert_eq!(ActivityAdmission::MAX_DEFER_DELAY, Duration::from_secs(24 * 60 * 60));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deferred_backlog_does_not_starve_ready_work_or_reread_history() {
+    for (backlog, workers) in [(300, 1), (1000, 4)] {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = Arc::new(
+            SqliteProvider::new(
+                &format!("sqlite:{}?mode=rwc", dir.path().join("test.db").display()),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let store = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
+        let (ready, mut ready_events) = mpsc::unbounded_channel();
+        let activities = ActivityRegistry::builder()
+            .register_with_admission(
+                "Limited",
+                |ctx, _input| {
+                    assert_eq!(ctx.orchestration_name(), "Backlog");
+                    assert_eq!(ctx.orchestration_version(), "1.0.0");
+                    Ok(ActivityAdmission::Defer(Duration::from_millis(100)))
+                },
+                |_ctx, _input| async move { panic!("deferred handler must not run") },
+            )
+            .register("Free", move |_ctx: ActivityContext, input: String| {
+                let ready = ready.clone();
+                async move {
+                    ready.send(()).unwrap();
+                    Ok(input)
+                }
+            })
+            .build();
+        let orchestrations = OrchestrationRegistry::builder()
+            .register("Backlog", move |ctx: OrchestrationContext, _input: String| async move {
+                let mut pending = (0..backlog)
+                    .map(|_| ctx.schedule_activity("Limited", "payload"))
+                    .collect::<Vec<_>>();
+                pending.push(ctx.schedule_activity("Free", "payload"));
+                ctx.join(pending).await;
+                Ok(String::new())
+            })
+            .build();
+        let runtime = Runtime::start_with_options(
+            store.clone(),
+            activities,
+            orchestrations,
+            RuntimeOptions {
+                worker_concurrency: workers,
+                ..options()
+            },
+        )
+        .await;
+        Client::new(sqlite)
+            .start_orchestration("backlog", "Backlog", "")
+            .await
+            .unwrap();
+        let progress = tokio::time::timeout(Duration::from_secs(10), ready_events.recv()).await;
+        runtime.shutdown(None).await;
+        assert_eq!(
+            progress.unwrap(),
+            Some(()),
+            "{backlog} deferred activities, {workers} workers"
+        );
+        assert_eq!(
+            store.history_reads(),
+            0,
+            "current-execution metadata must not load history"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admission_metadata_uses_the_activity_execution() {
+    for hide_management in [false, true] {
+        let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+        common::test_create_execution(sqlite.as_ref(), "metadata", "Old", "1.0.0", "", None, None)
+            .await
+            .unwrap();
+        common::test_create_execution(sqlite.as_ref(), "metadata", "New", "2.0.0", "", None, None)
+            .await
+            .unwrap();
+        let store = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
+        if hide_management {
+            store.hide_management_capability();
+        }
+        let (checked, mut checks) = mpsc::unbounded_channel();
+        let activities = ActivityRegistry::builder()
+            .register_with_admission(
+                "Limited",
+                move |ctx, _input| {
+                    checked
+                        .send((
+                            ctx.execution_id(),
+                            ctx.orchestration_name().to_string(),
+                            ctx.orchestration_version().to_string(),
+                        ))
+                        .unwrap();
+                    Ok(ActivityAdmission::Defer(Duration::from_secs(60)))
+                },
+                |_ctx, _input| async move { panic!("deferred handler must not run") },
+            )
+            .build();
+        sqlite
+            .enqueue_for_worker(WorkItem::ActivityExecute {
+                instance: "metadata".to_string(),
+                execution_id: 1,
+                id: 2,
+                name: "Limited".to_string(),
+                input: String::new(),
+                session_id: None,
+                tag: None,
+            })
+            .await
+            .unwrap();
+        let runtime = Runtime::start_with_options(store, activities, orchestrations(), options()).await;
+        let metadata = tokio::time::timeout(Duration::from_secs(5), checks.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.shutdown(None).await;
+        assert_eq!(metadata, (1, "Old".to_string(), "1.0.0".to_string()));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn admission_guard_released_on_success_error_and_panic() {
     let (store, _dir) = common::create_sqlite_store_disk().await;
     let capacity = Arc::new(Semaphore::new(1));
@@ -202,6 +471,7 @@ async fn admission_guard_released_on_success_error_and_panic() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn rejected_panicking_and_invalid_admission_never_invokes_handler() {
+    let (events, _guard) = common::tracing_capture::install_tracing_capture();
     let (store, _dir) = common::create_sqlite_store_disk().await;
     let activities = ActivityRegistry::builder()
         .register_with_admission(
@@ -232,7 +502,18 @@ async fn rejected_panicking_and_invalid_admission_never_invokes_handler() {
             "unexpected status: {status:?}"
         );
     }
-    runtime.shutdown(None).await;
+    runtime.clone().shutdown(None).await;
+    let metrics = runtime.metrics_snapshot().unwrap();
+    assert!(metrics.activity_app_errors >= 3);
+    assert_eq!(metrics.activity_infra_errors, 0);
+    assert_eq!(metrics.activity_admission_deferrals, 0);
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.message == "Activity started")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
