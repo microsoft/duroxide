@@ -1517,21 +1517,48 @@ async fn test_metrics_activity_outcomes() {
 }
 
 #[test]
+fn test_metrics_snapshot_struct_literal_compatibility() {
+    use duroxide::runtime::observability::MetricsSnapshot;
+
+    // Keep this exhaustive: adding public fields breaks downstream struct literals.
+    let snapshot = MetricsSnapshot {
+        orch_starts: 0,
+        orch_completions: 0,
+        orch_failures: 0,
+        orch_application_errors: 0,
+        orch_infrastructure_errors: 0,
+        orch_configuration_errors: 0,
+        orch_poison: 0,
+        activity_success: 0,
+        activity_app_errors: 0,
+        activity_infra_errors: 0,
+        activity_config_errors: 0,
+        activity_poison: 0,
+        orch_dispatcher_items_fetched: 0,
+        worker_dispatcher_items_fetched: 0,
+        orch_continue_as_new: 0,
+        suborchestration_calls: 0,
+        provider_errors: 0,
+    };
+    assert_eq!(snapshot, MetricsSnapshot::default());
+}
+
+#[test]
 fn test_metrics_activity_ack_uncertain() {
     use duroxide::runtime::observability::{MetricsProvider, ObservabilityConfig};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     let metrics = MetricsProvider::new(&ObservabilityConfig::default()).unwrap();
     let recorder = DebuggingRecorder::new();
-    let mut expected = metrics.snapshot();
-    assert_eq!(expected.activity_ack_uncertain, 0);
+    let expected = metrics.snapshot();
+    assert_eq!(metrics.activity_ack_uncertain(), 0);
 
     metrics::with_local_recorder(&recorder, || {
         metrics.record_activity_ack_uncertain();
         metrics.record_activity_ack_uncertain();
     });
 
-    expected.activity_ack_uncertain = 2;
+    assert_eq!(metrics.activity_ack_uncertain(), 2);
     assert_eq!(
         metrics.snapshot(),
         expected,

@@ -398,6 +398,10 @@ impl AckTest {
         Arc::clone(&self.rt).shutdown(Some(10_000)).await;
         status
     }
+
+    fn metrics_provider(&self) -> &runtime::observability::MetricsProvider {
+        self.rt.observability_handle().unwrap().metrics_provider()
+    }
 }
 
 fn counting_activity(result: Result<String, String>) -> (ActivityRegistry, Arc<AtomicU32>) {
@@ -444,6 +448,8 @@ async fn worker_abandon_on_ack_failure_enables_retry() {
     assert_eq!(token, abandoned);
     assert_ne!(token, redelivered);
     assert_eq!(completion, retried_completion);
+    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_infra_errors, 1);
+    assert_eq!(test.metrics_provider().activity_ack_uncertain(), 0);
 }
 
 #[tokio::test]
@@ -470,7 +476,7 @@ async fn worker_retries_retryable_ack_failure_without_reexecuting_activity() {
         } if result == "done"
     ));
     assert_eq!(calls, vec![calls[0].clone(); 5]);
-    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_ack_uncertain, 0);
+    assert_eq!(test.metrics_provider().activity_ack_uncertain(), 0);
 }
 
 #[tokio::test]
@@ -503,6 +509,8 @@ async fn worker_abandons_after_retryable_ack_attempts_are_exhausted() {
     };
     assert_ne!(token, redelivered);
     assert_eq!(completion, retried_completion);
+    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_infra_errors, 1);
+    assert_eq!(test.metrics_provider().activity_ack_uncertain(), 0);
 }
 
 #[tokio::test]
@@ -665,9 +673,8 @@ async fn worker_retryable_ack_error_after_commit_is_reported_as_uncertain() {
     };
     assert_eq!(result, "done");
     assert_eq!(calls[0], calls[1]);
-    let metrics = test.rt.metrics_snapshot().unwrap();
-    assert_eq!(metrics.activity_infra_errors, 0);
-    assert_eq!(metrics.activity_ack_uncertain, 1);
+    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_infra_errors, 0);
+    assert_eq!(test.metrics_provider().activity_ack_uncertain(), 1);
 
     let events = captured.lock().unwrap();
     assert!(
@@ -699,9 +706,8 @@ async fn worker_uncertain_ack_before_commit_recovers_after_lock_expiry() {
         runtime::OrchestrationStatus::Completed { output, .. } if output == "done"
     ));
     assert_eq!(execution_count.load(Ordering::SeqCst), 2);
-    let metrics = test.rt.metrics_snapshot().unwrap();
-    assert_eq!(metrics.activity_infra_errors, 0);
-    assert_eq!(metrics.activity_ack_uncertain, 1);
+    assert_eq!(test.rt.metrics_snapshot().unwrap().activity_infra_errors, 0);
+    assert_eq!(test.metrics_provider().activity_ack_uncertain(), 1);
 
     let calls = test.provider.work_item_calls();
     assert_eq!(
