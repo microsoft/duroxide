@@ -48,6 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag. (#74)
 - Relative SQLite queue delays saturate instead of overflowing their timestamp
   representation. (#74)
+- Provider validation's multi-threaded lock-expiration recovery test measures
+  its waits from the first completed claim, so connection warm-up cannot consume
+  the expiry margin. The lease duration and margin are unchanged.
 
 ## [0.1.32] - 2026-10-11
 
