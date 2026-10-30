@@ -133,7 +133,6 @@ pub struct MetricsSnapshot {
     pub activity_infra_errors: u64,
     pub activity_config_errors: u64,
     pub activity_poison: u64,
-    pub activity_admission_deferrals: u64,
     pub orch_dispatcher_items_fetched: u64,
     pub worker_dispatcher_items_fetched: u64,
     pub orch_continue_as_new: u64,
@@ -472,6 +471,12 @@ impl MetricsProvider {
         self.activity_admission_deferrals_atomic.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Number of admission deferrals whose abandon returned success.
+    #[inline]
+    pub fn activity_admission_deferrals(&self) -> u64 {
+        self.activity_admission_deferrals_atomic.load(Ordering::Relaxed)
+    }
+
     #[inline]
     pub fn record_orchestration_poison(&self) {
         self.orch_poison_atomic.fetch_add(1, Ordering::Relaxed);
@@ -639,7 +644,6 @@ impl MetricsProvider {
             activity_infra_errors: self.activity_infra_errors_atomic.load(Ordering::Relaxed),
             activity_config_errors: self.activity_config_errors_atomic.load(Ordering::Relaxed),
             activity_poison: self.activity_poison_atomic.load(Ordering::Relaxed),
-            activity_admission_deferrals: self.activity_admission_deferrals_atomic.load(Ordering::Relaxed),
             orch_dispatcher_items_fetched: self.orch_dispatcher_items_fetched_atomic.load(Ordering::Relaxed),
             worker_dispatcher_items_fetched: self.worker_dispatcher_items_fetched_atomic.load(Ordering::Relaxed),
             orch_continue_as_new: self.orch_continue_as_new_atomic.load(Ordering::Relaxed),

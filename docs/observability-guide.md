@@ -271,6 +271,9 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 - **Labels**: `activity_name`, `tag`
 - **Use**: Identify resource-constrained activities without counting deferrals as executions
 
+For an in-process count, use `MetricsProvider::activity_admission_deferrals()`.
+The existing public `MetricsSnapshot` fields remain unchanged.
+
 The "Activity started" log appears only after admission succeeds. Admission
 rejections, panics, and zero retry delays count as `app_error`; storage failures
 while deferring count as `infra_error`, even if the fallback abandon succeeds.

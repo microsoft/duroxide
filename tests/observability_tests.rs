@@ -1491,6 +1491,51 @@ async fn test_metrics_outcome_matrix() {
     assert_eq!(metrics.snapshot().orch_continue_as_new, 1);
 }
 
+#[test]
+fn metrics_snapshot_preserves_public_struct_literals_and_patterns() {
+    use duroxide::runtime::observability::MetricsSnapshot;
+
+    let snapshot = MetricsSnapshot {
+        orch_starts: 1,
+        orch_completions: 0,
+        orch_failures: 0,
+        orch_application_errors: 0,
+        orch_infrastructure_errors: 0,
+        orch_configuration_errors: 0,
+        orch_poison: 0,
+        activity_success: 0,
+        activity_app_errors: 0,
+        activity_infra_errors: 0,
+        activity_config_errors: 0,
+        activity_poison: 0,
+        orch_dispatcher_items_fetched: 0,
+        worker_dispatcher_items_fetched: 0,
+        orch_continue_as_new: 0,
+        suborchestration_calls: 0,
+        provider_errors: 0,
+    };
+    let MetricsSnapshot {
+        orch_starts,
+        orch_completions: _,
+        orch_failures: _,
+        orch_application_errors: _,
+        orch_infrastructure_errors: _,
+        orch_configuration_errors: _,
+        orch_poison: _,
+        activity_success: _,
+        activity_app_errors: _,
+        activity_infra_errors: _,
+        activity_config_errors: _,
+        activity_poison: _,
+        orch_dispatcher_items_fetched: _,
+        worker_dispatcher_items_fetched: _,
+        orch_continue_as_new: _,
+        suborchestration_calls: _,
+        provider_errors: _,
+    } = snapshot;
+    assert_eq!(orch_starts, 1);
+}
+
 /// Test: MetricsProvider activity outcome types
 #[tokio::test]
 async fn test_metrics_activity_outcomes() {
@@ -1517,7 +1562,7 @@ async fn test_metrics_activity_outcomes() {
 
     metrics.record_activity_admission_deferral("TestActivity", Some("build"));
     let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.activity_admission_deferrals, 1);
+    assert_eq!(metrics.activity_admission_deferrals(), 1);
     assert_eq!(snapshot.activity_success, 1);
     assert_eq!(snapshot.activity_app_errors, 1);
     assert_eq!(snapshot.activity_infra_errors, 1);

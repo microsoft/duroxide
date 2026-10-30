@@ -30,6 +30,14 @@ fn options() -> RuntimeOptions {
     }
 }
 
+fn admission_deferrals(runtime: &Runtime) -> u64 {
+    runtime
+        .observability_handle()
+        .unwrap()
+        .metrics_provider()
+        .activity_admission_deferrals()
+}
+
 fn orchestrations() -> OrchestrationRegistry {
     OrchestrationRegistry::builder()
         .register("Run", |ctx: OrchestrationContext, activity: String| async move {
@@ -227,7 +235,7 @@ async fn deferred_admission_frees_worker_without_consuming_attempts_and_survives
         OrchestrationStatus::Completed { output, .. } if output == "payload"
     ));
     runtime.clone().shutdown(None).await;
-    assert!(runtime.metrics_snapshot().unwrap().activity_admission_deferrals >= 20);
+    assert!(admission_deferrals(&runtime) >= 20);
 
     let history = store.read("limited").await.unwrap();
     assert_eq!(
@@ -366,7 +374,7 @@ async fn failed_deferral_retries_the_same_delay_and_restores_the_attempt() {
     ));
     assert_eq!(store.work_abandons(), vec![(Some(delay), true); 2]);
     let metrics = runtime.metrics_snapshot().unwrap();
-    assert_eq!(metrics.activity_admission_deferrals, 1);
+    assert_eq!(admission_deferrals(&runtime), 1);
     assert_eq!(metrics.activity_infra_errors, 1);
     assert_eq!(
         events
@@ -422,7 +430,7 @@ async fn uncommitted_deferral_consumes_attempt_and_is_not_counted_as_deferred() 
     ));
     assert_eq!(store.work_abandons(), vec![(Some(delay), true); 2]);
     let metrics = runtime.metrics_snapshot().unwrap();
-    assert_eq!(metrics.activity_admission_deferrals, 0);
+    assert_eq!(admission_deferrals(&runtime), 0);
     assert_eq!(metrics.activity_infra_errors, 1);
     assert_eq!(metrics.activity_app_errors, 0);
     assert!(
@@ -481,7 +489,7 @@ async fn shutdown_before_deferral_commit_can_poison_without_a_handler_start() {
             .expect("deferral must reach its uncommitted abandon");
         runtime.clone().shutdown(Some(0)).await;
         assert_eq!(admissions.load(Ordering::SeqCst), attempt);
-        assert_eq!(runtime.metrics_snapshot().unwrap().activity_admission_deferrals, 0);
+        assert_eq!(admission_deferrals(&runtime), 0);
         assert!(
             !store
                 .read("stopped-deferral")
@@ -550,7 +558,7 @@ async fn shutdown_after_deferral_commit_preserves_attempt_refund_without_a_respo
         .await
         .expect("deferral must commit before its response is blocked");
     runtime.clone().shutdown(Some(0)).await;
-    assert_eq!(runtime.metrics_snapshot().unwrap().activity_admission_deferrals, 0);
+    assert_eq!(admission_deferrals(&runtime), 0);
     assert!(
         !store
             .read("committed-deferral")
@@ -633,7 +641,7 @@ async fn metadata_read_failure_consumes_an_attempt_before_admission() {
         let metrics = runtime.metrics_snapshot().unwrap();
         assert_eq!(metrics.activity_infra_errors, 1);
         assert_eq!(metrics.activity_app_errors, 0);
-        assert_eq!(metrics.activity_admission_deferrals, 0);
+        assert_eq!(admission_deferrals(&runtime), 0);
     }
 }
 
@@ -846,7 +854,7 @@ async fn rejected_panicking_and_invalid_admission_never_invokes_handler() {
     let metrics = runtime.metrics_snapshot().unwrap();
     assert!(metrics.activity_app_errors >= 3);
     assert_eq!(metrics.activity_infra_errors, 0);
-    assert_eq!(metrics.activity_admission_deferrals, 0);
+    assert_eq!(admission_deferrals(&runtime), 0);
     assert!(
         !events
             .lock()
