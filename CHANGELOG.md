@@ -30,8 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be upgraded to provide this behavior in a mixed-version deployment. (#74)
 - Activity metadata uses the lightweight instance lookup for the current
   execution instead of re-reading its full history on every attempt. Activities
-  from earlier executions read their own execution's metadata. Failed deferral
-  retries preserve the requested delay and attempt-restoration flag. (#74)
+  from earlier executions read their own execution's metadata. Both lookup paths
+  record provider-operation metrics. If the execution-history fallback fails,
+  processing now abandons the fetch with its attempt counted and reports an
+  infrastructure error instead of invoking the activity with `unknown` metadata.
+  This applies to ordinary and admission-controlled activities; repeated read
+  failures can exhaust the fetch budget before either handler runs. Metadata
+  failures are logged separately from acknowledgment and deferral failures. (#74)
+- Failed deferral retries preserve the requested delay and attempt-restoration
+  flag. (#74)
 - Relative SQLite queue delays saturate instead of overflowing their timestamp
   representation. (#74)
 

@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::fault_injection::FailingProvider;
+use common::fault_injection::{FailingProvider, PoisonInjectingProvider};
 use common::tracing_capture::CapturedEvent;
 use duroxide::providers::sqlite::SqliteProvider;
 use duroxide::providers::{Provider, WorkItem};
@@ -16,6 +16,7 @@ use duroxide::runtime;
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{LogFormat, ObservabilityConfig, RuntimeOptions, UnregisteredBackoffConfig};
 use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::Level;
@@ -1077,6 +1078,134 @@ async fn test_versioned_orchestration_metrics() {
     );
     // Note: Version labels are recorded in OTel metrics (orchestration_name, version)
     // but not exposed in atomic counter snapshot
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn activity_metadata_provider_operations_are_instrumented() {
+    for history_fallback in [false, true] {
+        let recorder = DebuggingRecorder::new();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+        let provider = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
+        if history_fallback {
+            provider.hide_management_capability();
+            provider.fail_execution_history_reads(1);
+        }
+        let activities = ActivityRegistry::builder()
+            .register("Activity", |ctx: ActivityContext, input: String| async move {
+                assert_eq!(ctx.orchestration_name(), "MetadataOrch");
+                assert_eq!(ctx.orchestration_version(), "1.0.0");
+                Ok(input)
+            })
+            .build();
+        let orchestrations = OrchestrationRegistry::builder()
+            .register("MetadataOrch", |ctx: OrchestrationContext, input: String| async move {
+                ctx.schedule_activity("Activity", input).await
+            })
+            .build();
+        let rt = runtime::Runtime::start_with_options(
+            provider,
+            activities,
+            orchestrations,
+            RuntimeOptions {
+                worker_concurrency: 1,
+                orchestration_concurrency: 1,
+                max_attempts: 2,
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                ..Default::default()
+            },
+        )
+        .await;
+        let client = Client::new(sqlite);
+        client
+            .start_orchestration("metadata-metrics", "MetadataOrch", "payload")
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("metadata-metrics", Duration::from_secs(5))
+            .await;
+        rt.clone().shutdown(None).await;
+        assert!(matches!(
+            status.unwrap(),
+            OrchestrationStatus::Completed { output, .. } if output == "payload"
+        ));
+
+        let captured = recorder.snapshotter().snapshot().into_vec();
+        let assert_duration = |operation: &str, status: &str| {
+            let (key, _, _, value) = captured
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "duroxide_provider_operation_duration_seconds"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == operation)
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "status" && label.value() == status)
+                })
+                .unwrap_or_else(|| panic!("missing duration metric for {operation}/{status}"));
+            assert_eq!(key.key().labels().count(), 2);
+            assert!(matches!(value, DebugValue::Histogram(samples) if samples.len() == 1));
+        };
+        if history_fallback {
+            assert_duration("read_with_execution", "error");
+            assert_duration("read_with_execution", "success");
+            let (key, _, _, value) = captured
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "duroxide_provider_errors_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == "read_with_execution")
+                })
+                .expect("metadata read failure must emit a provider error counter");
+            assert!(
+                key.key()
+                    .labels()
+                    .any(|label| label.key() == "error_type" && label.value() == "other")
+            );
+            assert_eq!(value, &DebugValue::Counter(1));
+            assert_eq!(rt.metrics_snapshot().unwrap().provider_errors, 1);
+        } else {
+            assert_duration("get_instance_info", "success");
+            assert_eq!(rt.metrics_snapshot().unwrap().provider_errors, 0);
+        }
+    }
+}
+
+#[test]
+fn admission_deferral_metric_has_activity_and_tag_labels() {
+    let recorder = DebuggingRecorder::new();
+    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+    let metrics = runtime::observability::MetricsProvider::new(&ObservabilityConfig::default()).unwrap();
+    metrics.record_activity_admission_deferral("Limited", Some("network"));
+    metrics.record_activity_admission_deferral("Limited", None);
+
+    let captured = recorder.snapshotter().snapshot().into_vec();
+    assert_eq!(captured.len(), 2);
+    for tag in ["network", "default"] {
+        let (key, _, _, value) = captured
+            .iter()
+            .find(|(key, _, _, _)| {
+                key.key().name() == "duroxide_activity_admission_deferrals_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "tag" && label.value() == tag)
+            })
+            .expect("missing admission deferral counter");
+        assert_eq!(key.key().labels().count(), 2);
+        assert!(
+            key.key()
+                .labels()
+                .any(|label| label.key() == "activity_name" && label.value() == "Limited")
+        );
+        assert_eq!(value, &DebugValue::Counter(1));
+    }
+    assert_eq!(metrics.activity_admission_deferrals(), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]

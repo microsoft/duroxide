@@ -748,7 +748,7 @@ async fn fetch_work_item(
          WHERE id = (
              SELECT id FROM worker_queue
              WHERE visible_at <= ? AND (lock_token IS NULL OR locked_until <= ?)
-             ORDER BY id LIMIT 1
+             ORDER BY visible_at, id LIMIT 1
          )
          RETURNING work_item, attempt_count, instance_id",
         lock_token, locked_until, now, now
@@ -1457,10 +1457,12 @@ that a handler actually began executing across a process crash.
 The worker uses `ProviderAdmin::get_instance_info` for lightweight activity
 metadata when it describes the activity's execution. Providers without that
 capability, and activities from an earlier execution, fall back to
-`read_with_execution`. Metadata must describe the requested execution, not a
-newer continue-as-new execution. If the execution-history read fails, the worker
-abandons the fetch without restoring its attempt and does not invoke admission
-or the handler.
+`read_with_execution`, loading the full execution history on every attempt,
+including repeated admission deferrals. There is no descriptor cache.
+Both lookup paths record provider-operation latency and errors. Metadata must
+describe the requested execution, not a newer continue-as-new execution. If the
+execution-history read fails, the worker abandons the fetch without restoring
+its attempt and does not invoke admission or the handler.
 
 ### ack_work_item() — Complete Implementation
 

@@ -585,15 +585,32 @@ async fn shutdown_after_deferral_commit_preserves_attempt_refund_without_a_respo
 
 #[tokio::test(flavor = "current_thread")]
 async fn metadata_read_failure_consumes_an_attempt_before_admission() {
-    for max_attempts in [1, 2] {
+    for (max_attempts, read_failures, admission_controlled) in [
+        (1, 1, false),
+        (1, 1, true),
+        (2, 1, false),
+        (2, 1, true),
+        (2, 2, false),
+        (2, 2, true),
+    ] {
+        let (events, _guard) = common::tracing_capture::install_tracing_capture();
         let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
         let store = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
         store.hide_management_capability();
-        store.fail_execution_history_reads(1);
+        store.fail_execution_history_reads(read_failures);
         let admissions = Arc::new(AtomicUsize::new(0));
         let callback_admissions = admissions.clone();
-        let activities = ActivityRegistry::builder()
-            .register_with_admission(
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let calls = handler_calls.clone();
+        let handler = move |ctx: ActivityContext, input: String| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(ctx.orchestration_name(), "Run");
+            assert_eq!(ctx.orchestration_version(), "1.0.0");
+            async move { Ok(input) }
+        };
+        let builder = ActivityRegistry::builder();
+        let activities = if admission_controlled {
+            builder.register_with_admission(
                 "Limited",
                 move |ctx, _input| {
                     callback_admissions.fetch_add(1, Ordering::SeqCst);
@@ -601,9 +618,12 @@ async fn metadata_read_failure_consumes_an_attempt_before_admission() {
                     assert_eq!(ctx.orchestration_version(), "1.0.0");
                     Ok(ActivityAdmission::admit(()))
                 },
-                |_ctx, input| async move { Ok(input) },
+                handler,
             )
-            .build();
+        } else {
+            builder.register("Limited", handler)
+        }
+        .build();
         let runtime = Runtime::start_with_options(
             store.clone(),
             activities,
@@ -624,24 +644,44 @@ async fn metadata_read_failure_consumes_an_attempt_before_admission() {
             .await
             .unwrap();
         runtime.clone().shutdown(None).await;
-        if max_attempts == 1 {
+        if read_failures == max_attempts {
             assert!(matches!(
                 status,
                 OrchestrationStatus::Failed {
-                    details: duroxide::ErrorDetails::Poison { attempt_count: 2, .. },
+                    details: duroxide::ErrorDetails::Poison { attempt_count, .. },
                     ..
-                }
+                } if attempt_count == max_attempts + 1
             ));
             assert_eq!(admissions.load(Ordering::SeqCst), 0);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
         } else {
             assert!(matches!(status, OrchestrationStatus::Completed { output, .. } if output == "payload"));
-            assert_eq!(admissions.load(Ordering::SeqCst), 1);
+            assert_eq!(admissions.load(Ordering::SeqCst), usize::from(admission_controlled));
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         }
-        assert_eq!(store.work_abandons(), vec![(Some(Duration::from_millis(100)), false)]);
+        let expected_failures = usize::try_from(read_failures).unwrap();
+        assert_eq!(
+            store.work_abandons(),
+            vec![(Some(Duration::from_millis(100)), false); expected_failures]
+        );
         let metrics = runtime.metrics_snapshot().unwrap();
-        assert_eq!(metrics.activity_infra_errors, 1);
+        assert_eq!(metrics.activity_infra_errors, u64::from(read_failures));
+        assert_eq!(metrics.provider_errors, u64::from(read_failures));
         assert_eq!(metrics.activity_app_errors, 0);
         assert_eq!(admission_deferrals(&runtime), 0);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.message == "worker: activity metadata read failed, abandoning work item")
+                .count(),
+            expected_failures
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.message.contains("activity acknowledgment or deferral failed"))
+        );
     }
 }
 

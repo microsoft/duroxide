@@ -31,7 +31,7 @@
 //! 3. The worker dispatcher waits up to the grace period for the activity to complete
 //! 4. If the activity doesn't complete, it's aborted and the work item is dropped
 
-use crate::providers::WorkItem;
+use crate::providers::{WorkItem, instrumented::instrument_provider_operation};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -125,8 +125,6 @@ enum ActivityOutcome {
     Cancelled,
     /// Admission deferred without executing the handler
     Deferred(Duration),
-    /// Activity setup failed before invocation
-    InfraError,
 }
 
 enum ActivityInvocation {
@@ -494,7 +492,15 @@ async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::Activity
     let activity_ctx = match build_activity_context(rt, &ctx, cancellation_token.clone()).await {
         Ok(activity_ctx) => activity_ctx,
         Err(error) => {
-            handle_activity_outcome(rt, &ctx, Err(error), ActivityOutcome::InfraError).await;
+            warn!(
+                instance = %ctx.instance,
+                execution_id = ctx.execution_id,
+                activity_id = ctx.activity_id,
+                worker_id = %ctx.worker_id,
+                %error,
+                "worker: activity metadata read failed, abandoning work item"
+            );
+            abandon_after_activity_failure(rt, &ctx, Duration::from_millis(100), false).await;
             return;
         }
     };
@@ -531,7 +537,13 @@ async fn build_activity_context(
     cancellation_token: CancellationToken,
 ) -> Result<crate::ActivityContext, crate::providers::ProviderError> {
     let metadata = if let Some(admin) = rt.history_store.as_management_capability() {
-        match admin.get_instance_info(&ctx.instance).await {
+        match instrument_provider_operation(
+            rt.metrics_provider(),
+            "get_instance_info",
+            admin.get_instance_info(&ctx.instance),
+        )
+        .await
+        {
             Ok(info) if info.current_execution_id == ctx.execution_id && info.orchestration_version != "unknown" => {
                 Some((info.orchestration_name, info.orchestration_version))
             }
@@ -847,7 +859,6 @@ async fn handle_activity_outcome(
             ActivityOutcome::Deferred(_) => {
                 rt.record_activity_admission_deferral(&ctx.activity_name, ctx.tag.as_deref())
             }
-            ActivityOutcome::InfraError => rt.record_activity_infra_error(),
             ActivityOutcome::Cancelled => {}
         },
         Err(e) => {
@@ -864,23 +875,35 @@ async fn handle_activity_outcome(
                 ActivityOutcome::Deferred(delay) => (delay, true),
                 _ => (Duration::from_millis(100), false),
             };
-            if let Err(error) = rt
-                .history_store
-                .abandon_work_item(&ctx.lock_token, Some(delay), ignore_attempt)
-                .await
+            if abandon_after_activity_failure(rt, ctx, delay, ignore_attempt).await
+                && matches!(outcome, ActivityOutcome::Deferred(_))
             {
-                warn!(
-                    instance = %ctx.instance,
-                    activity_id = ctx.activity_id,
-                    error = %error,
-                    "Failed to abandon activity work item; waiting for lock expiry"
-                );
-            } else if matches!(outcome, ActivityOutcome::Deferred(_)) {
                 rt.record_activity_admission_deferral(&ctx.activity_name, ctx.tag.as_deref());
             }
-            rt.record_activity_infra_error();
         }
     }
+}
+
+async fn abandon_after_activity_failure(
+    rt: &Arc<Runtime>,
+    ctx: &ActivityWorkContext,
+    delay: Duration,
+    ignore_attempt: bool,
+) -> bool {
+    let result = rt
+        .history_store
+        .abandon_work_item(&ctx.lock_token, Some(delay), ignore_attempt)
+        .await;
+    if let Err(error) = &result {
+        warn!(
+            instance = %ctx.instance,
+            activity_id = ctx.activity_id,
+            %error,
+            "Failed to abandon activity work item; waiting for lock expiry"
+        );
+    }
+    rt.record_activity_infra_error();
+    result.is_ok()
 }
 
 // ============================================================================

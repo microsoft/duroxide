@@ -28,6 +28,7 @@ This document provides a complete reference of all metrics emitted by duroxide v
 | `duroxide_worker_queue_depth` | Gauge | Runtime | _(none)_ | ✅ `test_queue_depth_gauges_tracking` | ✅ Code Review | Observable gauge with callback, initialized via `initialize_gauges()` |
 | **Activity Execution** |
 | `duroxide_activity_executions_total` | Counter | Activity | `activity_name`, `outcome`, `retry_attempt`, `tag` | ✅ `metrics_capture_activity_and_orchestration_outcomes` | ✅ Code Review | Tracks all outcomes including app_error |
+| `duroxide_activity_admission_deferrals_total` | Counter | Activity | `activity_name`, `tag` | ✅ `admission_deferral_metric_has_activity_and_tag_labels` | ✅ Recorder test | Counts observed successful deferral abandons, not executions |
 | `duroxide_activity_duration_seconds` | Histogram | Activity | `activity_name`, `outcome`, `tag` | ✅ `test_activity_duration_tracking` | ✅ Code Review | Buckets: 0.01-300s |
 | `duroxide_activity_infrastructure_errors_total` | Counter | Activity | `activity_name` | ✅ `metrics_capture_activity_and_orchestration_outcomes` | ✅ Code Review | Infra-specific errors |
 | `duroxide_activity_configuration_errors_total` | Counter | Activity | `activity_name` | ✅ `test_error_classification_metrics` | ✅ Code Review | Config-specific errors |
@@ -461,6 +462,29 @@ topk(5,
 
 ---
 
+### 2.5 `duroxide_activity_admission_deferrals_total` (Counter)
+
+**Description:** Admission deferrals whose abandon operation returned success,
+including a successful fallback after an abandon error.
+
+**Labels:**
+- `activity_name` (string) - Activity name
+- `tag` (string) - Activity routing tag, or `"default"` for untagged work
+
+**Semantics:** Deferrals do not count as activity executions or produce activity
+duration samples. Failed abandons count as infrastructure errors; a storage
+commit whose response is lost may not increment this counter. Admission `Err`,
+panic, and zero delay instead produce terminal application failures (`app_error`).
+
+For in-process diagnostics, use `MetricsProvider::activity_admission_deferrals()`;
+the public `MetricsSnapshot` shape is unchanged.
+
+```promql
+sum by (activity_name, tag) (rate(duroxide_activity_admission_deferrals_total[5m]))
+```
+
+---
+
 ## 3. Sub-Orchestration Metrics
 
 > **Session Metrics (Future):** Session-specific metrics (session claims, migrations,
@@ -531,6 +555,8 @@ histogram_quantile(0.95,
   - `"save_event"` - Save event to history
   - `"create_instance"` - Create new orchestration instance
   - `"query"` - Query operation
+  - `"get_instance_info"` - Lightweight activity metadata lookup
+  - `"read_with_execution"` - Execution-history metadata fallback
 - `status` (string) - Operation status:
   - `"success"` - Operation succeeded
   - `"error"` - Operation failed
@@ -566,6 +592,7 @@ histogram_quantile(0.99,
   - `"deadlock"` - Database deadlock
   - `"corruption"` - Data corruption
   - `"constraint_violation"` - Database constraint violation
+  - `"other"` - Errors not classified as timeout, connection, or deadlock
 
 **Purpose:** Database health monitoring, alerting on infrastructure issues
 
