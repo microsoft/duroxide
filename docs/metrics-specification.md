@@ -32,6 +32,7 @@ This document provides a complete reference of all metrics emitted by duroxide v
 | `duroxide_activity_duration_seconds` | Histogram | Activity | `activity_name`, `outcome`, `tag` | ✅ `test_activity_duration_tracking` | ✅ Code Review | Buckets: 0.01-300s |
 | `duroxide_activity_infrastructure_errors_total` | Counter | Activity | `activity_name` | ✅ `metrics_capture_activity_and_orchestration_outcomes` | ✅ Code Review | Infra-specific errors |
 | `duroxide_activity_configuration_errors_total` | Counter | Activity | `activity_name` | ✅ `test_error_classification_metrics` | ✅ Code Review | Config-specific errors |
+| `duroxide_activity_ack_uncertain_total` | Counter | Activity | _(none)_ | ✅ `test_metrics_activity_ack_uncertain` | ✅ Emitted | Counts uncertain acknowledgement outcomes, not confirmed failures |
 | **Poison Message** |
 | `duroxide_orchestration_poison_total` | Counter | Poison | _(none)_ | ✅ `test_poison_message_metrics` | ✅ Code Review | Orchestrations exceeding max_attempts |
 | `duroxide_activity_poison_total` | Counter | Poison | _(none)_ | ✅ `test_poison_message_metrics` | ✅ Code Review | Activities exceeding max_attempts |
@@ -485,6 +486,21 @@ sum by (activity_name, tag) (rate(duroxide_activity_admission_deferrals_total[5m
 
 ---
 
+### 2.6 `duroxide_activity_ack_uncertain_total` (Counter)
+
+**Description:** Activity completion acknowledgements ending in a permanent error
+after a retryable error. Incremented once per uncertain outcome, not per retry.
+
+**Labels:** _(none)_
+
+**Purpose:** Track uncertain acknowledgements separately from confirmed activity
+infrastructure failures. An earlier attempt may have committed or the lock may
+have been lost; redelivery is not guaranteed. This counter does not increment
+`duroxide_activity_executions_total` or `duroxide_activity_infrastructure_errors_total`.
+The runtime metrics snapshot exposes it as `activity_ack_uncertain`.
+
+---
+
 ## 3. Sub-Orchestration Metrics
 
 > **Session Metrics (Future):** Session-specific metrics (session claims, migrations,
@@ -935,4 +951,3 @@ RuntimeOptions {
 ---
 
 **Document Status:** This specification reflects the **current implementation** as of 2025-12-13. Client metrics are defined but not yet instrumented. All implemented metrics have test coverage in `tests/observability_tests.rs`. Poison message handling was added in v1.1.
-
