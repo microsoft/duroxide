@@ -295,11 +295,19 @@ Failures loading activity metadata before admission also consume attempts.
 Deferral is not a retry of an executed activity.
 
 An admission error, panic, or zero delay fails the activity rather than invoking
-the handler and is reported as an application error. Storage errors during
-deferral are infrastructure errors; an immediate fallback abandon preserves the
-same delay and attempt-restoration flag. If that also fails, recovery waits for
-the work lock to expire, which can happen before the requested delay. A requested
-delay is not a durable "not before" guarantee until its abandon commits.
+the handler. These deliberately use the same durable `ActivityFailed` result as
+handler errors, with application classification and `retryable: false`.
+`Defer` is the retry signal for temporary capacity shortages; `Err` means a
+permanent rejection, while panic and zero delay indicate faulty admission logic.
+Automatically retrying those failures as infrastructure backpressure could
+repeat invalid input or broken configuration indefinitely. The orchestration
+can catch the activity failure and choose its own recovery.
+
+Storage errors during deferral are infrastructure errors; an immediate fallback
+abandon preserves the same delay and attempt-restoration flag. If that also
+fails, recovery waits for the work lock to expire, which can happen before the
+requested delay. A requested delay is not a durable "not before" guarantee until
+its abandon commits.
 Deferrals whose abandon returns success increment
 `duroxide_activity_admission_deferrals_total`, not the activity execution counter;
 a commit whose response is lost can restore the attempt without being counted.

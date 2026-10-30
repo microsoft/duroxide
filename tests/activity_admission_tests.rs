@@ -834,7 +834,7 @@ async fn rejected_panicking_and_invalid_admission_never_invokes_handler() {
         )
         .build();
     let runtime = Runtime::start_with_options(store.clone(), activities, orchestrations(), options()).await;
-    let client = Client::new(store);
+    let client = Client::new(store.clone());
     for (instance, message) in [
         ("rejected", "invalid admission configuration"),
         ("panic", "expected admission panic"),
@@ -849,6 +849,23 @@ async fn rejected_panicking_and_invalid_admission_never_invokes_handler() {
             matches!(status, OrchestrationStatus::Failed { ref details, .. } if details.display_message().contains(message)),
             "unexpected status: {status:?}"
         );
+        let history = store.read(instance).await.unwrap();
+        let failures: Vec<_> = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::ActivityFailed { details, .. } => Some(details),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 1, "admission rejection is a terminal activity result");
+        assert!(matches!(
+            failures[0],
+            duroxide::ErrorDetails::Application {
+                kind: duroxide::AppErrorKind::ActivityFailed,
+                retryable: false,
+                ..
+            }
+        ));
     }
     runtime.clone().shutdown(None).await;
     let metrics = runtime.metrics_snapshot().unwrap();

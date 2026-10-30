@@ -497,9 +497,13 @@ impl ActivityAdmission {
 pub trait ActivityHandler: Send + Sync {
     /// Reserve resources without blocking or performing I/O.
     ///
-    /// Called again on each deferred fetch, outside orchestration replay. An
-    /// error rejects the activity as an application failure. A returned guard
-    /// must release its reservation on drop, including cancellation and panic.
+    /// Called again on each deferred fetch, outside orchestration replay. Use
+    /// `Defer` for temporary capacity shortages. An error, panic, or zero-delay
+    /// decision produces a durable, non-retryable application failure without
+    /// invoking the handler; the worker does not retry faulty admission logic
+    /// as infrastructure backpressure. An orchestration can handle that failure.
+    /// A returned guard must release its reservation on drop, including
+    /// cancellation and panic.
     ///
     /// # Errors
     ///
