@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::fault_injection::FailingProvider;
+use common::fault_injection::{FailingProvider, PoisonInjectingProvider};
 use common::tracing_capture::CapturedEvent;
 use duroxide::providers::sqlite::SqliteProvider;
 use duroxide::providers::{Provider, WorkItem};
@@ -16,6 +16,7 @@ use duroxide::runtime;
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{LogFormat, ObservabilityConfig, RuntimeOptions, UnregisteredBackoffConfig};
 use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::Level;
@@ -1080,6 +1081,134 @@ async fn test_versioned_orchestration_metrics() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn activity_metadata_provider_operations_are_instrumented() {
+    for history_fallback in [false, true] {
+        let recorder = DebuggingRecorder::new();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+        let provider = Arc::new(PoisonInjectingProvider::new(sqlite.clone()));
+        if history_fallback {
+            provider.hide_management_capability();
+            provider.fail_execution_history_reads(1);
+        }
+        let activities = ActivityRegistry::builder()
+            .register("Activity", |ctx: ActivityContext, input: String| async move {
+                assert_eq!(ctx.orchestration_name(), "MetadataOrch");
+                assert_eq!(ctx.orchestration_version(), "1.0.0");
+                Ok(input)
+            })
+            .build();
+        let orchestrations = OrchestrationRegistry::builder()
+            .register("MetadataOrch", |ctx: OrchestrationContext, input: String| async move {
+                ctx.schedule_activity("Activity", input).await
+            })
+            .build();
+        let rt = runtime::Runtime::start_with_options(
+            provider,
+            activities,
+            orchestrations,
+            RuntimeOptions {
+                worker_concurrency: 1,
+                orchestration_concurrency: 1,
+                max_attempts: 2,
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                ..Default::default()
+            },
+        )
+        .await;
+        let client = Client::new(sqlite);
+        client
+            .start_orchestration("metadata-metrics", "MetadataOrch", "payload")
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("metadata-metrics", Duration::from_secs(5))
+            .await;
+        rt.clone().shutdown(None).await;
+        assert!(matches!(
+            status.unwrap(),
+            OrchestrationStatus::Completed { output, .. } if output == "payload"
+        ));
+
+        let captured = recorder.snapshotter().snapshot().into_vec();
+        let assert_duration = |operation: &str, status: &str| {
+            let (key, _, _, value) = captured
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "duroxide_provider_operation_duration_seconds"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == operation)
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "status" && label.value() == status)
+                })
+                .unwrap_or_else(|| panic!("missing duration metric for {operation}/{status}"));
+            assert_eq!(key.key().labels().count(), 2);
+            assert!(matches!(value, DebugValue::Histogram(samples) if samples.len() == 1));
+        };
+        if history_fallback {
+            assert_duration("read_with_execution", "error");
+            assert_duration("read_with_execution", "success");
+            let (key, _, _, value) = captured
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "duroxide_provider_errors_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == "read_with_execution")
+                })
+                .expect("metadata read failure must emit a provider error counter");
+            assert!(
+                key.key()
+                    .labels()
+                    .any(|label| label.key() == "error_type" && label.value() == "other")
+            );
+            assert_eq!(value, &DebugValue::Counter(1));
+            assert_eq!(rt.metrics_snapshot().unwrap().provider_errors, 1);
+        } else {
+            assert_duration("get_instance_info", "success");
+            assert_eq!(rt.metrics_snapshot().unwrap().provider_errors, 0);
+        }
+    }
+}
+
+#[test]
+fn admission_deferral_metric_has_activity_and_tag_labels() {
+    let recorder = DebuggingRecorder::new();
+    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+    let metrics = runtime::observability::MetricsProvider::new(&ObservabilityConfig::default()).unwrap();
+    metrics.record_activity_admission_deferral("Limited", Some("network"));
+    metrics.record_activity_admission_deferral("Limited", None);
+
+    let captured = recorder.snapshotter().snapshot().into_vec();
+    assert_eq!(captured.len(), 2);
+    for tag in ["network", "default"] {
+        let (key, _, _, value) = captured
+            .iter()
+            .find(|(key, _, _, _)| {
+                key.key().name() == "duroxide_activity_admission_deferrals_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "tag" && label.value() == tag)
+            })
+            .expect("missing admission deferral counter");
+        assert_eq!(key.key().labels().count(), 2);
+        assert!(
+            key.key()
+                .labels()
+                .any(|label| label.key() == "activity_name" && label.value() == "Limited")
+        );
+        assert_eq!(value, &DebugValue::Counter(1));
+    }
+    assert_eq!(metrics.activity_admission_deferrals(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_provider_metrics_recorded() {
     // Test that provider operation metrics are recorded via InstrumentedProvider
     // The InstrumentedProvider is automatically applied when metrics are enabled
@@ -1491,6 +1620,51 @@ async fn test_metrics_outcome_matrix() {
     assert_eq!(metrics.snapshot().orch_continue_as_new, 1);
 }
 
+#[test]
+fn metrics_snapshot_preserves_public_struct_literals_and_patterns() {
+    use duroxide::runtime::observability::MetricsSnapshot;
+
+    let snapshot = MetricsSnapshot {
+        orch_starts: 1,
+        orch_completions: 0,
+        orch_failures: 0,
+        orch_application_errors: 0,
+        orch_infrastructure_errors: 0,
+        orch_configuration_errors: 0,
+        orch_poison: 0,
+        activity_success: 0,
+        activity_app_errors: 0,
+        activity_infra_errors: 0,
+        activity_config_errors: 0,
+        activity_poison: 0,
+        orch_dispatcher_items_fetched: 0,
+        worker_dispatcher_items_fetched: 0,
+        orch_continue_as_new: 0,
+        suborchestration_calls: 0,
+        provider_errors: 0,
+    };
+    let MetricsSnapshot {
+        orch_starts,
+        orch_completions: _,
+        orch_failures: _,
+        orch_application_errors: _,
+        orch_infrastructure_errors: _,
+        orch_configuration_errors: _,
+        orch_poison: _,
+        activity_success: _,
+        activity_app_errors: _,
+        activity_infra_errors: _,
+        activity_config_errors: _,
+        activity_poison: _,
+        orch_dispatcher_items_fetched: _,
+        worker_dispatcher_items_fetched: _,
+        orch_continue_as_new: _,
+        suborchestration_calls: _,
+        provider_errors: _,
+    } = snapshot;
+    assert_eq!(orch_starts, 1);
+}
+
 /// Test: MetricsProvider activity outcome types
 #[tokio::test]
 async fn test_metrics_activity_outcomes() {
@@ -1514,6 +1688,13 @@ async fn test_metrics_activity_outcomes() {
     // Config error
     metrics.record_activity_execution("TestActivity", "config_error", 0.3, 0, Some("build"));
     assert_eq!(metrics.snapshot().activity_config_errors, 1);
+
+    metrics.record_activity_admission_deferral("TestActivity", Some("build"));
+    let snapshot = metrics.snapshot();
+    assert_eq!(metrics.activity_admission_deferrals(), 1);
+    assert_eq!(snapshot.activity_success, 1);
+    assert_eq!(snapshot.activity_app_errors, 1);
+    assert_eq!(snapshot.activity_infra_errors, 1);
 }
 
 /// Test: MetricsProvider poison message tracking

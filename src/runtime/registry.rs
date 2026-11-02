@@ -13,7 +13,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 
-use super::{ActivityHandler, FnActivity, FnOrchestration, OrchestrationHandler};
+use super::{ActivityAdmission, ActivityHandler, FnActivity, FnOrchestration, OrchestrationHandler};
 use crate::_typed_codec::Codec;
 use crate::OrchestrationContext;
 use semver::Version;
@@ -411,6 +411,43 @@ impl OrchestrationRegistryBuilder {
 // Activity Builder - Specialized Methods
 // ============================================================================
 
+async fn invoke_typed_activity<In, Out, F, Fut>(
+    handler: &F,
+    ctx: crate::ActivityContext,
+    input: String,
+) -> Result<String, String>
+where
+    In: serde::de::DeserializeOwned + Send,
+    Out: serde::Serialize + Send,
+    F: Fn(crate::ActivityContext, In) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<Out, String>> + Send,
+{
+    let input: In = crate::_typed_codec::Json::decode(&input)?;
+    let output: Out = handler(ctx, input).await?;
+    crate::_typed_codec::Json::encode(&output)
+}
+
+struct AdmissionControlledActivity<A, F> {
+    admission: A,
+    handler: F,
+}
+
+#[async_trait::async_trait]
+impl<A, F, Fut> ActivityHandler for AdmissionControlledActivity<A, F>
+where
+    A: Fn(&crate::ActivityContext, &str) -> Result<ActivityAdmission, String> + Send + Sync,
+    F: Fn(crate::ActivityContext, String) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<String, String>> + Send,
+{
+    fn try_admit(&self, ctx: &crate::ActivityContext, input: &str) -> Result<ActivityAdmission, String> {
+        (self.admission)(ctx, input)
+    }
+
+    async fn invoke(&self, ctx: crate::ActivityContext, input: String) -> Result<String, String> {
+        (self.handler)(ctx, input).await
+    }
+}
+
 impl ActivityRegistryBuilder {
     /// Deprecated: use `ActivityRegistry::builder_from` instead
     pub fn from_registry(reg: &ActivityRegistry) -> Self {
@@ -453,6 +490,29 @@ impl ActivityRegistryBuilder {
         self
     }
 
+    /// Register an activity with a nonblocking resource-admission callback.
+    ///
+    /// The callback must atomically reserve all required capacity or return
+    /// `Defer` holding none. Admission applies to each execution attempt, not
+    /// replayed activity results. No cross-runtime coordination is provided.
+    pub fn register_with_admission<A, F, Fut>(mut self, name: impl Into<String>, admission: A, f: F) -> Self
+    where
+        A: Fn(&crate::ActivityContext, &str) -> Result<ActivityAdmission, String> + Send + Sync + 'static,
+        F: Fn(crate::ActivityContext, String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        let name = name.into();
+        if self.check_reserved_prefix(&name) || self.check_duplicate(&name, &DEFAULT_VERSION, "activity") {
+            return self;
+        }
+        self.map.entry(name.clone()).or_default().insert(
+            DEFAULT_VERSION,
+            Arc::new(AdmissionControlledActivity { admission, handler: f }),
+        );
+        self.policy.insert(name, VersionPolicy::Latest);
+        self
+    }
+
     pub fn register_typed<In, Out, F, Fut>(mut self, name: impl Into<String>, f: F) -> Self
     where
         In: serde::de::DeserializeOwned + Send + 'static,
@@ -463,11 +523,7 @@ impl ActivityRegistryBuilder {
         let f_clone = std::sync::Arc::new(f);
         let wrapper = move |ctx: crate::ActivityContext, input_s: String| {
             let f_inner = f_clone.clone();
-            async move {
-                let input: In = crate::_typed_codec::Json::decode(&input_s)?;
-                let out: Out = (f_inner)(ctx, input).await?;
-                crate::_typed_codec::Json::encode(&out)
-            }
+            async move { invoke_typed_activity::<In, Out, _, _>(f_inner.as_ref(), ctx, input_s).await }
         };
         let name = name.into();
         // Check reserved prefix first
@@ -484,6 +540,37 @@ impl ActivityRegistryBuilder {
         // Set policy to Latest (hardcoded for activities)
         self.policy.insert(name, VersionPolicy::Latest);
         self
+    }
+
+    /// Register a typed activity with a nonblocking resource-admission callback.
+    ///
+    /// Admission receives a borrowed decoded input; the handler receives an owned
+    /// decoded input. Uses the same codec as [`Self::register_typed`], including
+    /// raw-string compatibility. Invalid input fails before either callback runs.
+    ///
+    /// Input is decoded for each admission check and again for an admitted handler,
+    /// so deserialization must be side-effect-free. Admission and guard lifetime
+    /// follow [`Self::register_with_admission`].
+    pub fn register_typed_with_admission<In, Out, A, F, Fut>(self, name: impl Into<String>, admission: A, f: F) -> Self
+    where
+        In: serde::de::DeserializeOwned + Send + 'static,
+        Out: serde::Serialize + Send + 'static,
+        A: Fn(&crate::ActivityContext, &In) -> Result<ActivityAdmission, String> + Send + Sync + 'static,
+        F: Fn(crate::ActivityContext, In) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Out, String>> + Send + 'static,
+    {
+        let handler = Arc::new(f);
+        self.register_with_admission(
+            name,
+            move |ctx, input| {
+                let input: In = crate::_typed_codec::Json::decode(input)?;
+                admission(ctx, &input)
+            },
+            move |ctx, input| {
+                let handler = Arc::clone(&handler);
+                async move { invoke_typed_activity::<In, Out, _, _>(handler.as_ref(), ctx, input).await }
+            },
+        )
     }
 
     /// Register a built-in activity (bypasses reserved prefix check).

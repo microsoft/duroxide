@@ -242,6 +242,106 @@ activities.register("CallExternalAPI", |ctx: ActivityContext, request: String| a
 | `ctx.is_cancelled()` | Returns `true` if cancellation was requested |
 | `ctx.cancelled()` | Returns a `Future` that completes when cancelled (use in `select!`) |
 
+### Activity Admission
+
+Use `ActivityRegistry::builder().register_with_admission(name, admission, handler)`
+to impose resource limits without occupying worker slots while waiting.
+The synchronous admission callback receives `&ActivityContext` and the activity's
+input as `&str`. It must not block or perform I/O.
+
+```rust
+use duroxide::runtime::{ActivityAdmission, registry::ActivityRegistry};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::{Semaphore, TryAcquireError};
+
+let capacity = Arc::new(Semaphore::new(4));
+let activities = ActivityRegistry::builder()
+    .register_with_admission(
+        "Limited",
+        move |_ctx, _input| match capacity.clone().try_acquire_owned() {
+            Ok(permit) => Ok(ActivityAdmission::admit(permit)),
+            Err(TryAcquireError::NoPermits) => {
+                Ok(ActivityAdmission::Defer(Duration::from_millis(100)))
+            }
+            Err(error) => Err(error.to_string()),
+        },
+        |_ctx, input| async move { Ok(input) },
+    )
+    .build();
+```
+
+`admit(guard)` retains a resource reservation until the handler returns or its
+task is dropped, including error, panic, and cancellation. If several limits
+apply, reserve all of them atomically or defer holding none. Detached work is
+not protected after the handler finishes.
+
+For typed input and output, use
+`register_typed_with_admission(name, admission, handler)`. The admission callback
+receives `&In`; the handler receives an owned `In` and returns `Result<Out, String>`.
+It uses the same codec as `register_typed`, including raw-string compatibility.
+Invalid input fails before either callback runs. Input is decoded for each
+admission check and again when invoking an admitted handler, so deserialization
+must be side-effect-free.
+
+Using the imports above, the same semaphore limit can protect a typed activity:
+
+```rust
+let capacity = Arc::new(Semaphore::new(4));
+let activities = ActivityRegistry::builder().register_typed_with_admission(
+    "Limited",
+    move |_ctx, _input: &u32| match capacity.clone().try_acquire_owned() {
+        Ok(permit) => Ok(ActivityAdmission::admit(permit)),
+        Err(TryAcquireError::NoPermits) => Ok(ActivityAdmission::Defer(Duration::from_millis(100))),
+        Err(error) => Err(error.to_string()),
+    },
+    |_ctx, input: u32| async move { Ok(input) },
+).build();
+```
+
+`Defer(delay)` requires a positive delay. The runtime clamps it to 1 ms through
+24 hours (`ActivityAdmission::MAX_DEFER_DELAY`) before passing it to any provider.
+Computed delays such as `deadline.saturating_duration_since(now)` can become zero
+and fail that activity attempt; use `.max(Duration::from_millis(1))` when zero
+should mean retry soon.
+Deferral leaves the original activity pending in durable storage, frees the
+worker to fetch other work, and does not record an activity result.
+A **committed** deferral restores its fetch attempt. Crashes, shutdown aborts,
+and failed abandons can still consume the poison-message attempt budget, so
+leave room for recovery attempts. This is a fetch-attempt budget, not a count of
+handler starts: an activity can become poison without ever invoking its handler.
+Failures loading activity metadata before admission also consume attempts.
+Deferral is not a retry of an executed activity.
+
+An admission error, panic, or zero delay fails the activity rather than invoking
+the handler. These deliberately use the same durable `ActivityFailed` result as
+handler errors, with application classification and `retryable: false`.
+`Defer` is the retry signal for temporary capacity shortages; `Err` means a
+permanent rejection, while panic and zero delay indicate faulty admission logic.
+Automatically retrying those failures as infrastructure backpressure could
+repeat invalid input or broken configuration indefinitely. The orchestration
+can catch the activity failure and choose its own recovery.
+`schedule_activity_with_retry` receives only an error message, so it retries
+admission failures regardless of `retryable: false`, scheduling fresh attempts
+and rerunning admission up to the policy's attempt limit.
+
+Storage errors during deferral are infrastructure errors; an immediate fallback
+abandon preserves the same delay and attempt-restoration flag. If that also
+fails, recovery waits for the work lock to expire, which can happen before the
+requested delay. A requested delay is not a durable "not before" guarantee until
+its abandon commits.
+Deferrals whose abandon returns success increment
+`duroxide_activity_admission_deferrals_total`, not the activity execution counter;
+a commit whose response is lost can restore the attempt without being counted.
+The "Activity started" log is emitted only after admission succeeds.
+
+Admission runs outside orchestration replay; completed results are unaffected.
+Each recovered execution attempt is admitted again. Resource counters belong
+to the application and are not automatically coordinated across runtimes.
+Keep total worker capacity above the admitted activity ceiling if other work
+needs headroom. Providers must allow already-ready work to progress past deferred
+items, including after a deferral's delay expires. This is not a guarantee of
+equal throughput or admission fairness between workflows.
+
 ### The Replay Model
 
 
@@ -2693,4 +2793,3 @@ async fn fast_updates(ctx: OrchestrationContext, items_json: String) -> Result<(
 ---
 
 **You now have everything needed to build production-grade durable workflows!** 🎉
-

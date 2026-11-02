@@ -247,6 +247,8 @@ pub struct RuntimeOptions {
     ///
     /// After this many fetch attempts, the runtime will immediately fail
     /// the orchestration/activity with a Poison error instead of processing.
+    /// Fetches can consume this budget before a handler starts, including metadata
+    /// read failures and shutdown during an uncommitted admission deferral.
     ///
     /// Default: 10
     pub max_attempts: u32,
@@ -455,9 +457,62 @@ where
     }
 }
 
+/// A nonblocking admission decision made before invoking an activity.
+#[non_exhaustive]
+pub enum ActivityAdmission {
+    /// The guard is held until the activity handler returns or its task is dropped.
+    Admit(Box<dyn Send>),
+    /// Leave the activity pending and retry admission after a positive delay.
+    ///
+    /// Positive delays are clamped to one millisecond through [`Self::MAX_DEFER_DELAY`].
+    /// Deferral releases the worker slot without recording a history event or
+    /// consuming a fetch attempt once the deferral commits. Interrupted or failed
+    /// deferrals can still consume attempts and be redelivered on lock expiry
+    /// before the requested delay. An activity may become poison without starting
+    /// its handler. Deferral does not retry an executed activity.
+    Defer(Duration),
+}
+
+impl std::fmt::Debug for ActivityAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admit(_) => f.debug_tuple("Admit").finish_non_exhaustive(),
+            Self::Defer(delay) => f.debug_tuple("Defer").field(delay).finish(),
+        }
+    }
+}
+
+impl ActivityAdmission {
+    /// Maximum admission retry delay: 24 hours, independent of the provider.
+    pub const MAX_DEFER_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Admit an activity while retaining ownership of its resource reservation.
+    pub fn admit(guard: impl Send + 'static) -> Self {
+        Self::Admit(Box::new(guard))
+    }
+}
+
 /// Trait implemented by activity handlers that can be invoked by the runtime.
 #[async_trait]
 pub trait ActivityHandler: Send + Sync {
+    /// Reserve resources without blocking or performing I/O.
+    ///
+    /// Called again on each deferred fetch, outside orchestration replay. Use
+    /// `Defer` for temporary capacity shortages. An error, panic, or zero-delay
+    /// decision produces a durable, non-retryable application failure without
+    /// invoking the handler; the worker does not retry faulty admission logic
+    /// as infrastructure backpressure. An orchestration can handle that failure.
+    /// A returned guard must release its reservation on drop, including
+    /// cancellation and panic.
+    ///
+    /// # Errors
+    ///
+    /// Return an error when admission configuration is invalid or a required
+    /// resource is unavailable permanently, rather than temporarily at capacity.
+    fn try_admit(&self, _ctx: &crate::ActivityContext, _input: &str) -> Result<ActivityAdmission, String> {
+        Ok(ActivityAdmission::admit(()))
+    }
+
     async fn invoke(&self, ctx: crate::ActivityContext, input: String) -> Result<String, String>;
 }
 
@@ -655,6 +710,13 @@ impl Runtime {
     fn record_activity_infra_error(&self) {
         if let Some(provider) = self.metrics_provider() {
             provider.record_activity_infra_error();
+        }
+    }
+
+    #[inline]
+    fn record_activity_admission_deferral(&self, activity_name: &str, tag: Option<&str>) {
+        if let Some(provider) = self.metrics_provider() {
+            provider.record_activity_admission_deferral(activity_name, tag);
         }
     }
 

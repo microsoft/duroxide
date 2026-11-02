@@ -14,6 +14,40 @@ use super::{
 use crate::Event;
 use crate::runtime::observability::MetricsProvider;
 
+fn record_provider_error(metrics: &MetricsProvider, operation: &str, error: &ProviderError) {
+    let error_type = if error.message.contains("deadlock") {
+        "deadlock"
+    } else if error.message.contains("timeout") {
+        "timeout"
+    } else if error.message.contains("connection") {
+        "connection"
+    } else {
+        "other"
+    };
+    metrics.record_provider_error(operation, error_type);
+}
+
+// Management capabilities bypass the wrapper, so their callers share this instrumentation.
+pub(crate) async fn instrument_provider_operation<T>(
+    metrics: Option<&MetricsProvider>,
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T, ProviderError>>,
+) -> Result<T, ProviderError> {
+    let start = std::time::Instant::now();
+    let result = future.await;
+    if let Some(metrics) = metrics {
+        metrics.record_provider_operation(
+            operation,
+            start.elapsed().as_secs_f64(),
+            if result.is_ok() { "success" } else { "error" },
+        );
+        if let Err(error) = &result {
+            record_provider_error(metrics, operation, error);
+        }
+    }
+    result
+}
+
 /// Wrapper that adds metrics instrumentation to any Provider implementation.
 ///
 /// This follows the decorator pattern to automatically record:
@@ -61,16 +95,7 @@ impl InstrumentedProvider {
     #[inline]
     fn record_error(&self, operation: &str, error: &ProviderError) {
         if let Some(ref m) = self.metrics {
-            let error_type = if error.message.contains("deadlock") {
-                "deadlock"
-            } else if error.message.contains("timeout") {
-                "timeout"
-            } else if error.message.contains("connection") {
-                "connection"
-            } else {
-                "other"
-            };
-            m.record_provider_error(operation, error_type);
+            record_provider_error(m, operation, error);
         }
     }
 }
@@ -159,20 +184,16 @@ impl Provider for InstrumentedProvider {
     }
 
     async fn read(&self, instance: &str) -> Result<Vec<Event>, ProviderError> {
-        let start = std::time::Instant::now();
-        let result = self.inner.read(instance).await;
-        let duration = start.elapsed();
-
-        self.record_operation("read", duration, if result.is_ok() { "success" } else { "error" });
-        if let Err(ref e) = result {
-            self.record_error("read", e);
-        }
-
-        result
+        instrument_provider_operation(self.metrics.as_deref(), "read", self.inner.read(instance)).await
     }
 
     async fn read_with_execution(&self, instance: &str, execution_id: u64) -> Result<Vec<Event>, ProviderError> {
-        self.inner.read_with_execution(instance, execution_id).await
+        instrument_provider_operation(
+            self.metrics.as_deref(),
+            "read_with_execution",
+            self.inner.read_with_execution(instance, execution_id),
+        )
+        .await
     }
 
     async fn append_with_execution(
