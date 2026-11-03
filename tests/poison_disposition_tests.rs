@@ -30,6 +30,8 @@ use std::time::Duration;
 const INSTANCE: &str = "poison-disposition";
 const MAX_ATTEMPTS: u32 = 10;
 const INJECTED_ATTEMPT_COUNT: u32 = MAX_ATTEMPTS + 1;
+// Recovery may need two full leases before the successful delivery.
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn setup(corrupted_history: bool) -> (Arc<SqliteProvider>, Arc<PoisonInjectingProvider>) {
     let sqlite = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
@@ -65,8 +67,8 @@ fn options() -> RuntimeOptions {
         max_attempts: MAX_ATTEMPTS,
         orchestration_concurrency: 1,
         worker_concurrency: 1,
-        orchestrator_lock_timeout: Duration::from_millis(50),
         dispatcher_min_poll_interval: Duration::from_millis(5),
+        // Keep the production lease so scheduling delays do not cause unrelated ack failures.
         ..Default::default()
     }
 }
@@ -88,7 +90,7 @@ fn poison_failures(rt: &Runtime) -> u64 {
 }
 
 async fn wait_for_dispositions(rt: &Runtime, confirmed: u64, failed: u64) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             let snapshot = rt.metrics_snapshot().expect("metrics should be available");
             if snapshot.orch_poison >= confirmed && poison_failures(rt) >= failed {
@@ -455,7 +457,7 @@ async fn check_propagated_poison(source: PoisonSource, outcome: AckOutcome) {
     )
     .await;
     Client::new(provider.clone())
-        .wait_for_orchestration(INSTANCE, Duration::from_secs(5))
+        .wait_for_orchestration(INSTANCE, TEST_TIMEOUT)
         .await
         .expect("propagated failure should reach a terminal state");
     rt.clone().shutdown(None).await;
