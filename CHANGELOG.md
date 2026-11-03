@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   representation. (#74)
 - Provider validation's multi-threaded lock-expiration recovery test measures
   its waits from the first completed claim, so connection warm-up cannot consume
-  the expiry margin. The lease duration and margin are unchanged.
+  the expiry margin. The lease duration and margin are unchanged. (#76)
 
 ## [0.1.32] - 2026-10-11
 
