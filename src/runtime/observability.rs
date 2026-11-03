@@ -157,6 +157,7 @@ pub struct MetricsProvider {
     activity_success_atomic: AtomicU64,
     activity_app_errors_atomic: AtomicU64,
     activity_infra_errors_atomic: AtomicU64,
+    activity_ack_uncertain_atomic: AtomicU64,
     activity_config_errors_atomic: AtomicU64,
     activity_poison_atomic: AtomicU64,
     activity_admission_deferrals_atomic: AtomicU64,
@@ -196,6 +197,7 @@ impl MetricsProvider {
             activity_success_atomic: AtomicU64::new(0),
             activity_app_errors_atomic: AtomicU64::new(0),
             activity_infra_errors_atomic: AtomicU64::new(0),
+            activity_ack_uncertain_atomic: AtomicU64::new(0),
             activity_config_errors_atomic: AtomicU64::new(0),
             activity_poison_atomic: AtomicU64::new(0),
             activity_admission_deferrals_atomic: AtomicU64::new(0),
@@ -451,6 +453,18 @@ impl MetricsProvider {
         counter!("duroxide_activity_executions_total", "outcome" => "infra_error").increment(1);
         counter!("duroxide_activity_infrastructure_errors_total").increment(1);
         self.activity_infra_errors_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_activity_ack_uncertain(&self) {
+        counter!("duroxide_activity_ack_uncertain_total").increment(1);
+        self.activity_ack_uncertain_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of activity completion acknowledgements with an uncertain outcome.
+    #[inline]
+    pub fn activity_ack_uncertain(&self) -> u64 {
+        self.activity_ack_uncertain_atomic.load(Ordering::Relaxed)
     }
 
     #[inline]

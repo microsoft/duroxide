@@ -49,6 +49,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Relative SQLite queue delays saturate instead of overflowing their timestamp
   representation. (#74)
 
+- **Activity acknowledgement retries** - Retry transient provider errors when
+  acknowledging activity success or application errors, up to five attempts with
+  lock renewal retained. This avoids unnecessary activity re-execution.
+  Cancellation acknowledgements remain single-attempt, and retries do not extend
+  the shutdown grace period. A permanent error after a transient acknowledgement
+  error is reported as an uncertain outcome rather than a confirmed infrastructure
+  failure; neither commit nor redelivery is guaranteed. Uncertain outcomes are
+  counted separately in `duroxide_activity_ack_uncertain_total`. (#72)
+
+### Provider notes for 0.2.0
+
+- **Duplicate activity acknowledgements** - Completion acknowledgements can be
+  retried after the transaction committed but its response was lost. Providers
+  must atomically remove the locked worker item and enqueue its completion.
+  After that commit, repeating `ack_work_item(token, Some(completion))` with the
+  same token must return a non-retryable error without enqueueing another
+  completion. See the [provider contract](docs/provider-implementation-guide.md#error-classification). (#72)
+- After upgrading the Duroxide dependency, register
+  [`duroxide::provider_validations::test_ack_work_item_duplicate_rejected`](src/provider_validation/atomicity.rs)
+  in your provider's validation suite. It acknowledges the same token twice and
+  verifies that the second call fails non-retryably, exactly one completion is
+  queued, and the worker item is removed. SQLite already runs this validation;
+  external providers must add their own wrapper. (#72)
+
 ## [0.1.32] - 2026-10-11
 
 **Release:** <https://crates.io/crates/duroxide/0.1.32>
