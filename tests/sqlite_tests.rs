@@ -6,12 +6,15 @@
 #![allow(clippy::expect_used)]
 
 use duroxide::providers::sqlite::SqliteProvider;
-use duroxide::providers::{ExecutionMetadata, Provider, ProviderAdmin, TagFilter, WorkItem};
+use duroxide::providers::{ExecutionMetadata, Provider, ProviderAdmin, PruneOptions, TagFilter, WorkItem};
 use duroxide::{ActivityContext, Event, EventKind};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::task::JoinSet;
+
+mod common;
 
 /// Helper to create a SQLite store for testing
 #[allow(dead_code)]
@@ -34,9 +37,271 @@ async fn create_sqlite_store_named(name: &str) -> (Arc<dyn Provider>, TempDir, S
     (store, td, db_url)
 }
 
+async fn run_with_writer_contention<F>(url: &str, operation: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: std::fmt::Debug + Send + 'static,
+{
+    let writer_pool = sqlx::SqlitePool::connect(url).await.unwrap();
+    let writer = writer_pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let mut operation = tokio::spawn(operation);
+    let while_locked = tokio::time::timeout(Duration::from_millis(100), &mut operation).await;
+    writer.commit().await.unwrap();
+    let (result, waited) = match while_locked {
+        Ok(result) => (result.unwrap(), false),
+        Err(_) => (
+            tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .expect("operation did not resume after writer release")
+                .unwrap(),
+            true,
+        ),
+    };
+    writer_pool.close().await;
+    assert!(waited, "operation completed before writer release: {result:?}");
+    result
+}
+
 // ============================================================================
 // BASIC FUNCTIONALITY TESTS
 // ============================================================================
+
+#[tokio::test]
+async fn test_sqlite_orchestration_fetch_and_ack_wait_for_writer() {
+    let (store, _dir, url) = create_sqlite_store_named("orchestration-writer").await;
+    store
+        .enqueue_for_orchestrator(
+            WorkItem::StartOrchestration {
+                instance: "writer-contention".to_string(),
+                orchestration: "Test".to_string(),
+                version: Some("1.0.0".to_string()),
+                input: String::new(),
+                parent_instance: None,
+                parent_id: None,
+                parent_execution_id: None,
+                execution_id: duroxide::INITIAL_EXECUTION_ID,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let fetch_store = Arc::clone(&store);
+    let (item, token, attempts) = run_with_writer_contention(&url, async move {
+        fetch_store
+            .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+            .await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(item.instance, "writer-contention");
+    assert_eq!(attempts, 1);
+
+    let ack_store = Arc::clone(&store);
+    run_with_writer_contention(&url, async move {
+        ack_store
+            .ack_orchestration_item(
+                &token,
+                item.execution_id,
+                vec![],
+                vec![],
+                vec![],
+                ExecutionMetadata {
+                    orchestration_name: Some(item.orchestration_name),
+                    orchestration_version: Some(item.version),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+    })
+    .await
+    .unwrap();
+    assert!(
+        store
+            .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_sqlite_worker_fetch_waits_for_writer_and_cancellation_releases_transaction() {
+    let (store, _dir, url) = create_sqlite_store_named("worker-writer").await;
+    let item = WorkItem::ActivityExecute {
+        instance: "writer-contention".to_string(),
+        execution_id: 1,
+        id: 1,
+        name: "Activity".to_string(),
+        input: String::new(),
+        session_id: None,
+        tag: None,
+    };
+    store.enqueue_for_worker(item.clone()).await.unwrap();
+
+    let fetch_store = Arc::clone(&store);
+    let (fetched, token, attempts) = run_with_writer_contention(&url, async move {
+        fetch_store
+            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::DefaultOnly)
+            .await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(fetched, item);
+    assert_eq!(attempts, 1);
+    store.ack_work_item(&token, None).await.unwrap();
+    store.enqueue_for_worker(item.clone()).await.unwrap();
+
+    let writer_pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    let writer = writer_pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let fetch_store = Arc::clone(&store);
+    let mut fetch = tokio::spawn(async move {
+        fetch_store
+            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::DefaultOnly)
+            .await
+    });
+    let while_locked = tokio::time::timeout(Duration::from_millis(100), &mut fetch).await;
+    fetch.abort();
+    writer.commit().await.unwrap();
+    assert!(
+        while_locked.is_err(),
+        "fetch completed before writer release: {while_locked:?}"
+    );
+    assert!(fetch.await.unwrap_err().is_cancelled());
+
+    let (fetched, token, attempts) = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::DefaultOnly),
+    )
+    .await
+    .expect("cancelled fetch retained the writer")
+    .unwrap()
+    .unwrap();
+    assert_eq!(fetched, item);
+    assert_eq!(attempts, 1, "cancelled acquisition must not consume an attempt");
+    store.ack_work_item(&token, None).await.unwrap();
+    writer_pool.close().await;
+}
+
+#[tokio::test]
+async fn test_sqlite_prune_and_delete_wait_for_writer() {
+    let (store, _dir, url) = create_sqlite_store_named("admin-writer").await;
+    for _ in 0..2 {
+        let execution_id =
+            common::test_create_execution(store.as_ref(), "admin-writer", "Test", "1.0.0", "", None, None)
+                .await
+                .unwrap();
+        common::seed_history_turn(
+            store.as_ref(),
+            WorkItem::ExternalRaised {
+                instance: "admin-writer".to_string(),
+                name: "finish".to_string(),
+                data: String::new(),
+            },
+            execution_id,
+            vec![Event::with_event_id(
+                2,
+                "admin-writer",
+                execution_id,
+                None,
+                EventKind::OrchestrationCompleted {
+                    output: "done".to_string(),
+                },
+            )],
+            vec![],
+            ExecutionMetadata {
+                status: Some("Completed".to_string()),
+                output: Some("done".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    let prune_store = Arc::clone(&store);
+    let pruned = run_with_writer_contention(&url, async move {
+        prune_store
+            .as_management_capability()
+            .unwrap()
+            .prune_executions("admin-writer", PruneOptions::default())
+            .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(pruned.executions_deleted, 1);
+    assert_eq!(pruned.events_deleted, 2);
+
+    let delete_store = Arc::clone(&store);
+    let deleted = run_with_writer_contention(&url, async move {
+        delete_store
+            .as_management_capability()
+            .unwrap()
+            .delete_instances_atomic(&["admin-writer".to_string()], false)
+            .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(deleted.instances_deleted, 1);
+    assert_eq!(deleted.executions_deleted, 1);
+    assert_eq!(deleted.events_deleted, 2);
+}
+
+#[tokio::test]
+async fn test_worker_ready_index_on_file_backed_create_and_upgrade() {
+    for upgrade in [false, true] {
+        let (mut store, _dir, url) = create_sqlite_store_named("worker-ready-index").await;
+        let item = WorkItem::ActivityExecute {
+            instance: "index-migration".to_string(),
+            execution_id: 1,
+            id: 1,
+            name: "Activity".to_string(),
+            input: "preserved".to_string(),
+            session_id: None,
+            tag: None,
+        };
+        store.enqueue_for_worker(item.clone()).await.unwrap();
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        if upgrade {
+            // This migration adds only the index, so removing both reproduces the previous schema.
+            sqlx::query("DROP INDEX IF EXISTS idx_worker_ready_order")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20240113000000")
+                .execute(&pool)
+                .await
+                .unwrap();
+            drop(store);
+            store = Arc::new(SqliteProvider::new(&url, None).await.unwrap());
+        }
+
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_index_info('idx_worker_ready_order') ORDER BY seqno")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(columns, ["visible_at", "id"], "upgrade={upgrade}");
+        let applied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 20240113000000 AND success = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applied, 1, "the migration must run, not the schema-creation fallback");
+
+        let (fetched, token, attempts) = store
+            .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::DefaultOnly)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched, item);
+        assert_eq!(attempts, 1);
+        store.ack_work_item(&token, None).await.unwrap();
+        pool.close().await;
+    }
+}
 
 #[tokio::test]
 async fn test_sqlite_provider_basic() {

@@ -748,7 +748,7 @@ async fn fetch_work_item(
          WHERE id = (
              SELECT id FROM worker_queue
              WHERE visible_at <= ? AND (lock_token IS NULL OR locked_until <= ?)
-             ORDER BY id LIMIT 1
+             ORDER BY visible_at, id LIMIT 1
          )
          RETURNING work_item, attempt_count, instance_id",
         lock_token, locked_until, now, now
@@ -1393,7 +1393,7 @@ async fn fetch_work_item(
             SELECT id FROM worker_queue
             WHERE visible_at <= ?3 
               AND (lock_token IS NULL OR locked_until <= ?3)
-            ORDER BY id 
+            ORDER BY visible_at, id
             LIMIT 1
         )
         RETURNING id, work_item, attempt_count, instance_id, execution_id
@@ -1441,6 +1441,28 @@ async fn get_execution_state(&self, instance_id: &str, execution_id: Option<i64>
   - `token`: Lock token for ack/abandon/renew
   - `attempts`: How many times this item has been fetched (for poison detection)
   - `state`: Execution state (Running or Terminated for cancellation)
+
+**Worker queue progress:** Repeatedly deferred activities must not overtake work
+that was already ready, even after their delay expires. Order eligible rows by
+`visible_at, id` (with a matching index), or use an equivalent requeue policy.
+Apply the same ordering to session-aware and tag-filtered fetches. Admission
+deferral restores an attempt only when `abandon_work_item(..., true)` commits;
+failed or interrupted abandons can still consume attempts.
+If no abandon commits, lock expiry can make the item eligible before its requested
+retry delay. Conversely, if the commit succeeds but its response is lost, the
+stored delay and restored attempt survive even though the runtime did not observe
+success. Neither fetch counts nor a durable admission/start-intent write can prove
+that a handler actually began executing across a process crash.
+
+The worker uses `ProviderAdmin::get_instance_info` for lightweight activity
+metadata when it describes the activity's execution. Providers without that
+capability, and activities from an earlier execution, fall back to
+`read_with_execution`, loading the full execution history on every attempt,
+including repeated admission deferrals. There is no descriptor cache.
+Both lookup paths record provider-operation latency and errors. Metadata must
+describe the requested execution, not a newer continue-as-new execution. If the
+execution-history read fails, the worker abandons the fetch without restoring
+its attempt and does not invoke admission or the handler.
 
 ### ack_work_item() — Complete Implementation
 

@@ -24,8 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only `RuntimeStopObserver` that does not retain worker resources.
   Keep terminal state for late observers and preserve fault escalation during rollback.
   Report known turn faults before later provider waits, with protected diagnostics.
-  Status and source closure do not prove cleanup. SDK and host monitoring remain
-  separate follow-up work.
+  Status and source closure do not prove cleanup. SDK observation and host policy
+  remain separate from native cleanup.
+- Opt-in activity resource admission through `ActivityAdmission`, the default
+  `ActivityHandler::try_admit` method, and the `register_with_admission` and
+  `register_typed_with_admission` registration helpers.
+  Admission can retain a guard for the handler's lifetime or durably defer
+  execution without occupying a worker slot or recording an activity result.
+  Positive retry delays are clamped to 1 ms–24 hours. Only committed deferrals
+  restore their fetch attempt; failed or interrupted deferrals may still use
+  the poison-message budget, even when the handler never starts. Uncommitted
+  deferral delays may be lost on lock expiry. Successfully observed deferrals
+  have a separate `duroxide_activity_admission_deferrals_total` metric and the
+  `MetricsProvider::activity_admission_deferrals()` accessor for in-process
+  counts without changing the public `MetricsSnapshot` shape. (#74)
+- Admission errors, callback panics, and zero retry delays produce terminal
+  `ActivityFailed` application results with `retryable: false`, without invoking
+  the handler. Orchestration-level retry helpers still retry these errors
+  according to their policy. (#74)
 
 ### Changed
 
@@ -50,6 +66,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decision, while retaining native grace shortening before completion.
 - Preserve actual Tokio-generated activity-panic history text on the same task
   after guarded destruction, instead of replacing it with payload-only text.
+- SQLite queue fetches, orchestration acknowledgements, instance deletion and
+  execution pruning reserve writer access before reading transaction state.
+  This avoids read-to-write upgrade failures and repeated fetch backoff during
+  concurrent activity deferrals.
+  Pool return rolls back transactions left by cancellation during acquisition,
+  so a cancelled fetch cannot retain writer access.
+  Existing lock timeouts, retry classification, attempt accounting and stored
+  formats remain unchanged.
+- SQLite worker selection now orders eligible items by visibility time, then
+  queue ID, so a deferred backlog cannot repeatedly overtake already-ready work.
+  Migration `20240113000000` adds the supporting `visible_at, id` index to new
+  and existing file-backed databases.
+  Other providers must implement equivalent queue progress semantics; existing
+  stored histories and work-item formats are unchanged. SQLite workers must all
+  be upgraded to provide this behavior in a mixed-version deployment. (#74)
+- Activity metadata uses the lightweight instance lookup for the current
+  execution instead of re-reading its full history on every attempt. Activities
+  from earlier executions read their own execution's metadata. Both lookup paths
+  record provider-operation metrics. If the execution-history fallback fails,
+  processing now abandons the fetch with its attempt counted and reports an
+  infrastructure error instead of invoking the activity with `unknown` metadata.
+  This applies to ordinary and admission-controlled activities; repeated read
+  failures can exhaust the fetch budget before either handler runs. Metadata
+  failures are logged separately from acknowledgment and deferral failures. (#74)
+- Failed deferral retries preserve the requested delay and attempt-restoration
+  flag. (#74)
+- Relative SQLite queue delays saturate instead of overflowing their timestamp
+  representation. (#74)
 
 ## [0.1.32] - 2026-10-11
 

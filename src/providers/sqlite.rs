@@ -5,8 +5,8 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteTransactionManager};
+use sqlx::{Connection, Row, Sqlite, Transaction, TransactionManager};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
@@ -59,6 +59,15 @@ impl SqliteProvider {
         ProviderError::retryable(operation, error_msg)
     }
 
+    async fn begin_write_transaction(&self, operation: &str) -> Result<Transaction<'static, Sqlite>, ProviderError> {
+        // Reserve the writer before reading; upgrading a read snapshot can fail
+        // immediately under concurrent writes instead of using busy_timeout.
+        self.pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error(operation, e))
+    }
+
     /// Internal method to enqueue orchestrator work with optional visibility delay
     async fn enqueue_orchestrator_work_with_delay(
         &self,
@@ -98,8 +107,7 @@ impl SqliteProvider {
 
         // Calculate visible_at based on delay
         let visible_at = if let Some(delay) = delay {
-            let delay_ms = delay.as_millis().min(i64::MAX as u128) as i64;
-            Self::now_millis().saturating_add(delay_ms)
+            Self::timestamp_after(delay)
         } else {
             Self::now_millis()
         };
@@ -129,6 +137,16 @@ impl SqliteProvider {
         let is_memory = database_url.contains(":memory:") || database_url.contains("mode=memory");
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            .after_release(|conn, _meta| {
+                Box::pin(async move {
+                    // SQLx 0.8.6 custom BEGIN has a cancellation point before
+                    // its Transaction guard exists. Never recycle that open writer.
+                    while conn.is_in_transaction() {
+                        SqliteTransactionManager::rollback(conn).await?;
+                    }
+                    Ok(true)
+                })
+            })
             .after_connect(move |conn, _meta| {
                 Box::pin({
                     let is_memory = is_memory;
@@ -426,6 +444,9 @@ impl SqliteProvider {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_worker_available ON worker_queue(lock_token, id)")
             .execute(pool)
             .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_worker_ready_order ON worker_queue(visible_at, id)")
+            .execute(pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_worker_identity ON worker_queue(instance_id, execution_id, activity_id)",
         )
@@ -505,9 +526,10 @@ impl SqliteProvider {
             .as_millis() as i64
     }
 
-    /// Get future timestamp in milliseconds
+    /// Get a future timestamp in milliseconds, saturating at `i64::MAX`.
     fn timestamp_after(duration: Duration) -> i64 {
-        Self::now_millis() + duration.as_millis() as i64
+        let delay_ms = duration.as_millis().min(i64::MAX as u128) as i64;
+        Self::now_millis().saturating_add(delay_ms)
     }
 
     /// Build a SQL WHERE clause fragment for tag filtering.
@@ -723,11 +745,7 @@ impl Provider for SqliteProvider {
         _poll_timeout: Duration,
         filter: Option<&DispatcherCapabilityFilter>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("fetch_orchestration_item", e))?;
+        let mut tx = self.begin_write_transaction("fetch_orchestration_item").await?;
         let now_ms = Self::now_millis();
 
         // Implementation ordering (capability filtering contract):
@@ -1143,11 +1161,7 @@ impl Provider for SqliteProvider {
         metadata: crate::providers::ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+        let mut tx = self.begin_write_transaction("ack_orchestration_item").await?;
 
         // Get instance from instance_locks table (we now use instance-level locking)
         let row = sqlx::query("SELECT instance_id FROM instance_locks WHERE lock_token = ?")
@@ -1804,11 +1818,7 @@ impl Provider for SqliteProvider {
             return Ok(None);
         }
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("fetch_work_item", e))?;
+        let mut tx = self.begin_write_transaction("fetch_work_item").await?;
 
         let lock_token = Self::generate_lock_token();
         let locked_until = Self::timestamp_after(lock_timeout);
@@ -1843,7 +1853,7 @@ impl Provider for SqliteProvider {
                     OR s.session_id IS NULL
                   )
                   AND ({tag_clause})
-                ORDER BY q.id
+                ORDER BY q.visible_at, q.id
                 LIMIT 1
                 "#,
             );
@@ -1864,7 +1874,7 @@ impl Provider for SqliteProvider {
                   AND (q.lock_token IS NULL OR q.locked_until <= ?1)
                   AND q.session_id IS NULL
                   AND ({tag_clause})
-                ORDER BY q.id
+                ORDER BY q.visible_at, q.id
                 LIMIT 1
                 "#,
             );
@@ -2242,8 +2252,7 @@ impl Provider for SqliteProvider {
         // Optionally delay only the messages this fetch locked. Rows that became visible
         // after the fetch (for example a continue-as-new start) keep their visibility.
         if let Some(delay) = delay {
-            let delay_ms = delay.as_millis().min(i64::MAX as u128) as i64;
-            let visible_at = Self::now_millis().saturating_add(delay_ms);
+            let visible_at = Self::timestamp_after(delay);
             sqlx::query("UPDATE orchestrator_queue SET visible_at = ? WHERE lock_token = ?")
                 .bind(visible_at)
                 .bind(lock_token)
@@ -2938,11 +2947,7 @@ impl ProviderAdmin for SqliteProvider {
         }
 
         // Step 2: Delete all instances in a single transaction using bulk operations
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
+        let mut tx = self.begin_write_transaction("delete_instances_atomic").await?;
 
         // Step 2a: Check for orphan race condition
         // If any instance has parent_instance_id pointing to an instance we're deleting,
@@ -3281,11 +3286,7 @@ impl ProviderAdmin for SqliteProvider {
         }
 
         // Delete executions and their history in a transaction
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("prune_executions", e))?;
+        let mut tx = self.begin_write_transaction("prune_executions").await?;
 
         let mut result = PruneResult {
             instances_processed: 1,
@@ -3480,6 +3481,30 @@ mod tests {
         SqliteProvider::new("sqlite::memory:", None)
             .await
             .expect("Failed to create test store")
+    }
+
+    #[tokio::test]
+    async fn test_unowned_write_transaction_is_rolled_back_before_connection_reuse() {
+        let store = create_test_store().await;
+        let mut connections = Vec::new();
+        for _ in 0..store.pool.options().get_max_connections() {
+            connections.push(store.pool.acquire().await.unwrap());
+        }
+        let mut connection = connections.pop().unwrap();
+        // SQLx 0.8.6 can reach this state when custom BEGIN is cancelled after
+        // acknowledgement but before its handle-validation await returns.
+        SqliteTransactionManager::begin(&mut connection, Some("BEGIN IMMEDIATE".into()))
+            .await
+            .unwrap();
+        assert!(connection.is_in_transaction());
+        drop(connection);
+
+        // All other pool slots are held, so this must reuse or replace that slot.
+        let connection = tokio::time::timeout(Duration::from_secs(5), store.pool.acquire())
+            .await
+            .expect("cancelled transaction prevented connection reuse")
+            .unwrap();
+        assert!(!connection.is_in_transaction(), "unowned transaction returned to pool");
     }
 
     #[tokio::test]
@@ -4345,6 +4370,54 @@ mod tests {
             .unwrap();
         assert!(matches!(dequeued2, WorkItem::ActivityExecute { instance, .. } if instance == "test-abandon-work"));
         assert_ne!(lock_token2, lock_token); // Different lock token
+    }
+
+    #[tokio::test]
+    async fn test_abandon_work_item_with_oversized_delay() {
+        for delay in [
+            Duration::MAX,
+            Duration::from_millis(i64::MAX as u64),
+            Duration::from_millis(i64::MAX as u64 + 1),
+        ] {
+            let store = create_test_store().await;
+            for instance in ["deferred", "ready"] {
+                store
+                    .enqueue_for_worker(WorkItem::ActivityExecute {
+                        instance: instance.to_string(),
+                        execution_id: 1,
+                        id: 1,
+                        name: "TestActivity".to_string(),
+                        input: String::new(),
+                        session_id: None,
+                        tag: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let (item, lock_token, _) = store
+                .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(item, WorkItem::ActivityExecute { instance, .. } if instance == "deferred"));
+
+            store.abandon_work_item(&lock_token, Some(delay), true).await.unwrap();
+
+            let deferred_state: (i64, i64, Option<String>) =
+                sqlx::query_as("SELECT visible_at, attempt_count, lock_token FROM worker_queue ORDER BY id LIMIT 1")
+                    .fetch_one(&store.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(deferred_state, (i64::MAX, 0, None), "{delay:?}");
+
+            let (item, _, _) = store
+                .fetch_work_item(Duration::from_secs(30), Duration::ZERO, None, &TagFilter::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(item, WorkItem::ActivityExecute { instance, .. } if instance == "ready"));
+        }
     }
 
     #[tokio::test]

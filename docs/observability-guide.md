@@ -196,6 +196,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_pending_foreign_retirements` | Gauge | Runtime lifecycle | _(none)_ | Aggregate independently retained foreign completions (unreleased) |
 | **Activity Execution** |
 | `duroxide_activity_executions_total` | Counter | Activity | activity_name, outcome, retry_attempt | Track success/failure rates |
+| `duroxide_activity_admission_deferrals_total` | Counter | Activity | activity_name, tag | Track admission deferrals whose abandon returned success |
 | `duroxide_activity_duration_seconds` | Histogram | Activity | activity_name, outcome | Activity latency p95/p99 |
 | `duroxide_activity_errors_total` | Counter | Activity | activity_name, error_type, retryable | Detailed error tracking |
 | **Sub-Orchestration** |
@@ -318,6 +319,23 @@ Use the retained lifecycle operation and its cleanup result to decide when resou
 - **Note**: Continue-as-new does NOT change this count (orchestration stays active)
 
 #### Activity Execution Metrics
+
+**`duroxide_activity_admission_deferrals_total`** (Counter)
+- **Description**: Admission deferrals whose abandon returned success, including a successful fallback after an abandon error
+- **Labels**: `activity_name`, `tag`
+- **Use**: Identify resource-constrained activities without counting deferrals as executions
+
+For an in-process count, use `MetricsProvider::activity_admission_deferrals()`.
+The existing public `MetricsSnapshot` fields remain unchanged.
+
+The "Activity started" log appears only after admission succeeds. Admission
+rejections, panics, and zero retry delays count as `app_error`; storage failures
+while deferring count as `infra_error`, even if the fallback abandon succeeds.
+Uncommitted deferrals do not increment the deferral counter and may consume a
+fetch attempt on recovery. A deferral that commits before shutdown or a lost
+response can restore its attempt without incrementing this counter. The counter
+is not a durable audit of all storage commits. Activity metadata-read failures
+before admission count as infrastructure errors, not deferrals.
 
 **`duroxide_activity_executions_total`** (Counter)
 - **Description**: Activity execution attempts

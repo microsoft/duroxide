@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use duroxide::providers::{Provider, sqlite::SqliteProvider};
 use duroxide::runtime::registry::ActivityRegistry;
-use duroxide::runtime::{ObservabilityConfig, Runtime, RuntimeOptions, RuntimeShutdownError, ShutdownOutcome};
+use duroxide::runtime::{
+    ActivityAdmission, ObservabilityConfig, Runtime, RuntimeOptions, RuntimeShutdownError, RuntimeStopStatus,
+    ShutdownOutcome,
+};
 use duroxide::{
     ActivityContext, Client, Event, EventKind, OrchestrationContext, OrchestrationRegistry, OrchestrationStatus,
 };
@@ -71,21 +74,45 @@ async fn history_where(
 
 #[tokio::test]
 async fn activity_panic_history_preserves_the_actual_tokio_task_identity() {
+    assert_activity_panic_identity(false).await;
+}
+
+#[tokio::test]
+async fn admission_panic_history_preserves_the_actual_tokio_task_identity() {
+    assert_activity_panic_identity(true).await;
+}
+
+async fn assert_activity_panic_identity(admission_panic: bool) {
     let provider = provider().await;
     let client = Client::new(Arc::clone(&provider));
     let task_id = Arc::new(Mutex::new(None));
     let captured = Arc::clone(&task_id);
-    let activities = ActivityRegistry::builder()
-        .register("work", move |_: ActivityContext, _: String| {
-            let captured = Arc::clone(&captured);
-            async move {
-                *captured.lock().unwrap() = Some(tokio::task::id());
-                panic!("production activity panic");
-                #[allow(unreachable_code)]
-                Ok(String::new())
-            }
-        })
-        .build();
+    let activities = if admission_panic {
+        ActivityRegistry::builder()
+            .register_with_admission(
+                "work",
+                move |_ctx, _input| {
+                    *captured.lock().unwrap() = Some(tokio::task::id());
+                    panic!("production admission panic");
+                    #[allow(unreachable_code)]
+                    Ok(ActivityAdmission::admit(()))
+                },
+                |_ctx, _input| async move { panic!("rejected handler must not run") },
+            )
+            .build()
+    } else {
+        ActivityRegistry::builder()
+            .register("work", move |_: ActivityContext, _: String| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    *captured.lock().unwrap() = Some(tokio::task::id());
+                    panic!("production activity panic");
+                    #[allow(unreachable_code)]
+                    Ok(String::new())
+                }
+            })
+            .build()
+    };
     let runtime = Runtime::start_with_options(Arc::clone(&provider), activities, activity_flow(), options()).await;
     client.start_orchestration("panic", "flow", "").await.unwrap();
     assert!(matches!(
@@ -107,13 +134,87 @@ async fn activity_panic_history_preserves_the_actual_tokio_task_identity() {
         vec![format!(
             "task {} panicked with message {:?}",
             task_id.lock().unwrap().unwrap(),
-            "production activity panic"
+            if admission_panic {
+                "production admission panic"
+            } else {
+                "production activity panic"
+            }
         )]
     );
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
     assert_eq!(
         bounded(runtime.shutdown_with_grace(Duration::from_secs(1))).await,
         Ok(ShutdownOutcome::Drained)
     );
+}
+
+#[tokio::test]
+async fn admission_and_handler_destruction_faults_are_contained_on_completion_and_force() {
+    struct PanickingDrop(Arc<AtomicUsize>);
+
+    impl Drop for PanickingDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("injected destruction failure");
+        }
+    }
+
+    for force in [false, true] {
+        let provider = provider().await;
+        let admission_drops = Arc::new(AtomicUsize::new(0));
+        let handler_drops = Arc::new(AtomicUsize::new(0));
+        let admission_counter = Arc::clone(&admission_drops);
+        let handler_counter = Arc::clone(&handler_drops);
+        let started = Arc::new(Notify::new());
+        let handler_started = Arc::clone(&started);
+        let activities = ActivityRegistry::builder()
+            .register_with_admission(
+                "work",
+                move |_ctx, _input| Ok(ActivityAdmission::admit(PanickingDrop(Arc::clone(&admission_counter)))),
+                move |_ctx, _input| {
+                    let counter = Arc::clone(&handler_counter);
+                    let started = Arc::clone(&handler_started);
+                    async move {
+                        let _drop = PanickingDrop(counter);
+                        started.notify_one();
+                        if force {
+                            std::future::pending::<()>().await;
+                        }
+                        Ok("done".to_string())
+                    }
+                },
+            )
+            .build();
+        let runtime = Runtime::start_with_options(Arc::clone(&provider), activities, activity_flow(), options()).await;
+        let mut observer = runtime.stop_observer();
+        Client::new(provider)
+            .start_orchestration("destruction", "flow", "")
+            .await
+            .unwrap();
+        bounded(started.notified()).await;
+        if force {
+            assert_eq!(admission_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(handler_drops.load(Ordering::SeqCst), 0);
+        } else {
+            bounded(async {
+                let mut state = observer.state();
+                while state != RuntimeStopStatus::Faulted {
+                    state = observer
+                        .changed(state)
+                        .await
+                        .expect("fault must precede source closure");
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            bounded(Arc::clone(&runtime).shutdown_with_grace(Duration::ZERO)).await,
+            Err(RuntimeShutdownError::Failed { quiescent: true })
+        );
+        assert_eq!(observer.state(), RuntimeStopStatus::Faulted);
+        assert_eq!(admission_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(handler_drops.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]

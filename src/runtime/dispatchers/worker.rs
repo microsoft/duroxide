@@ -31,8 +31,9 @@
 //! 3. The worker dispatcher waits up to the grace period for the activity to complete
 //! 4. If the activity doesn't complete, it's aborted and the work item is dropped
 
-use crate::providers::WorkItem;
+use crate::providers::{WorkItem, instrumented::instrument_provider_operation};
 use futures_util::FutureExt;
+use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,8 +42,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
-use super::super::task_safety::{FailureKind, TaskRole, record_panic};
-use super::super::{Runtime, registry};
+use super::super::task_safety::{FailureKind, TaskFailure, TaskRole, record_panic};
+use super::super::{ActivityAdmission, Runtime, registry};
 
 // ============================================================================
 // Types
@@ -126,6 +127,14 @@ enum ActivityOutcome {
     AppError,
     /// Orchestration was cancelled, activity result dropped
     Cancelled,
+    /// Admission deferred without executing the handler
+    Deferred(Duration),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ActivityInvocation {
+    Completed(String),
+    Deferred(Duration),
 }
 
 /// Context for processing a single activity work item.
@@ -485,18 +494,21 @@ async fn execute_activity(rt: &Arc<Runtime>, activities: &Arc<registry::Activity
         cancellation_token.clone(),
     );
 
-    let activity_ctx = build_activity_context(rt, &ctx, cancellation_token.clone()).await;
-
-    tracing::debug!(
-        target: "duroxide::runtime",
-        instance_id = %ctx.instance,
-        execution_id = %ctx.execution_id,
-        activity_name = %ctx.activity_name,
-        activity_id = %ctx.activity_id,
-        worker_id = %ctx.worker_id,
-        activity_tag = ?ctx.tag,
-        "Activity started"
-    );
+    let activity_ctx = match build_activity_context(rt, &ctx, cancellation_token.clone()).await {
+        Ok(activity_ctx) => activity_ctx,
+        Err(error) => {
+            warn!(
+                instance = %ctx.instance,
+                execution_id = ctx.execution_id,
+                activity_id = ctx.activity_id,
+                worker_id = %ctx.worker_id,
+                %error,
+                "worker: activity metadata read failed, abandoning work item"
+            );
+            abandon_after_activity_failure(rt, &ctx, Duration::from_millis(100), false).await;
+            return;
+        }
+    };
 
     let start_time = std::time::Instant::now();
 
@@ -528,13 +540,59 @@ async fn build_activity_context(
     rt: &Arc<Runtime>,
     ctx: &ActivityWorkContext,
     cancellation_token: CancellationToken,
-) -> crate::ActivityContext {
-    let descriptor = rt.get_orchestration_descriptor(&ctx.instance).await;
-    let (orch_name, orch_version) = descriptor
-        .map(|d| (d.name, d.version))
-        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+) -> Result<crate::ActivityContext, crate::providers::ProviderError> {
+    let metadata = if let Some(admin) = rt.history_store.as_management_capability() {
+        match instrument_provider_operation(
+            rt.metrics_provider(),
+            "get_instance_info",
+            admin.get_instance_info(&ctx.instance),
+        )
+        .await
+        {
+            Ok(info) if info.current_execution_id == ctx.execution_id && info.orchestration_version != "unknown" => {
+                Some((info.orchestration_name, info.orchestration_version))
+            }
+            Ok(_) => None,
+            Err(error) => {
+                warn!(
+                    instance = %ctx.instance,
+                    execution_id = ctx.execution_id,
+                    %error,
+                    "Failed to read activity metadata; falling back to execution history"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (orch_name, orch_version) = match metadata {
+        Some(metadata) => metadata,
+        None => {
+            let history = rt
+                .history_store
+                .read_with_execution(&ctx.instance, ctx.execution_id)
+                .await?;
+            history
+                .iter()
+                .find_map(|event| match &event.kind {
+                    crate::EventKind::OrchestrationStarted { name, version, .. } => {
+                        Some((name.clone(), version.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    warn!(
+                        instance = %ctx.instance,
+                        execution_id = ctx.execution_id,
+                        "Orchestration metadata missing for activity"
+                    );
+                    ("unknown".to_string(), "unknown".to_string())
+                })
+        }
+    };
 
-    crate::ActivityContext::new_with_cancellation(
+    Ok(crate::ActivityContext::new_with_cancellation(
         ctx.instance.clone(),
         ctx.execution_id,
         orch_name,
@@ -546,7 +604,7 @@ async fn build_activity_context(
         ctx.tag.clone(),
         cancellation_token,
         Arc::clone(&rt.history_store),
-    )
+    ))
 }
 
 /// Run an activity with cancellation support using `tokio::select!`.
@@ -560,16 +618,33 @@ async fn run_activity_with_cancellation(
     start_time: std::time::Instant,
 ) -> (Result<(), crate::providers::ProviderError>, ActivityOutcome) {
     let input = ctx.input.clone();
+    let activity_id = ctx.activity_id;
     // Abort-on-drop so the invocation cannot outlive this task if the worker is
     // aborted mid-activity during shutdown.
-    let mut activity_handle = AbortOnDropHandle::new(spawn_activity_invocation(rt, handler, activity_ctx, input));
+    let mut activity_handle =
+        AbortOnDropHandle::new(spawn_activity_invocation(rt, handler, activity_ctx, input, activity_id));
 
     tokio::select! {
         joined = &mut activity_handle => {
             // Keep the renewal guard until acknowledgement finishes, not just invocation.
             // Handle normal activity completion (success, error, or panic)
             match joined {
-                Ok(Ok(result)) => handle_activity_success(rt, ctx, result, start_time).await,
+                Ok(Ok(ActivityInvocation::Completed(result))) => {
+                    handle_activity_success(rt, ctx, result, start_time).await
+                }
+                Ok(Ok(ActivityInvocation::Deferred(delay))) => {
+                    tracing::debug!(
+                        instance = %ctx.instance,
+                        activity_name = %ctx.activity_name,
+                        activity_id = ctx.activity_id,
+                        retry_after_ms = delay.as_millis(),
+                        "Activity admission deferred"
+                    );
+                    let result = rt.history_store
+                        .abandon_work_item(&ctx.lock_token, Some(delay), true)
+                        .await;
+                    (result, ActivityOutcome::Deferred(delay))
+                }
                 Ok(Err(error)) => handle_activity_error(rt, ctx, error, start_time).await,
                 Err(join_error) => handle_activity_error(rt, ctx, join_error.to_string(), start_time).await,
             }
@@ -624,8 +699,31 @@ async fn run_activity_with_cancellation(
 }
 
 enum ActivityInvocationOutcome {
-    Returned(Result<String, String>),
+    Returned(Result<ActivityInvocation, String>),
     Panicked(Option<String>),
+}
+
+struct ActivityAdmissionGuard<'a> {
+    runtime: &'a Arc<Runtime>,
+    guard: Option<Box<dyn Send>>,
+}
+
+impl Drop for ActivityAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        // A second failing destructor must not abort an already-unwinding invocation.
+        if let Some(guard) = self.guard.take()
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(guard)))
+        {
+            let mut failures = Vec::new();
+            record_panic(
+                "activity-admission",
+                FailureKind::DestructionPanicked,
+                payload,
+                &mut failures,
+            );
+            self.runtime.record_faults(&failures);
+        }
+    }
 }
 
 fn spawn_activity_invocation(
@@ -633,10 +731,11 @@ fn spawn_activity_invocation(
     handler: Arc<dyn crate::runtime::ActivityHandler>,
     context: crate::ActivityContext,
     input: String,
-) -> JoinHandle<Result<String, String>> {
+    activity_id: u64,
+) -> JoinHandle<Result<ActivityInvocation, String>> {
     let invocation = runtime.clone().tracked_task(
         TaskRole::ActivityInvocation,
-        invoke_activity(runtime.clone(), handler, context, input),
+        invoke_activity(runtime.clone(), handler, context, input, activity_id),
     );
     runtime.task_tracker.spawn(async move {
         let outcome = invocation.await;
@@ -655,28 +754,47 @@ async fn invoke_activity(
     handler: Arc<dyn crate::runtime::ActivityHandler>,
     context: crate::ActivityContext,
     input: String,
+    activity_id: u64,
 ) -> ActivityInvocationOutcome {
+    let mut failures = Vec::new();
+    let guard = match catch_unwind(AssertUnwindSafe(|| handler.try_admit(&context, &input))) {
+        Ok(Ok(ActivityAdmission::Admit(guard))) => guard,
+        Ok(Ok(ActivityAdmission::Defer(delay))) if delay.is_zero() => {
+            return ActivityInvocationOutcome::Returned(Err(
+                "Activity admission deferral requires a positive retry delay".to_string(),
+            ));
+        }
+        Ok(Ok(ActivityAdmission::Defer(delay))) => {
+            return ActivityInvocationOutcome::Returned(Ok(ActivityInvocation::Deferred(
+                delay.clamp(Duration::from_millis(1), ActivityAdmission::MAX_DEFER_DELAY),
+            )));
+        }
+        Ok(Err(error)) => return ActivityInvocationOutcome::Returned(Err(error)),
+        Err(payload) => {
+            let outcome = activity_panic_outcome(payload, &mut failures);
+            runtime.record_faults(&failures);
+            return outcome;
+        }
+    };
+    let _admission_guard = ActivityAdmissionGuard {
+        runtime: &runtime,
+        guard: Some(guard),
+    };
+    tracing::debug!(
+        target: "duroxide::runtime",
+        instance_id = %context.instance_id(),
+        execution_id = context.execution_id(),
+        activity_name = %context.activity_name(),
+        activity_id,
+        worker_id = %context.worker_id(),
+        activity_tag = ?context.tag(),
+        "Activity started"
+    );
     let mut future = handler.invoke(context, input);
     let result = AssertUnwindSafe(future.as_mut()).catch_unwind().await;
-    let mut failures = Vec::new();
     let result = match result {
-        Ok(result) => ActivityInvocationOutcome::Returned(result),
-        Err(payload) => {
-            let message = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_string()));
-            // User panics remain durable application errors, not runtime failures.
-            if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
-                record_panic(
-                    "activity-panic-payload",
-                    FailureKind::PanicPayloadPanicked,
-                    secondary,
-                    &mut failures,
-                );
-            }
-            ActivityInvocationOutcome::Panicked(message)
-        }
+        Ok(result) => ActivityInvocationOutcome::Returned(result.map(ActivityInvocation::Completed)),
+        Err(payload) => activity_panic_outcome(payload, &mut failures),
     };
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
         record_panic(
@@ -688,6 +806,23 @@ async fn invoke_activity(
     }
     runtime.record_faults(&failures);
     result
+}
+
+fn activity_panic_outcome(payload: Box<dyn Any + Send>, failures: &mut Vec<TaskFailure>) -> ActivityInvocationOutcome {
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_string()));
+    // User panics remain durable application errors, not runtime failures.
+    if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        record_panic(
+            "activity-panic-payload",
+            FailureKind::PanicPayloadPanicked,
+            secondary,
+            failures,
+        );
+    }
+    ActivityInvocationOutcome::Panicked(message)
 }
 
 // ============================================================================
@@ -828,6 +963,9 @@ async fn handle_activity_outcome(
         Ok(()) => match outcome {
             ActivityOutcome::Success => rt.record_activity_success(),
             ActivityOutcome::AppError => rt.record_activity_app_error(),
+            ActivityOutcome::Deferred(_) => {
+                rt.record_activity_admission_deferral(&ctx.activity_name, ctx.tag.as_deref())
+            }
             ActivityOutcome::Cancelled => {}
         },
         Err(e) => {
@@ -837,15 +975,42 @@ async fn handle_activity_outcome(
                 activity_id = ctx.activity_id,
                 worker_id = %ctx.worker_id,
                 error = %e,
-                "worker: atomic ack failed, abandoning work item"
+                outcome = ?outcome,
+                "worker: activity acknowledgment or deferral failed, abandoning work item"
             );
-            let _ = rt
-                .history_store
-                .abandon_work_item(&ctx.lock_token, Some(Duration::from_millis(100)), false)
-                .await;
-            rt.record_activity_infra_error();
+            let (delay, ignore_attempt) = match outcome {
+                ActivityOutcome::Deferred(delay) => (delay, true),
+                _ => (Duration::from_millis(100), false),
+            };
+            if abandon_after_activity_failure(rt, ctx, delay, ignore_attempt).await
+                && matches!(outcome, ActivityOutcome::Deferred(_))
+            {
+                rt.record_activity_admission_deferral(&ctx.activity_name, ctx.tag.as_deref());
+            }
         }
     }
+}
+
+async fn abandon_after_activity_failure(
+    rt: &Arc<Runtime>,
+    ctx: &ActivityWorkContext,
+    delay: Duration,
+    ignore_attempt: bool,
+) -> bool {
+    let result = rt
+        .history_store
+        .abandon_work_item(&ctx.lock_token, Some(delay), ignore_attempt)
+        .await;
+    if let Err(error) = &result {
+        warn!(
+            instance = %ctx.instance,
+            activity_id = ctx.activity_id,
+            %error,
+            "Failed to abandon activity work item; waiting for lock expiry"
+        );
+    }
+    rt.record_activity_infra_error();
+    result.is_ok()
 }
 
 // ============================================================================
@@ -1232,7 +1397,7 @@ mod tests {
                 .await
                 .unwrap_err();
                 let task =
-                    spawn_activity_invocation(&runtime, panic_handler(factory), context(&runtime), String::new());
+                    spawn_activity_invocation(&runtime, panic_handler(factory), context(&runtime), String::new(), 1);
                 let task_id = task.id();
                 let actual = bounded(task).await.unwrap_err();
                 assert!(actual.is_panic(), "{name}");
@@ -1255,11 +1420,12 @@ mod tests {
                         &runtime,
                         handler,
                         context(&runtime),
-                        String::new()
+                        String::new(),
+                        1
                     ))
                     .await
                     .unwrap(),
-                    expected
+                    expected.map(ActivityInvocation::Completed)
                 );
             }
             assert_eq!(
@@ -1287,6 +1453,7 @@ mod tests {
                 panic_handler(move || Box::new(FailingPayload(observed.clone()))),
                 context(&runtime),
                 String::new(),
+                1,
             ))
             .await
             .unwrap_err();
@@ -1350,11 +1517,12 @@ mod tests {
                     &runtime,
                     handler,
                     context(&runtime),
-                    String::new()
+                    String::new(),
+                    1
                 ))
                 .await
                 .unwrap(),
-                Ok("completed".to_owned())
+                Ok(ActivityInvocation::Completed("completed".to_owned()))
             );
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(
@@ -1423,7 +1591,7 @@ mod tests {
                         release: receiver.clone(),
                     }))
                 };
-                let activity = spawn_activity_invocation(&runtime, handler, context(&runtime), String::new());
+                let activity = spawn_activity_invocation(&runtime, handler, context(&runtime), String::new(), 1);
                 bounded(entered.notified()).await;
                 assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
                 activity.abort();

@@ -159,6 +159,7 @@ pub struct MetricsProvider {
     activity_infra_errors_atomic: AtomicU64,
     activity_config_errors_atomic: AtomicU64,
     activity_poison_atomic: AtomicU64,
+    activity_admission_deferrals_atomic: AtomicU64,
 
     // Dispatcher counters
     orch_dispatcher_items_fetched_atomic: AtomicU64,
@@ -197,6 +198,7 @@ impl MetricsProvider {
             activity_infra_errors_atomic: AtomicU64::new(0),
             activity_config_errors_atomic: AtomicU64::new(0),
             activity_poison_atomic: AtomicU64::new(0),
+            activity_admission_deferrals_atomic: AtomicU64::new(0),
             orch_dispatcher_items_fetched_atomic: AtomicU64::new(0),
             worker_dispatcher_items_fetched_atomic: AtomicU64::new(0),
             orch_continue_as_new_atomic: AtomicU64::new(0),
@@ -456,6 +458,23 @@ impl MetricsProvider {
         counter!("duroxide_activity_executions_total", "outcome" => "config_error").increment(1);
         counter!("duroxide_activity_configuration_errors_total").increment(1);
         self.activity_config_errors_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_activity_admission_deferral(&self, activity_name: &str, tag: Option<&str>) {
+        counter!(
+            "duroxide_activity_admission_deferrals_total",
+            "activity_name" => activity_name.to_string(),
+            "tag" => tag.unwrap_or("default").to_string(),
+        )
+        .increment(1);
+        self.activity_admission_deferrals_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of admission deferrals whose abandon returned success.
+    #[inline]
+    pub fn activity_admission_deferrals(&self) -> u64 {
+        self.activity_admission_deferrals_atomic.load(Ordering::Relaxed)
     }
 
     #[inline]

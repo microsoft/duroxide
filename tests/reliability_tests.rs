@@ -23,21 +23,26 @@ async fn external_duplicate_workitems_dedup() {
     };
     let orchestration_registry = OrchestrationRegistry::builder().register("WaitEvt", orch).build();
     let activity_registry = ActivityRegistry::builder().build();
-    let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
+    let rt =
+        runtime::Runtime::start_with_store(store.clone(), activity_registry.clone(), orchestration_registry.clone())
+            .await;
     let client = duroxide::Client::new(store.clone());
 
     let inst = "inst-ext-dup";
     client.start_orchestration(inst, "WaitEvt", "").await.unwrap();
     assert!(common::wait_for_subscription(store.clone(), inst, "Evt", 2_000).await);
 
-    // enqueue duplicate externals
+    // Queue both inputs before dispatch resumes; a later batch is discarded
+    // once the first event completes the orchestration.
+    rt.shutdown(None).await;
     let wi = WorkItem::ExternalRaised {
         instance: inst.to_string(),
         name: "Evt".to_string(),
         data: "ok".to_string(),
     };
-    let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
-    let _ = store.enqueue_for_orchestrator(wi.clone(), None).await;
+    store.enqueue_for_orchestrator(wi.clone(), None).await.unwrap();
+    store.enqueue_for_orchestrator(wi, None).await.unwrap();
+    let rt = runtime::Runtime::start_with_store(store.clone(), activity_registry, orchestration_registry).await;
 
     // wait for completion
     let ok = common::wait_for_history(

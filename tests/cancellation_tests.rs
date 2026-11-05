@@ -2537,8 +2537,6 @@ async fn positional_arrival_before_sub_outstanding() {
         ..Default::default()
     };
 
-    let rt =
-        runtime::Runtime::start_with_options(store.clone(), activity_registry, orchestration_registry, options).await;
     let client = Client::new(store.clone());
 
     client
@@ -2546,8 +2544,10 @@ async fn positional_arrival_before_sub_outstanding() {
         .await
         .unwrap();
 
-    // Raise event immediately (before the 100ms timer finishes)
+    // Queue the event before dispatch starts, not against a wall-clock timer race.
     client.raise_event("inst-pos-arr", "MyEvent", "data").await.unwrap();
+    let rt =
+        runtime::Runtime::start_with_options(store.clone(), activity_registry, orchestration_registry, options).await;
 
     // Wait for completion
     let status = client

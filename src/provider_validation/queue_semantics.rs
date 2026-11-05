@@ -3,7 +3,7 @@
 
 use crate::provider_validation::{Event, EventKind, ExecutionMetadata, create_instance, start_item};
 use crate::provider_validations::ProviderFactory;
-use crate::providers::{TagFilter, WorkItem};
+use crate::providers::{SessionFetchConfig, TagFilter, WorkItem};
 use std::time::Duration;
 
 /// Test 5.1: Worker Queue FIFO Ordering
@@ -115,6 +115,79 @@ pub async fn test_worker_peek_lock_semantics<F: ProviderFactory>(factory: &F) {
             .is_none()
     );
     tracing::info!("✓ Test passed: worker peek-lock semantics verified");
+}
+
+/// Deferred work must not overtake work that was already ready, even after its delay expires.
+pub async fn test_worker_deferred_item_does_not_starve_ready_work<F: ProviderFactory>(factory: &F) {
+    for session in [
+        None,
+        Some(SessionFetchConfig {
+            owner_id: "progress-worker".to_string(),
+            lock_timeout: factory.lock_timeout(),
+        }),
+    ] {
+        let provider = factory.create_provider().await;
+        for id in [1, 2] {
+            provider
+                .enqueue_for_worker(WorkItem::ActivityExecute {
+                    instance: "deferred-progress".to_string(),
+                    execution_id: 1,
+                    id,
+                    name: "Activity".to_string(),
+                    input: String::new(),
+                    session_id: session.as_ref().map(|_| "progress-session".to_string()),
+                    tag: None,
+                })
+                .await
+                .unwrap();
+        }
+        let (item, token, _) = provider
+            .fetch_work_item(
+                factory.lock_timeout(),
+                Duration::ZERO,
+                session.as_ref(),
+                &TagFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(item, WorkItem::ActivityExecute { id: 1, .. }));
+        provider
+            .abandon_work_item(&token, Some(Duration::from_millis(1)), true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (item, token, _) = provider
+            .fetch_work_item(
+                factory.lock_timeout(),
+                Duration::ZERO,
+                session.as_ref(),
+                &TagFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(item, WorkItem::ActivityExecute { id: 2, .. }),
+            "an expired deferral must not jump ahead of already-ready work"
+        );
+        provider.ack_work_item(&token, None).await.unwrap();
+
+        let (item, token, attempts) = provider
+            .fetch_work_item(
+                factory.lock_timeout(),
+                Duration::ZERO,
+                session.as_ref(),
+                &TagFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(item, WorkItem::ActivityExecute { id: 1, .. }));
+        assert_eq!(attempts, 1, "the committed deferral must restore its attempt");
+        provider.ack_work_item(&token, None).await.unwrap();
+    }
 }
 
 /// Test 5.3: Worker Ack Atomicity
