@@ -19,9 +19,11 @@ use crate::{Event, EventKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
-use tokio_util::task::{AbortOnDropHandle, TaskTracker};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
+use super::super::invocation_scope::InvocationGuard;
+use super::super::task_safety::TaskRole;
 use super::super::{HistoryManager, Runtime, WorkItemReader};
 
 /// Validate runtime limits on the history delta and fail the orchestration if any are exceeded.
@@ -274,7 +276,7 @@ fn calculate_renewal_interval(lock_timeout: Duration, buffer: Duration) -> Durat
 
 /// Spawn a background task to renew the lock for an in-flight orchestration.
 fn spawn_orchestration_lock_renewal_task(
-    task_tracker: &TaskTracker,
+    runtime: &Arc<Runtime>,
     store: Arc<dyn crate::providers::Provider>,
     token: String,
     lock_timeout: Duration,
@@ -294,41 +296,45 @@ fn spawn_orchestration_lock_renewal_task(
     // Deliberately does not observe the shutdown signal: the turn it is renewing may
     // still be running, and releasing the lock early would let another node steal the
     // item and execute it twice. The owning poller stops this task instead.
-    AbortOnDropHandle::new(task_tracker.spawn(async move {
-        let mut interval = tokio::time::interval(renewal_interval);
-        interval.tick().await; // Skip first immediate tick
+    AbortOnDropHandle::new(
+        runtime
+            .clone()
+            .spawn_tracked(TaskRole::OrchestrationRenewal, async move {
+                let mut interval = tokio::time::interval(renewal_interval);
+                interval.tick().await; // Skip first immediate tick
 
-        loop {
-            interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-            match store.renew_orchestration_item_lock(&token, lock_timeout).await {
-                Ok(()) => {
-                    tracing::trace!(
-                        target: "duroxide::runtime::dispatchers::orchestration",
-                        lock_token = %token,
-                        extend_secs = %lock_timeout.as_secs(),
-                        "Orchestration lock renewed"
-                    );
+                    match store.renew_orchestration_item_lock(&token, lock_timeout).await {
+                        Ok(()) => {
+                            tracing::trace!(
+                                target: "duroxide::runtime::dispatchers::orchestration",
+                                lock_token = %token,
+                                extend_secs = %lock_timeout.as_secs(),
+                                "Orchestration lock renewed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                target: "duroxide::runtime::dispatchers::orchestration",
+                                lock_token = %token,
+                                error = %e,
+                                "Failed to renew orchestration lock (may have been acked/abandoned)"
+                            );
+                            // Stop renewal - lock is gone or expired
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        target: "duroxide::runtime::dispatchers::orchestration",
-                        lock_token = %token,
-                        error = %e,
-                        "Failed to renew orchestration lock (may have been acked/abandoned)"
-                    );
-                    // Stop renewal - lock is gone or expired
-                    break;
-                }
-            }
-        }
 
-        tracing::debug!(
-            target: "duroxide::runtime::dispatchers::orchestration",
-            lock_token = %token,
-            "Orchestration lock renewal task stopped"
-        );
-    }))
+                tracing::debug!(
+                    target: "duroxide::runtime::dispatchers::orchestration",
+                    lock_token = %token,
+                    "Orchestration lock renewal task stopped"
+                );
+            }),
+    )
 }
 
 impl Runtime {
@@ -376,7 +382,7 @@ impl Runtime {
             let supported_range = runtime_supported_range.clone();
             // Generate unique worker ID: orch-{index}-{runtime_id}
             let worker_id = format!("orch-{worker_idx}-{}", rt.runtime_id);
-            let handle = self.task_tracker.spawn(async move {
+            let handle = self.clone().spawn_tracked(TaskRole::OrchestrationSlot, async move {
                 // debug!("Orchestration worker {} started", worker_id);
                 let mut consecutive_retryable_errors = 0u32;
                 loop {
@@ -450,7 +456,7 @@ impl Runtime {
                             // abort-on-drop guard so it cannot outlive this task if the
                             // poller is aborted mid-turn.
                             let _renewal_guard = spawn_orchestration_lock_renewal_task(
-                                &rt.task_tracker,
+                                &rt,
                                 Arc::clone(&rt.history_store),
                                 lock_token.clone(),
                                 rt.options.orchestrator_lock_timeout,
@@ -1142,9 +1148,10 @@ impl Runtime {
         }
 
         // Run the atomic execution to get all changes, passing the resolved handler and version
+        let invocation = InvocationGuard::new(Arc::clone(self));
         let (_exec_history_delta, exec_worker_items, exec_orchestrator_items, exec_cancelled_activities, _result) =
             Arc::clone(self)
-                .run_single_execution_atomic(
+                .run_single_execution_scoped(
                     instance,
                     history_mgr,
                     workitem_reader,
@@ -1153,6 +1160,7 @@ impl Runtime {
                     handler,
                     resolved_version.to_string(),
                     kv_snapshot,
+                    invocation.attachment(),
                 )
                 .await;
 

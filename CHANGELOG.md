@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Foreign-runtime lifecycle integration** - Add fallible preparation and startup,
+  prompt stop requests, and typed cleanup results to the existing `TaskTracker` model.
+  Registered foreign cleanup remains owned after the native turn ends.
+  Finalization closes new durable effects before the snapshot.
+  Native shutdown waits through grace and cleanup. Language SDKs separately limit
+  caller waits and keep cleanup running.
+- **Pending foreign-retirement count** - One gauge reports retained foreign
+  completions per recorder, without Runtime labels or additional series.
+  New runtimes do not reset pending counts from other runtimes.
+  Structured events provide each Runtime's identity and count.
+  Broken completion observers remain counted. A zero count does not prove cleanup.
+- **Native stop/fault observation** - Add `Runtime::stop_status()` and an owned,
+  read-only `RuntimeStopObserver` that does not retain worker resources.
+  Keep terminal state for late observers and preserve fault escalation during rollback.
+  Report known turn faults before later provider waits, with protected diagnostics.
+  Status and source closure do not prove cleanup. SDK observation and host policy
+  remain separate from native cleanup.
 - Opt-in activity resource admission through `ActivityAdmission`, the default
   `ActivityHandler::try_admit` method, and the `register_with_admission` and
   `register_typed_with_admission` registration helpers.
@@ -26,8 +43,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the handler. Orchestration-level retry helpers still retry these errors
   according to their policy. (#74)
 
+### Changed
+
+- **Internal lifecycle fault shutdown** - Faults caught at protected internal,
+  destruction, finalization, and registered-cleanup boundaries stop new work and
+  request zero-grace shutdown of that Runtime.
+  This can interrupt unrelated admitted work. Ordinary application failures still
+  affect only their operation. The failed worker cannot restart and must still
+  finish cleanup. Existing recovery and retry rules can repeat external effects.
+  Shutdown does not terminate the process, undo committed history, or guarantee exactly-once execution.
+- **Finalization failure before the snapshot** - A detected failure rejects the
+  new durable batch from that attempt. It does not publish an ordinary failed turn.
+  Foreign cleanup remains owned. Later driver or cleanup faults do not rewrite a
+  valid decision or undo a committed acknowledgement. Earlier force can cancel
+  an acknowledgement that has not committed.
+  Finalizer-admitted durable work must be reproduced during normal replay;
+  finalization is not another replay stage.
+
 ### Fixed
 
+- Preserve an observed `Drained` terminal outcome against a stale concurrent force
+  decision, while retaining native grace shortening before completion.
+- Preserve actual Tokio-generated activity-panic history text on the same task
+  after guarded destruction, instead of replacing it with payload-only text.
+- SQLite queue fetches, orchestration acknowledgements, instance deletion and
+  execution pruning reserve writer access before reading transaction state.
+  This avoids read-to-write upgrade failures and repeated fetch backoff during
+  concurrent activity deferrals.
+  Pool return rolls back transactions left by cancellation during acquisition,
+  so a cancelled fetch cannot retain writer access.
+  Existing lock timeouts, retry classification, attempt accounting and stored
+  formats remain unchanged.
 - SQLite worker selection now orders eligible items by visibility time, then
   queue ID, so a deferred backlog cannot repeatedly overtake already-ready work.
   Migration `20240113000000` adds the supporting `visible_at, id` index to new

@@ -1,0 +1,3 @@
+# Replay fixture provenance hashes these sources byte-for-byte.
+tests/queue_race_upgrade.rs text eol=lf
+tests/common/cancellation_history.rs text eol=lf

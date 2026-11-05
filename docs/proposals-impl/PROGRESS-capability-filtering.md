@@ -1,8 +1,14 @@
-# Provider Capability Filtering — Implementation Progress
+# Provider Capability Filtering — Historical Progress
+
+> **Historical record (2026-02-09).** This file records past implementation work.
+> Test totals, implementation details, and deferred items describe that snapshot.
+> For current contracts, use the [Provider Implementation Guide](../provider-implementation-guide.md)
+> and [Provider Testing Guide](../provider-testing-guide.md).
 
 **Spec:** [proposals-impl/provider-capability-filtering.md](provider-capability-filtering.md)  
-**Status:** Phase 1 complete  
-**Last updated:** 2026-02-09
+**Recorded status:** Phase 1 complete
+
+**Snapshot date:** 2026-02-09
 
 ---
 
@@ -10,7 +16,7 @@
 
 The capability filtering feature allows the orchestration dispatcher to pass a version filter to the provider so it only returns executions whose pinned `duroxide_version` falls within the runtime's supported replay-engine range. This enables safe rolling upgrades in mixed-version clusters without fetch-lock-abandon cycles.
 
-733 tests passing (`cargo nextest run --all-features`).
+The snapshot passed 733 tests (`cargo nextest run --all-features`).
 
 ---
 
@@ -202,9 +208,10 @@ Spec test #21 specified a unit test for `compute_execution_metadata()`, but that
 
 ---
 
-## Beyond Phase 1
+## Work Deferred at the Snapshot
 
-The following items from the spec are explicitly deferred:
+The following items from the spec were deferred at that time.
+This list is not a current roadmap:
 
 - **Multi-range filter support** — phase 1 only uses the first range in `supported_duroxide_versions`
 - **Orchestration handler capability filtering** — filter by registered orchestration name/version
