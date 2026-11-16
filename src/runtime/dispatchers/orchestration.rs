@@ -1166,6 +1166,7 @@ impl Runtime {
 
     /// Acknowledge an orchestration item with changes, using smart retry logic based on ProviderError
     /// Returns Ok(()) on success, or the ProviderError if all retries failed
+    /// Records poison disposition metrics from the final acknowledgement result.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) async fn ack_orchestration_with_changes(
         &self,
@@ -1200,7 +1201,7 @@ impl Runtime {
         let mut attempts: u32 = 0;
         let max_attempts: u32 = 5;
 
-        loop {
+        let ack_result = loop {
             match self
                 .history_store
                 .ack_orchestration_item(
@@ -1215,7 +1216,7 @@ impl Runtime {
                 .await
             {
                 Ok(()) => {
-                    return Ok(());
+                    break Ok(());
                 }
                 Err(e) => {
                     // Check if error is retryable
@@ -1223,7 +1224,7 @@ impl Runtime {
                         // Non-retryable error - don't abandon lock yet, return error
                         // Caller will try to commit failure event, then abandon lock
                         warn!(error = %e, "ack_orchestration_item failed with non-retryable error");
-                        return Err(e);
+                        break Err(e);
                     }
 
                     // Retryable error - retry with backoff
@@ -1241,11 +1242,28 @@ impl Runtime {
                             Some(std::time::Duration::from_millis(50)),
                             false,
                         ));
-                        return Err(e);
+                        break Err(e);
                     }
                 }
             }
+        };
+
+        if let Some((instance, attempt_count, max_attempts)) =
+            history_delta.iter().find_map(|event| match &event.kind {
+                EventKind::OrchestrationFailed {
+                    details:
+                        crate::ErrorDetails::Poison {
+                            attempt_count,
+                            max_attempts,
+                            ..
+                        },
+                } => Some((event.instance_id.as_str(), *attempt_count, *max_attempts)),
+                _ => None,
+            })
+        {
+            self.record_poison_disposition(instance, attempt_count, max_attempts, &ack_result);
         }
+        ack_result
     }
 
     /// Fail an orchestration as a poison message.
@@ -1330,7 +1348,6 @@ impl Runtime {
                 )
                 .await;
 
-            self.record_orchestration_poison();
             return;
         }
 
@@ -1477,9 +1494,31 @@ impl Runtime {
                 vec![], // cancelled_activities - none for poison message handling
             )
             .await;
+    }
 
-        // Record metrics for poison detection
-        self.record_orchestration_poison();
+    /// Record the final acknowledgement result, not an assumed storage outcome.
+    /// An error can follow a committed write whose response was lost.
+    fn record_poison_disposition(
+        &self,
+        instance: &str,
+        attempt_count: u32,
+        max_attempts: u32,
+        ack_result: &Result<(), ProviderError>,
+    ) {
+        match ack_result {
+            Ok(()) => self.record_orchestration_poison(),
+            Err(error) => {
+                tracing::error!(
+                    instance = %instance,
+                    attempt_count = attempt_count,
+                    max_attempts = max_attempts,
+                    error = %error,
+                    "Failed to acknowledge poison disposition; termination was not confirmed \
+                     and the message may be redelivered"
+                );
+                self.record_orchestration_poison_failed();
+            }
+        }
     }
 
     /// Build `SubOrchFailed` notifications for a terminal instance that received a
