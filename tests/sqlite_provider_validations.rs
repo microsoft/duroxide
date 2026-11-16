@@ -91,10 +91,11 @@ mod tests {
         test_abandon_work_item_releases_lock,
         test_abandon_work_item_with_delay,
         test_ack_only_affects_locked_messages,
+        // Atomicity tests
+        test_ack_work_item_duplicate_rejected,
         // Cancellation tests
         test_ack_work_item_fails_when_entry_deleted,
         test_ack_work_item_none_deletes_without_enqueue,
-        // Atomicity tests
         test_atomicity_failure_rollback,
         test_batch_cancellation_deletes_multiple_activities,
         test_cancelled_activities_deleted_from_worker_queue,
@@ -350,6 +351,11 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_concurrent_ack_prevention() {
         test_concurrent_ack_prevention(&SqliteTestFactory).await;
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_ack_work_item_duplicate_rejected() {
+        test_ack_work_item_duplicate_rejected(&SqliteTestFactory).await;
     }
 
     // Error handling tests
