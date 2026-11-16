@@ -14,9 +14,52 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::long_polling::LongPollingSqliteProvider;
+use common::long_polling::{LongPollingSqliteProvider, ProviderGate, ProviderOperation};
 
 // --- Tests ---
+
+#[tokio::test]
+async fn lock_expiration_validation_waits_for_the_first_claim() {
+    use duroxide::provider_validation::{ProviderFactory, instance_locking};
+    use duroxide::providers::sqlite::SqliteProvider;
+
+    struct GatedFactory(Arc<dyn Provider>);
+
+    #[async_trait::async_trait]
+    impl ProviderFactory for GatedFactory {
+        async fn create_provider(&self) -> Arc<dyn Provider> {
+            self.0.clone()
+        }
+
+        fn lock_timeout(&self) -> Duration {
+            Duration::from_millis(500)
+        }
+    }
+
+    let gate = Arc::new(ProviderGate::default());
+    let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    // Isolate claim timing from SQLite's concurrent-writer behavior.
+    let mut held_connections = Vec::new();
+    for _ in 1..store.get_pool().options().get_max_connections() {
+        held_connections.push(store.get_pool().acquire().await.unwrap());
+    }
+    let provider = Arc::new(
+        LongPollingSqliteProvider::new(store).with_gate(ProviderOperation::BeforeOrchestrationFetch, gate.clone()),
+    );
+    let validation = tokio::spawn(async move {
+        instance_locking::test_multi_threaded_lock_expiration_recovery(&GatedFactory(provider)).await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+        .await
+        .expect("the first fetch should reach the gate");
+    // Exceed both the lease and the recovery margin before permitting a claim.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    gate.open();
+    tokio::time::timeout(Duration::from_secs(3), validation)
+        .await
+        .expect("claim-relative recovery should finish")
+        .expect("connection acquisition time must not consume the lease-expiry margin");
+}
 
 /// Test 1: Verify fetch waits for the full duration if no work exists
 #[tokio::test]
