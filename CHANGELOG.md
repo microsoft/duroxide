@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-19
+
+**Release:** <https://crates.io/crates/duroxide/0.2.0>
+
 ### Added
 
 - Opt-in activity resource admission through `ActivityAdmission`, the default
@@ -84,6 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies that the second call fails non-retryably, exactly one completion is
   queued, and the worker item is removed. SQLite already runs this validation;
   external providers must add their own wrapper. (#72)
+- To check queue ordering, run
+  [`test_worker_deferred_item_does_not_starve_ready_work`](src/provider_validation/queue_semantics.rs)
+  against your provider. It verifies that an expired deferral yields to ready
+  work for both session and non-session fetches. (#74)
 
 ## [0.1.32] - 2026-10-11
 
