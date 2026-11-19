@@ -4,8 +4,8 @@
 [![Crates.io](https://img.shields.io/crates/v/duroxide.svg)](https://crates.io/crates/duroxide)
 [![Documentation](https://docs.rs/duroxide/badge.svg)](https://docs.rs/duroxide)
 
-> **[Latest Release: v0.1.32](https://crates.io/crates/duroxide/0.1.32)** — Queue and signal race fixes, exact continue-as-new carry-forward, no lost inputs between executions, deterministic KV key order, and a shutdown that stops every runtime task.
-> See [CHANGELOG.md](CHANGELOG.md#0132---2026-10-11) for release notes.
+> **[Latest Release: v0.2.0](https://crates.io/crates/duroxide/0.2.0)** — Activities can defer work until resources are available without holding a worker slot. SQLite prevents deferred work from starving ready items, and workers retry transient errors when acknowledging activity results.
+> See [CHANGELOG.md](CHANGELOG.md#020---2026-11-19) for release notes and provider upgrade requirements.
 >
 > **Release policy:** Official packages are published through Microsoft-managed
 > internal pipelines. Repository GitHub Actions are validation-only. See
@@ -47,9 +47,9 @@ and [Temporal](https://temporal.io/).
 
 ```toml
 [dependencies]
-duroxide = { version = "0.1", features = ["sqlite"] }  # With the bundled SQLite provider
+duroxide = { version = "0.2", features = ["sqlite"] }  # With the bundled SQLite provider
 # OR
-duroxide = "0.1"  # Core only — bring your own Provider
+duroxide = "0.2"  # Core only — bring your own Provider
 ```
 
 ## Examples
