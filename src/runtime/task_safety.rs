@@ -69,6 +69,104 @@ pub(super) struct TaskFailure {
 pub(super) type TaskResult = Result<(), Vec<TaskFailure>>;
 pub(super) type TaskFuture<'a> = Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>>;
 
+pub(super) struct UserOperation {
+    pub instance: String,
+    pub execution_id: u64,
+    pub name: String,
+    pub activity_id: Option<u64>,
+}
+
+struct UserPayloadDisposal {
+    failures: u8,
+    skipped: bool,
+}
+
+fn dispose_user_panic_payload(mut payload: Box<dyn Any + Send>) -> UserPayloadDisposal {
+    let mut failures = 0;
+    for _ in 0..2 {
+        match catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            Ok(()) => {
+                return UserPayloadDisposal {
+                    failures,
+                    skipped: false,
+                };
+            }
+            Err(next) => {
+                failures += 1;
+                payload = next;
+            }
+        }
+    }
+    // A destructor can keep producing new panicking payloads. Retain the last
+    // allocation rather than attempting unbounded cleanup; report it as skipped.
+    std::mem::forget(payload);
+    UserPayloadDisposal {
+        failures,
+        skipped: true,
+    }
+}
+
+pub(super) fn contain_user_panic(
+    identity: &UserOperation,
+    stage: &'static str,
+    payload: Box<dyn Any + Send>,
+) -> Vec<TaskFailure> {
+    report_user_cleanup(identity, stage, dispose_user_panic_payload(payload))
+}
+
+pub(super) fn dispose_user_payload(
+    identity: &UserOperation,
+    stage: &'static str,
+    payload: Box<dyn Any + Send>,
+) -> Vec<TaskFailure> {
+    let disposal = dispose_user_panic_payload(payload);
+    if disposal.failures == 0 {
+        Vec::new()
+    } else {
+        report_user_cleanup(identity, stage, disposal)
+    }
+}
+
+fn report_user_cleanup(
+    identity: &UserOperation,
+    stage: &'static str,
+    disposal: UserPayloadDisposal,
+) -> Vec<TaskFailure> {
+    let payload_fate = if disposal.skipped {
+        "cleanup-skipped"
+    } else if disposal.failures > 0 {
+        "secondary-disposed"
+    } else {
+        "disposed"
+    };
+    let mut failures = Vec::new();
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+        tracing::error!(
+            target: "duroxide::runtime::cleanup",
+            category = "contained_user_cleanup",
+            instance = %identity.instance,
+            execution_id = identity.execution_id,
+            operation = %identity.name,
+            activity_id = ?identity.activity_id,
+            task_id = ?tokio::task::try_id(),
+            stage,
+            disposition = "operation-local",
+            payload_fate,
+            payload_disposal_failures = disposal.failures,
+            payload_cleanup_skipped = disposal.skipped,
+            "User cleanup failed; application state is not repaired"
+        );
+    })) {
+        record_panic(
+            "user-cleanup-reporting",
+            FailureKind::ReportingPanicked,
+            payload,
+            &mut failures,
+        );
+    }
+    failures
+}
+
 pub(super) fn append_failures(task: &'static str, mut errors: Vec<TaskFailure>, failures: &mut Vec<TaskFailure>) {
     if errors.is_empty() {
         errors.push(TaskFailure {

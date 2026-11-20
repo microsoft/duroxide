@@ -127,7 +127,12 @@ out whether all owned work and cleanup have ended.
 An internal lifecycle fault stops new work and requests **zero-grace shutdown of
 the affected Runtime**. This can interrupt other work in the same runtime.
 It does not terminate the process. An ordinary activity or orchestration error
-still affects only that operation. Interrupted work follows the existing recovery
+still affects only that operation. Named user-cleanup failures are contained while
+core obligations remain protected; eligible late failures preserve actual outcomes
+and valid finalized decisions. Native tracing reports each incident, not `Faulted`.
+Containment does not repair application state or guarantee complete resource cleanup.
+Core, reporting, finalization and registered-cleanup failures still stop the Runtime.
+Interrupted work follows the existing recovery
 and retry rules. A retry can repeat an external effect. Read
 [fault shutdown and recovery](docs/ORCHESTRATION-GUIDE.md#fault-shutdown-and-recovery)
 before replacing a failed worker.

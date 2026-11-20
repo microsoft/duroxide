@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{debug, warn};
 
+use super::task_safety::{UserOperation, dispose_user_payload};
+
 /// This version must not be released without the queue, positional and CAN cutover.
 pub(crate) const RACE_CANCELLATION_FIX_SINCE: semver::Version = semver::Version::new(0, 1, 31);
 
@@ -600,6 +602,12 @@ impl ReplayEngine {
             }
         }
 
+        let identity = UserOperation {
+            instance: self.instance.clone(),
+            execution_id: self.execution_id,
+            name: orchestration_name,
+            activity_id: None,
+        };
         let ctx_for_future = ctx.clone();
         let h = handler.clone();
         let inp = input.clone();
@@ -612,7 +620,7 @@ impl ReplayEngine {
         let mut fut = match fut_result {
             Ok(f) => f,
             Err(panic_payload) => {
-                let msg = extract_panic_message(panic_payload);
+                let msg = extract_panic_message(panic_payload, &identity, &cleanup);
                 return TurnResult::Failed(crate::ErrorDetails::Application {
                     kind: crate::AppErrorKind::Panicked,
                     message: msg,
@@ -654,7 +662,7 @@ impl ReplayEngine {
                 }
 
                 if must_poll {
-                    match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
+                    match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions, &identity) {
                         Ok(Some(result)) => {
                             output_opt = Some(result);
                             break;
@@ -680,7 +688,7 @@ impl ReplayEngine {
             ctx.set_is_replaying(false);
 
             if must_poll && output_opt.is_none() {
-                match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
+                match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions, &identity) {
                     Ok(Some(result)) => output_opt = Some(result),
                     Ok(None) => {}
                     Err(err) => return Ok(err),
@@ -698,7 +706,7 @@ impl ReplayEngine {
 
             self.convert_emitted_actions(&ctx, emitted_actions);
 
-            if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt) {
+            if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt, &identity) {
                 return Ok(err);
             }
 
@@ -717,7 +725,7 @@ impl ReplayEngine {
         // decision, while foreign scheduling is fenced before that snapshot.
         cleanup.finalize();
         let finalization_failed = cleanup.finalization_failed();
-        cleanup.destroy_driver(fut);
+        cleanup.destroy_driver(fut, &identity, matches!(&decision, Ok(Ok(_))) && !finalization_failed);
         match decision {
             Ok(Ok(result)) if !finalization_failed => result,
             // This is an engine failure, not a failed application turn: the caller
@@ -731,6 +739,7 @@ impl ReplayEngine {
         fut: &mut Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>,
         ctx: &OrchestrationContext,
         emitted_actions: &mut VecDeque<(u64, Action)>,
+        identity: &UserOperation,
     ) -> Result<Option<Result<String, String>>, TurnResult> {
         let poll_result = catch_unwind(AssertUnwindSafe(|| poll_once(fut.as_mut())));
         match poll_result {
@@ -743,7 +752,7 @@ impl ReplayEngine {
                 Ok(None)
             }
             Err(panic_payload) => {
-                let msg = extract_panic_message(panic_payload);
+                let msg = extract_panic_message(panic_payload, identity, &ctx.invocation_cleanup);
                 Err(TurnResult::Failed(crate::ErrorDetails::Application {
                     kind: crate::AppErrorKind::Panicked,
                     message: msg,
@@ -1066,6 +1075,7 @@ impl ReplayEngine {
         ctx: &OrchestrationContext,
         fut: &mut Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>,
         output_opt: &mut Option<Result<String, String>>,
+        identity: &UserOperation,
     ) -> Result<(), TurnResult> {
         const MAX_QUIESCENCE_ITERATIONS: usize = 100;
         let mut quiescence_iter = 0;
@@ -1075,7 +1085,7 @@ impl ReplayEngine {
             quiescence_iter += 1;
             let actions_before = self.pending_actions.len();
 
-            if let Some(res) = Self::poll_orchestration_future(fut, ctx, &mut emitted_actions)? {
+            if let Some(res) = Self::poll_orchestration_future(fut, ctx, &mut emitted_actions, identity)? {
                 *output_opt = Some(res);
             }
             self.convert_emitted_actions(ctx, emitted_actions.drain(..));
@@ -1755,14 +1765,24 @@ fn nondeterminism_error(msg: &str) -> crate::ErrorDetails {
 }
 
 /// Extract panic message from payload
-fn extract_panic_message(panic_payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = panic_payload.downcast_ref::<&str>() {
+fn extract_panic_message(
+    panic_payload: Box<dyn std::any::Any + Send>,
+    identity: &UserOperation,
+    cleanup: &super::invocation_scope::CleanupAttachment,
+) -> String {
+    let message = if let Some(s) = panic_payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = panic_payload.downcast_ref::<String>() {
         s.clone()
     } else {
         "orchestration panicked".to_string()
-    }
+    };
+    cleanup.report_cleanup_failures(dispose_user_payload(
+        identity,
+        "orchestration-panic-payload",
+        panic_payload,
+    ));
+    message
 }
 
 /// Convert an Action to an Event for history persistence

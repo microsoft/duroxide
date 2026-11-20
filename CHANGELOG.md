@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completions per recorder, without Runtime labels or additional series.
   New runtimes do not reset pending counts from other runtimes.
   Structured events provide each Runtime's identity and count.
-  Broken completion observers remain counted. A zero count does not prove cleanup.
+  Observers that fail before returning remain counted. A zero count does not prove cleanup.
 - **Native stop/fault observation** - Add `Runtime::stop_status()` and an owned,
   read-only `RuntimeStopObserver` that does not retain worker resources.
   Keep terminal state for late observers and preserve fault escalation during rollback.
@@ -45,8 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Internal lifecycle fault shutdown** - Faults caught at protected internal,
-  destruction, finalization, and registered-cleanup boundaries stop new work and
+- **User-cleanup panic containment** - Contain named activity-future, admission-guard
+  and valid post-decision driver destruction failures while preserving actual outer
+  outcomes and core ownership. Emit a native diagnostic for each incident; bounded
+  panic-payload disposal reports deliberately skipped cleanup without claiming state repair.
+  Both registered-cleanup forms preserve actual return through later destruction,
+  while returned errors and destruction failures still fault the Runtime.
+- **Internal lifecycle fault shutdown** - Faults caught at protected core execution
+  and destruction, reporting, finalization, and registered-cleanup boundaries stop new work and
   request zero-grace shutdown of that Runtime.
   This can interrupt unrelated admitted work. Ordinary application failures still
   affect only their operation. The failed worker cannot restart and must still

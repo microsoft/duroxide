@@ -227,39 +227,68 @@ flowchart TD
     Signal -. "does not authorize" .-> SDK
 ```
 
-This observer is a native Rust API. The current .NET, Node, and Python wrappers
-do not expose a dedicated spontaneous-fault notification.
+This observer is a native Rust API. Matching unreleased .NET, Node, and Python
+adapters expose their own passive stop observers.
 The default .NET service is an `IHostedService`, not a `BackgroundService`
 with a long-running execution task that Generic Host supervises.
-SDK fault observation and default-host monitoring remain separate follow-up work.
+Its monitor reports recorded Runtime faults for diagnostics only.
 This API does not stop the host, terminate the process, or restart a worker.
+Contained user-cleanup incidents use native tracing, not stop-state notifications.
 
 ### Fault shutdown and recovery
 
-An internal lifecycle fault stops the affected Runtime.
-This policy covers faults caught at protected internal execution, destruction,
-finalization, and registered-cleanup boundaries.
-The runtime stops accepting work and requests zero-grace shutdown.
-This can interrupt unrelated work already admitted by the same worker.
-There is no selective catch-and-continue mode.
+The unreleased core contains cleanup panics at named user-code boundaries:
+destruction of an activity future or application admission guard, and destruction
+of an orchestration driver after a valid, finalized turn decision in
+Runtime-owned replay. Core obligations keep their independent completion and
+fault owners. This is not an exemption for an entire task role or language.
+Standalone replay does not have the Runtime-owned driver guarantee.
 
-Ordinary activity and orchestration errors still affect only that operation.
-This includes ordinary panics while polling a handler.
-A destructor that runs inside that handler-poll catch can also fail locally.
-Protected driver or task destruction outside that catch can stop the Runtime.
-The catch boundary determines fault scope, not the presence of a `Drop` implementation.
-Failure while destroying a panic payload can also cause runtime-wide shutdown.
+Eligible late cleanup failure preserves the actual outer handler result or
+valid turn decision. An inner future or foreign callback returning is not enough:
+an outer operation that fails before returning is still a failure.
+Cancellation keeps its cancellation disposition.
+Cleanup does not reopen a finalized batch or turn an attempted acknowledgment
+into a committed write. Existing retries, renewal, uncertain outcomes and poison
+handling remain unchanged.
+
+Ordinary activity and orchestration errors, including ordinary panics caught
+while polling a handler, still affect only that operation.
 Rust activity panic history keeps the actual task-panic message from Tokio.
 Normal returned `Result` errors do not change.
 
+Internal lifecycle faults in core execution, tracking, sessions or renewal,
+and reporting, finalization and registered-cleanup failures still stop the
+affected Runtime. Ordinary provider error handling is unchanged.
+The runtime stops accepting work and requests zero-grace shutdown.
+This can interrupt unrelated work already admitted by the same worker.
+There is no general recovery or configurable catch-and-continue mode.
+
+Each contained incident emits a protected
+[native cleanup diagnostic](observability-guide.md#contained-user-cleanup-incidents-unreleased).
+It does not set `Faulted`. A failure in diagnostic reporting remains a Runtime
+fault. Passive stop observation is not an incident stream or a health check.
+
+User panic-payload disposal makes at most two protected destructor attempts.
+If both fail, the remaining payload allocation is deliberately left undisposed
+and reported as `cleanup-skipped`. The failing user destructor is not retried.
+Containment does not repair application state, release every resource, or undo
+external effects. Investigate these incidents and apply the application's own
+recovery policy. Bounded attempts are not a time bound: a destructor can block.
+Unwind protection does not recover from process abort, nested double-panic abort,
+or memory corruption. The separate Rust panic hook can still print raw payloads.
+
 A missing cleanup attachment does not prove that execution is native-only.
 For example, the Node and Python adapters call foreign code without the .NET
-adapter's registered-cleanup protocol. This does not exempt them from fault containment.
+adapter's registered-cleanup protocol. Native destruction cannot certify that
+their unregistered foreign continuations ended.
 
 Zero grace requests force. It does not complete cleanup immediately.
 The runtime retains native code that does not yield and foreign work that has not ended.
 This retention can last indefinitely. The runtime does not kill the process or
 stop other Runtime instances in that process.
+Quiescence proves execution retirement, not that every user destructor succeeded
+or every allocation was freed.
 
 An SDK wait deadline does not cancel cleanup or permit resource release.
 The application or supervisor remains responsible for process termination after
@@ -337,8 +366,12 @@ to independent ownership in that tracker. Dispatcher abort cannot cancel this
 cleanup or drop a foreign completion that is still active.
 
 A cleanup `Ok` **or** `Err` must mean that foreign work has ended.
-A cleanup error still causes a lifecycle failure.
-If the completion panics, the runtime cannot prove that work ended and must retain ownership.
+Both registration forms record the supplied observer's actual return before
+protected destruction. A returned error or later observer destruction failure
+still faults the Runtime, but does not make that completed foreign work pending again.
+If polling fails before the supplied observer returns, ownership remains retained
+without repolling or force-dropping it. Nested readiness, timeout, sender loss,
+force and process exit cannot replace that return.
 This contract does not cover unregistered continuations.
 The .NET adapter registers its handler root and SDK continuations.
 The Node and Python adapters do not provide that additional guarantee.
@@ -596,8 +629,9 @@ admission failures regardless of `retryable: false`, scheduling fresh attempts
 and rerunning admission up to the policy's attempt limit.
 
 Admission-guard destruction is protected separately from handler destruction,
-including forced cancellation. A guard destructor fault requests Runtime-wide
-shutdown under the lifecycle cleanup-fault policy; it is not an admission rejection.
+including forced cancellation. Its destructor failure is a named user-cleanup
+incident under the policy above, not a new admission rejection or replacement
+handler result. Core and reporting failures remain Runtime-fatal.
 
 Storage errors during deferral are infrastructure errors; an immediate fallback
 abandon preserves the same delay and attempt-restoration flag. If that also

@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
-use super::super::task_safety::{FailureKind, TaskFailure, TaskRole, record_panic};
+use super::super::task_safety::{TaskFailure, TaskRole, UserOperation, contain_user_panic, dispose_user_payload};
 use super::super::{ActivityAdmission, Runtime, registry};
 
 // ============================================================================
@@ -708,24 +708,20 @@ enum ActivityInvocationOutcome {
     Panicked(Option<String>),
 }
 
-struct ActivityAdmissionGuard<'a> {
+struct ActivityUserValue<'a, T> {
     runtime: &'a Arc<Runtime>,
-    guard: Option<Box<dyn Send>>,
+    value: Option<T>,
+    identity: &'a UserOperation,
+    stage: &'static str,
 }
 
-impl Drop for ActivityAdmissionGuard<'_> {
+impl<T> Drop for ActivityUserValue<'_, T> {
     fn drop(&mut self) {
         // A second failing destructor must not abort an already-unwinding invocation.
-        if let Some(guard) = self.guard.take()
-            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(guard)))
+        if let Some(value) = self.value.take()
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value)))
         {
-            let mut failures = Vec::new();
-            record_panic(
-                "activity-admission",
-                FailureKind::DestructionPanicked,
-                payload,
-                &mut failures,
-            );
+            let failures = contain_user_panic(self.identity, self.stage, payload);
             self.runtime.record_faults(&failures);
         }
     }
@@ -761,6 +757,12 @@ async fn invoke_activity(
     input: String,
     activity_id: u64,
 ) -> ActivityInvocationOutcome {
+    let identity = UserOperation {
+        instance: context.instance_id().to_string(),
+        execution_id: context.execution_id(),
+        name: context.activity_name().to_string(),
+        activity_id: Some(activity_id),
+    };
     let mut failures = Vec::new();
     let guard = match catch_unwind(AssertUnwindSafe(|| handler.try_admit(&context, &input))) {
         Ok(Ok(ActivityAdmission::Admit(guard))) => guard,
@@ -776,14 +778,16 @@ async fn invoke_activity(
         }
         Ok(Err(error)) => return ActivityInvocationOutcome::Returned(Err(error)),
         Err(payload) => {
-            let outcome = activity_panic_outcome(payload, &mut failures);
+            let outcome = activity_panic_outcome(payload, &identity, &mut failures);
             runtime.record_faults(&failures);
             return outcome;
         }
     };
-    let _admission_guard = ActivityAdmissionGuard {
+    let _admission_guard = ActivityUserValue {
         runtime: &runtime,
-        guard: Some(guard),
+        value: Some(guard),
+        identity: &identity,
+        stage: "activity-admission",
     };
     tracing::debug!(
         target: "duroxide::runtime",
@@ -795,38 +799,35 @@ async fn invoke_activity(
         activity_tag = ?context.tag(),
         "Activity started"
     );
-    let mut future = handler.invoke(context, input);
-    let result = AssertUnwindSafe(future.as_mut()).catch_unwind().await;
+    let mut future = ActivityUserValue {
+        runtime: &runtime,
+        value: Some(handler.invoke(context, input)),
+        identity: &identity,
+        stage: "activity-invocation",
+    };
+    let result = AssertUnwindSafe(future.value.as_mut().expect("live activity future").as_mut())
+        .catch_unwind()
+        .await;
     let result = match result {
         Ok(result) => ActivityInvocationOutcome::Returned(result.map(ActivityInvocation::Completed)),
-        Err(payload) => activity_panic_outcome(payload, &mut failures),
+        Err(payload) => activity_panic_outcome(payload, &identity, &mut failures),
     };
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
-        record_panic(
-            "activity-invocation",
-            FailureKind::DestructionPanicked,
-            payload,
-            &mut failures,
-        );
-    }
+    drop(future);
     runtime.record_faults(&failures);
     result
 }
 
-fn activity_panic_outcome(payload: Box<dyn Any + Send>, failures: &mut Vec<TaskFailure>) -> ActivityInvocationOutcome {
+fn activity_panic_outcome(
+    payload: Box<dyn Any + Send>,
+    identity: &UserOperation,
+    failures: &mut Vec<TaskFailure>,
+) -> ActivityInvocationOutcome {
     let message = payload
         .downcast_ref::<String>()
         .cloned()
         .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_string()));
     // User panics remain durable application errors, not runtime failures.
-    if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
-        record_panic(
-            "activity-panic-payload",
-            FailureKind::PanicPayloadPanicked,
-            secondary,
-            failures,
-        );
-    }
+    failures.extend(dispose_user_payload(identity, "activity-panic-payload", payload));
     ActivityInvocationOutcome::Panicked(message)
 }
 
@@ -1359,9 +1360,7 @@ mod tests {
     mod panic_compatibility {
         use super::*;
         use crate::providers::{Provider, sqlite::SqliteProvider};
-        use crate::runtime::{
-            ActivityHandler, FnActivity, ObservabilityConfig, RuntimeOptions, RuntimeShutdownError, ShutdownOutcome,
-        };
+        use crate::runtime::{ActivityHandler, FnActivity, ObservabilityConfig, RuntimeOptions, ShutdownOutcome};
         use crate::{ActivityContext, OrchestrationRegistry};
         use std::any::Any;
         use std::future::Future;
@@ -1507,7 +1506,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "current_thread")]
-        async fn original_panic_payload_destruction_still_faults_runtime() {
+        async fn user_cleanup_payload_failure_preserves_tokio_error() {
             let runtime = runtime().await;
             let drops = Arc::new(AtomicUsize::new(0));
             let observed = drops.clone();
@@ -1522,13 +1521,12 @@ mod tests {
             .unwrap_err();
             assert!(error.into_panic().is::<()>(), "opaque payload must not escape to Tokio");
             assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.stop_status(), crate::runtime::RuntimeStopStatus::NotRequested);
             assert_eq!(
-                bounded(runtime.clone().shutdown_with_grace(Duration::ZERO)).await,
-                Err(RuntimeShutdownError::Failed { quiescent: true })
+                bounded(runtime.clone().shutdown_with_grace(Duration::from_secs(1))).await,
+                Ok(ShutdownOutcome::Drained)
             );
-            assert!(runtime.lifecycle.lock().unwrap().failures.iter().any(|failure| {
-                failure.task == "activity-panic-payload" && failure.kind == FailureKind::PanicPayloadPanicked
-            }));
+            assert!(runtime.lifecycle.lock().unwrap().failures.is_empty());
         }
 
         struct DirectFutureHandler<F>(F);
@@ -1552,49 +1550,59 @@ mod tests {
             }
         }
 
-        struct FailingFutureDrop(Arc<AtomicUsize>);
+        struct FailingFutureDrop {
+            drops: Arc<AtomicUsize>,
+            result: Option<Result<String, String>>,
+        }
 
         impl Future for FailingFutureDrop {
             type Output = Result<String, String>;
 
-            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-                Poll::Ready(Ok("completed".to_owned()))
+            fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(self.result.take().expect("outer result returns once"))
             }
         }
 
         impl Drop for FailingFutureDrop {
             fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                self.drops.fetch_add(1, Ordering::SeqCst);
                 panic!("prototype future destructor");
             }
         }
 
         #[tokio::test(flavor = "current_thread")]
-        async fn completed_activity_future_destruction_still_faults_runtime() {
+        async fn user_cleanup_actual_activity_returns_survive_future_destruction() {
             let runtime = runtime().await;
             let drops = Arc::new(AtomicUsize::new(0));
-            let observed = drops.clone();
-            let handler = Arc::new(DirectFutureHandler(move || FailingFutureDrop(observed.clone())));
+            for result in [Ok("completed".to_owned()), Err("actual failure".to_owned())] {
+                let expected = result.clone().map(ActivityInvocation::Completed);
+                let observed = Arc::clone(&drops);
+                let handler = Arc::new(DirectFutureHandler(move || FailingFutureDrop {
+                    drops: Arc::clone(&observed),
+                    result: Some(result.clone()),
+                }));
+                for _ in 0..2 {
+                    assert_eq!(
+                        bounded(spawn_activity_invocation(
+                            &runtime,
+                            handler.clone(),
+                            context(&runtime),
+                            String::new(),
+                            1
+                        ))
+                        .await
+                        .unwrap(),
+                        expected
+                    );
+                    assert_eq!(runtime.stop_status(), crate::runtime::RuntimeStopStatus::NotRequested);
+                }
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 4);
             assert_eq!(
-                bounded(spawn_activity_invocation(
-                    &runtime,
-                    handler,
-                    context(&runtime),
-                    String::new(),
-                    1
-                ))
-                .await
-                .unwrap(),
-                Ok(ActivityInvocation::Completed("completed".to_owned()))
+                bounded(runtime.clone().shutdown_with_grace(Duration::from_secs(1))).await,
+                Ok(ShutdownOutcome::Drained)
             );
-            assert_eq!(drops.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                bounded(runtime.clone().shutdown_with_grace(Duration::ZERO)).await,
-                Err(RuntimeShutdownError::Failed { quiescent: true })
-            );
-            assert!(runtime.lifecycle.lock().unwrap().failures.iter().any(|failure| {
-                failure.task == "activity-invocation" && failure.kind == FailureKind::DestructionPanicked
-            }));
+            assert!(runtime.lifecycle.lock().unwrap().failures.is_empty());
         }
 
         struct CountedPayload(Arc<AtomicUsize>);

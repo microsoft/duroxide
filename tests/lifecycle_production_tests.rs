@@ -186,32 +186,36 @@ async fn admission_and_handler_destruction_faults_are_contained_on_completion_an
             )
             .build();
         let runtime = Runtime::start_with_options(Arc::clone(&provider), activities, activity_flow(), options()).await;
-        let mut observer = runtime.stop_observer();
-        Client::new(provider)
-            .start_orchestration("destruction", "flow", "")
-            .await
-            .unwrap();
+        let observer = runtime.stop_observer();
+        let client = Client::new(provider);
+        client.start_orchestration("destruction", "flow", "").await.unwrap();
         bounded(started.notified()).await;
         if force {
             assert_eq!(admission_drops.load(Ordering::SeqCst), 0);
             assert_eq!(handler_drops.load(Ordering::SeqCst), 0);
         } else {
-            bounded(async {
-                let mut state = observer.state();
-                while state != RuntimeStopStatus::Faulted {
-                    state = observer
-                        .changed(state)
-                        .await
-                        .expect("fault must precede source closure");
-                }
-            })
-            .await;
+            assert!(matches!(
+                bounded(client.wait_for_orchestration("destruction", LIMIT))
+                    .await
+                    .unwrap(),
+                OrchestrationStatus::Failed { .. }
+            ));
         }
+        assert_eq!(observer.state(), RuntimeStopStatus::NotRequested);
         assert_eq!(
-            bounded(Arc::clone(&runtime).shutdown_with_grace(Duration::ZERO)).await,
-            Err(RuntimeShutdownError::Failed { quiescent: true })
+            bounded(Arc::clone(&runtime).shutdown_with_grace(if force {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(1)
+            }))
+            .await,
+            Ok(if force {
+                ShutdownOutcome::Forced
+            } else {
+                ShutdownOutcome::Drained
+            })
         );
-        assert_eq!(observer.state(), RuntimeStopStatus::Faulted);
+        assert_eq!(observer.state(), RuntimeStopStatus::Requested);
         assert_eq!(admission_drops.load(Ordering::SeqCst), 1);
         assert_eq!(handler_drops.load(Ordering::SeqCst), 1);
     }

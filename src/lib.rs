@@ -2497,8 +2497,10 @@ impl OrchestrationContext {
     /// and after driver destruction.
     /// Cleanup errors become lifecycle failures; their arbitrary text is not logged.
     /// A returned result, including `Err`, must certify that foreign work has ended.
-    /// If the completion panics, the runtime cannot prove that foreign work ended.
-    /// It logs the lifecycle failure and retains ownership without reporting completion.
+    /// If polling panics before the completion returns, the runtime cannot prove that
+    /// foreign work ended. It logs the lifecycle failure and retains ownership without
+    /// reporting completion. Destruction failure after a returned result is still a
+    /// lifecycle failure, but does not make the completed work pending again.
     /// An ordinary SDK wait can still time out. The application or supervisor then
     /// remains responsible for process termination.
     /// Ordinary replay retirement is not by itself forced runtime shutdown.

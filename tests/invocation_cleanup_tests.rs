@@ -155,6 +155,80 @@ fn synchronous_replay_rejects_cleanup_before_foreign_activation() {
     assert!(!foreign.cleanup_entered.is_cancelled());
 }
 
+#[test]
+fn synchronous_replay_does_not_contain_an_unowned_driver_drop() {
+    let foreign = MockForeign::default();
+    let registry = foreign.registry(Turn::Continue, false, true, false);
+    let handler = registry.resolve_handler("flow").unwrap().1;
+    let mut engine = replay_helpers::create_engine(vec![replay_helpers::started_event(1)]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        replay_helpers::execute(&mut engine, handler)
+    }));
+    assert!(
+        result.is_err(),
+        "standalone replay has no Runtime-owned cleanup boundary"
+    );
+    assert!(foreign.driver_dropped.is_cancelled());
+    assert!(!foreign.cleanup_entered.is_cancelled());
+}
+
+#[test]
+fn synchronous_replay_contains_user_payload_cleanup_but_not_reporting_failure() {
+    use tracing_subscriber::prelude::*;
+
+    struct Payload;
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            std::panic::resume_unwind(Box::new("payload cleanup failure"));
+        }
+    }
+    struct Reporter {
+        entered: Arc<AtomicBool>,
+        fail: bool,
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Reporter {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            if event.metadata().target() == "duroxide::runtime::cleanup" {
+                self.entered.store(true, Ordering::SeqCst);
+                assert!(!self.fail, "incident reporting failure");
+            }
+        }
+    }
+
+    for fail in [false, true] {
+        let reported = Arc::new(AtomicBool::new(false));
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(Reporter {
+            entered: Arc::clone(&reported),
+            fail,
+        }));
+        let registry = OrchestrationRegistry::builder()
+            .register("flow", |_: OrchestrationContext, _: String| async {
+                std::panic::resume_unwind(Box::new(Payload))
+            })
+            .build();
+        let handler = registry.resolve_handler("flow").unwrap().1;
+        let mut engine = replay_helpers::create_engine(vec![replay_helpers::started_event(1)]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            replay_helpers::execute(&mut engine, handler)
+        }));
+        assert!(reported.load(Ordering::SeqCst));
+        if fail {
+            assert!(
+                result.is_err(),
+                "a reporting failure must propagate without a Runtime owner"
+            );
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                TurnResult::Failed(duroxide::ErrorDetails::Application {
+                    kind: duroxide::AppErrorKind::Panicked,
+                    ..
+                })
+            ));
+        }
+    }
+}
+
 async fn captured_turn(turn: Turn, attach: bool, force: bool) -> Vec<Event> {
     let f = Fixture::new().await;
     let foreign = MockForeign::default();
@@ -266,7 +340,7 @@ fn without_creation_times(mut history: Vec<Event>) -> Vec<Event> {
     history
 }
 
-async fn fault_before_parent_routing(stamped: bool, fail_driver: bool) -> bool {
+async fn cleanup_before_parent_routing(stamped: bool, fail_driver: bool) -> bool {
     use duroxide::providers::{ExecutionMetadata, WorkItem};
     use duroxide::runtime::RuntimeStartError;
     use duroxide::runtime::test_hooks::LifecycleGate;
@@ -395,15 +469,15 @@ async fn fault_before_parent_routing(stamped: bool, fail_driver: bool) -> bool {
     };
     let runtime = f.prepare(ActivityRegistry::builder().build(), registry, options());
     bounded(Arc::clone(&runtime).start_execution()).await.unwrap();
-    let fault_count = || {
+    let incident_count = || {
         events
             .lock()
             .unwrap()
             .iter()
             .filter(|event| {
-                event.field("category").as_deref() == Some("owned_execution_failed")
-                    && event.field("task").as_deref() == Some("orchestration-driver")
-                    && event.field("kind").as_deref() == Some("DestructionPanicked")
+                event.field("category").as_deref() == Some("contained_user_cleanup")
+                    && event.field("stage").as_deref() == Some("orchestration-driver")
+                    && event.field("disposition").as_deref() == Some("operation-local")
             })
             .count()
     };
@@ -414,9 +488,9 @@ async fn fault_before_parent_routing(stamped: bool, fail_driver: bool) -> bool {
         let fetches = f
             .hooks
             .hits(LifecyclePoint::ProviderEnter(ProviderOperation::FetchActivity));
-        // Establish scheduler progress even on the no-fault and uncorrected paths.
+        // Establish scheduler progress even on the no-incident and uncorrected paths.
         until(|| {
-            fault_count() > 0
+            incident_count() > 0
                 || f.hooks
                     .hits(LifecyclePoint::ProviderEnter(ProviderOperation::FetchActivity))
                     >= fetches + 2
@@ -428,15 +502,8 @@ async fn fault_before_parent_routing(stamped: bool, fail_driver: bool) -> bool {
             "the held turn still owns retirement"
         );
     }
-    let early_fault = fault_count() > 0;
-    assert_eq!(
-        runtime.stop_status(),
-        if fail_driver {
-            RuntimeStopStatus::Faulted
-        } else {
-            RuntimeStopStatus::NotRequested
-        }
-    );
+    let early_incident = incident_count() > 0;
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
     let early_start = Arc::clone(&runtime).start_execution().await;
     assert_eq!(finalized.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -493,47 +560,33 @@ async fn fault_before_parent_routing(stamped: bool, fail_driver: bool) -> bool {
         "retirement rewrote committed history"
     );
     assert_eq!(
-        fault_count(),
+        incident_count(),
         usize::from(fail_driver),
-        "turn fault was reported again during retirement"
+        "contained incident was reported again during retirement"
     );
     assert!(history.iter().any(|event| matches!(&event.kind,
         EventKind::OrchestrationFailed { details: duroxide::ErrorDetails::Application {
             kind: duroxide::AppErrorKind::Cancelled { reason }, ..
         }} if reason == "controlled cancellation"
     )));
-    assert_eq!(
-        outcome,
-        if fail_driver {
-            Err(RuntimeShutdownError::Failed { quiescent: true })
-        } else {
-            Ok(ShutdownOutcome::Forced)
-        }
-    );
-    assert_eq!(
-        early_start,
-        Err(if early_fault {
-            RuntimeStartError::ShutdownRequested
-        } else {
-            RuntimeStartError::AlreadyStarted
-        })
-    );
-    early_fault
+    assert_eq!(outcome, Ok(ShutdownOutcome::Forced));
+    assert_eq!(early_start, Err(RuntimeStartError::AlreadyStarted));
+    early_incident
 }
 
 #[tokio::test]
-async fn driver_fault_precedes_a_held_legacy_parent_read() {
-    assert!(fault_before_parent_routing(false, true).await);
+async fn contained_driver_incident_precedes_a_held_legacy_parent_read() {
+    assert!(cleanup_before_parent_routing(false, true).await);
 }
 
 #[tokio::test]
 async fn stamped_parent_routes_without_waiting_for_a_legacy_read() {
-    assert!(fault_before_parent_routing(true, true).await);
+    assert!(cleanup_before_parent_routing(true, true).await);
 }
 
 #[tokio::test]
 async fn legacy_parent_routing_without_a_fault_keeps_the_runtime_running() {
-    assert!(!fault_before_parent_routing(false, false).await);
+    assert!(!cleanup_before_parent_routing(false, false).await);
 }
 
 #[tokio::test]
@@ -542,15 +595,23 @@ async fn panicking_fault_diagnostics_preserve_the_decision_and_retained_cleanup(
 
     struct PanicOnce {
         panicked: Arc<AtomicBool>,
+        observed_local: Arc<AtomicBool>,
         observed_fault: Arc<AtomicBool>,
         observer: RuntimeStopObserver,
     }
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PanicOnce {
         fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-            if *event.metadata().level() == tracing::Level::ERROR && !self.panicked.swap(true, Ordering::SeqCst) {
+            if event.metadata().target() == "duroxide::runtime::cleanup" && !self.panicked.swap(true, Ordering::SeqCst)
+            {
+                self.observed_local.store(
+                    self.observer.state() == RuntimeStopStatus::NotRequested,
+                    Ordering::SeqCst,
+                );
+                panic!("contained-incident diagnostic failure");
+            }
+            if *event.metadata().level() == tracing::Level::ERROR && self.panicked.load(Ordering::SeqCst) {
                 self.observed_fault
                     .store(self.observer.state() == RuntimeStopStatus::Faulted, Ordering::SeqCst);
-                panic!("diagnostic failure after turn destruction");
             }
         }
     }
@@ -570,9 +631,11 @@ async fn panicking_fault_diagnostics_preserve_the_decision_and_retained_cleanup(
         config,
     );
     let panicked = Arc::new(AtomicBool::new(false));
+    let observed_local = Arc::new(AtomicBool::new(false));
     let observed_fault = Arc::new(AtomicBool::new(false));
     let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(PanicOnce {
         panicked: Arc::clone(&panicked),
+        observed_local: Arc::clone(&observed_local),
         observed_fault: Arc::clone(&observed_fault),
         observer: runtime.stop_observer(),
     }));
@@ -582,6 +645,10 @@ async fn panicking_fault_diagnostics_preserve_the_decision_and_retained_cleanup(
     entered(&force).await;
     bounded(foreign.cleanup_entered.cancelled()).await;
     assert!(panicked.load(Ordering::SeqCst));
+    assert!(
+        observed_local.load(Ordering::SeqCst),
+        "user cleanup manufactured a Runtime fault"
+    );
     assert!(
         observed_fault.load(Ordering::SeqCst),
         "fault was not published before diagnostics"
@@ -674,6 +741,7 @@ async fn driver_destruction_failure_does_not_drop_its_retained_foreign_cleanup()
     Arc::clone(&runtime).start_execution().await.unwrap();
     f.client().start_orchestration("drop-fault", "flow", "").await.unwrap();
     bounded(foreign.cleanup_entered.cancelled()).await;
+    assert_eq!(runtime.stop_status(), RuntimeStopStatus::NotRequested);
     let mut shutdown = tokio::spawn(runtime.shutdown_with_grace(Duration::ZERO));
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
@@ -682,10 +750,7 @@ async fn driver_destruction_failure_does_not_drop_its_retained_foreign_cleanup()
     );
     assert_eq!(f.hooks.cleanup_counts().active, 1);
     foreign.release.cancel();
-    assert_eq!(
-        bounded(shutdown).await.unwrap(),
-        Err(RuntimeShutdownError::Failed { quiescent: true })
-    );
+    assert_eq!(bounded(shutdown).await.unwrap(), Ok(ShutdownOutcome::Forced));
     f.assert_retired();
     let history = f.inner.read("drop-fault").await.unwrap();
     assert!(

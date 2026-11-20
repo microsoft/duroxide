@@ -3,11 +3,15 @@
 
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 #[cfg(feature = "test-hooks")]
 use super::task_safety::protect_future;
-use super::task_safety::{FailureKind, TaskFailure, TaskFuture, TaskResult, append_failures, record_panic};
+use super::task_safety::{
+    FailureKind, TaskFailure, TaskFuture, TaskResult, UserOperation, append_failures, contain_user_panic, record_panic,
+};
 use futures_util::FutureExt;
 #[cfg(any(test, feature = "test-hooks"))]
 use tokio_util::sync::CancellationToken;
@@ -101,8 +105,8 @@ impl Drop for InvocationGuard {
         tracker.spawn_on(
             async move {
                 let _ = scope.retire_reporting(|failures| runtime.record_faults(failures)).await;
-                // Only a returned completion proves retirement, including an Err.
-                // Dropping or panicking an observer must not decrement this count.
+                // Only an actual completion return proves retirement, including an Err.
+                // A failed poll without that return must keep this count outstanding.
                 if has_cleanup {
                     runtime.record_foreign_retirement(false);
                 }
@@ -114,6 +118,27 @@ impl Drop for InvocationGuard {
 
 #[derive(Clone, Default)]
 pub(crate) struct CleanupAttachment(Option<Arc<Mutex<State>>>);
+
+struct RegisteredCleanup<F> {
+    supplied: Pin<Box<F>>,
+}
+
+impl<F: Future<Output = Result<(), String>>> Future for RegisteredCleanup<F> {
+    type Output = TaskResult;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Retain the supplied observer after Ready so retirement records its return
+        // before protected destruction, rather than dropping it in an owned map.
+        self.get_mut().supplied.as_mut().poll(cx).map(|result| {
+            result.map_err(|_| {
+                vec![TaskFailure {
+                    task: "invocation-cleanup",
+                    kind: FailureKind::Operation,
+                }]
+            })
+        })
+    }
+}
 
 impl InvocationScope {
     pub fn new() -> Self {
@@ -192,6 +217,18 @@ impl InvocationScope {
 }
 
 impl CleanupAttachment {
+    pub(super) fn report_cleanup_failures(&self, failures: Vec<TaskFailure>) {
+        if failures.is_empty() {
+            return;
+        }
+        if let Some(state) = &self.0 {
+            state.lock().unwrap().failures.extend(failures);
+        } else {
+            // Standalone replay has no Runtime owner to retain a reporting fault.
+            std::panic::resume_unwind(Box::new("user cleanup reporting failed"));
+        }
+    }
+
     pub(super) fn take_failures(&self) -> Vec<TaskFailure> {
         self.0
             .as_ref()
@@ -226,14 +263,9 @@ impl CleanupAttachment {
         &self,
         cleanup: impl Future<Output = Result<(), String>> + Send + 'static,
     ) -> Result<(), AttachError> {
-        self.attach(cleanup.map(|result| {
-            result.map_err(|_| {
-                vec![TaskFailure {
-                    task: "invocation-cleanup",
-                    kind: FailureKind::Operation,
-                }]
-            })
-        }))
+        self.attach(RegisteredCleanup {
+            supplied: Box::pin(cleanup),
+        })
     }
 
     pub(crate) fn register_with_finalization(
@@ -242,14 +274,9 @@ impl CleanupAttachment {
         finalization: impl FnMut() + Send + 'static,
     ) -> Result<(), AttachError> {
         self.attach_with_finalization(
-            cleanup.map(|result| {
-                result.map_err(|_| {
-                    vec![TaskFailure {
-                        task: "invocation-cleanup",
-                        kind: FailureKind::Operation,
-                    }]
-                })
-            }),
+            RegisteredCleanup {
+                supplied: Box::pin(cleanup),
+            },
             Some(Box::new(finalization)),
         )
     }
@@ -304,12 +331,16 @@ impl CleanupAttachment {
         }
     }
 
-    pub(super) fn destroy_driver(&self, driver: impl Sized) {
+    pub(super) fn destroy_driver(&self, driver: impl Sized, identity: &UserOperation, valid_decision: bool) {
         let Some(state) = &self.0 else {
             drop(driver);
             return;
         };
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(driver))) {
+            if valid_decision {
+                self.report_cleanup_failures(contain_user_panic(identity, "orchestration-driver", payload));
+                return;
+            }
             let mut failures = Vec::new();
             record_panic(
                 "orchestration-driver",
@@ -326,8 +357,225 @@ impl CleanupAttachment {
 mod tests {
     use super::*;
     use crate::runtime::task_safety::{FailureKind, TaskFailure};
+    use std::marker::PhantomPinned;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
     use tokio::sync::oneshot;
+
+    struct ReturnedCleanup {
+        fail: bool,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        _pin: PhantomPinned,
+    }
+
+    impl Future for ReturnedCleanup {
+        type Output = Result<(), String>;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            self.order.lock().unwrap().push("future-return");
+            Poll::Ready(if self.fail {
+                Err("registered cleanup failed".to_string())
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    impl Drop for ReturnedCleanup {
+        fn drop(&mut self) {
+            self.order.lock().unwrap().push("future-drop");
+            panic!("registered observer destruction failed");
+        }
+    }
+
+    struct CleanupCapture {
+        order: Arc<Mutex<Vec<&'static str>>>,
+        event: &'static str,
+    }
+
+    impl Drop for CleanupCapture {
+        fn drop(&mut self) {
+            self.order.lock().unwrap().push(self.event);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn registered_cleanup_success_survives_observer_destruction_failure() {
+        assert_registered_return(false, false).await;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn registered_cleanup_error_survives_observer_destruction_failure() {
+        assert_registered_return(false, true).await;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn registered_cleanup_finalized_success_survives_observer_destruction_failure() {
+        assert_registered_return(true, false).await;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn registered_cleanup_finalized_error_survives_observer_destruction_failure() {
+        assert_registered_return(true, true).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn assert_registered_return(with_finalization: bool, fail: bool) {
+        use super::super::{Runtime, RuntimeOptions, RuntimeShutdownError};
+        use std::time::Duration;
+
+        let runtime = Runtime::start_with_options(
+            Arc::new(crate::providers::sqlite::SqliteProvider::new_in_memory().await.unwrap()),
+            super::super::registry::ActivityRegistry::builder().build(),
+            crate::OrchestrationRegistry::builder().build(),
+            RuntimeOptions {
+                orchestration_concurrency: 0,
+                worker_concurrency: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+        let guard = InvocationGuard::new(Arc::clone(&runtime));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let completion = ReturnedCleanup {
+            fail,
+            order: Arc::clone(&order),
+            _pin: PhantomPinned,
+        };
+        if with_finalization {
+            let capture = CleanupCapture {
+                order: Arc::clone(&order),
+                event: "finalization-capture-drop",
+            };
+            guard
+                .attachment()
+                .register_with_finalization(completion, move || {
+                    std::hint::black_box(&capture);
+                    capture.order.lock().unwrap().push("finalization");
+                })
+                .unwrap();
+        } else {
+            guard.attachment().register(completion).unwrap();
+        }
+        drop(guard);
+        assert_eq!(runtime.lifecycle.lock().unwrap().pending_foreign_retirements, 1);
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                Arc::clone(&runtime).shutdown_with_grace(Duration::ZERO),
+            )
+            .await
+            .expect("actual registered completion was not retired"),
+            Err(RuntimeShutdownError::Failed { quiescent: true })
+        );
+        let mut expected = Vec::new();
+        if fail {
+            expected.push(TaskFailure {
+                task: "invocation-cleanup",
+                kind: FailureKind::Operation,
+            });
+        }
+        expected.push(TaskFailure {
+            task: "invocation-cleanup",
+            kind: FailureKind::DestructionPanicked,
+        });
+        let lifecycle = runtime.lifecycle.lock().unwrap();
+        assert_eq!(lifecycle.pending_foreign_retirements, 0);
+        assert_eq!(lifecycle.failures, expected);
+        assert_eq!(
+            *order.lock().unwrap(),
+            if with_finalization {
+                vec![
+                    "finalization",
+                    "finalization-capture-drop",
+                    "future-return",
+                    "future-drop",
+                ]
+            } else {
+                vec!["future-return", "future-drop"]
+            }
+        );
+    }
+
+    #[test]
+    fn registered_cleanup_poll_failure_retains_the_observer_without_repoll() {
+        for with_finalization in [false, true] {
+            assert_unproven_registered_return(with_finalization, false);
+        }
+    }
+
+    #[test]
+    fn registered_cleanup_nested_ready_does_not_certify_the_outer_observer() {
+        for with_finalization in [false, true] {
+            assert_unproven_registered_return(with_finalization, true);
+        }
+    }
+
+    fn assert_unproven_registered_return(with_finalization: bool, nested_ready: bool) {
+        let scope = InvocationScope::new();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let capture = CleanupCapture {
+            order: Arc::clone(&order),
+            event: "observer-capture-drop",
+        };
+        let mut inner = nested_ready.then(|| {
+            Box::pin(ReturnedCleanup {
+                fail: false,
+                order: Arc::clone(&order),
+                _pin: PhantomPinned,
+            })
+        });
+        let observed_polls = Arc::clone(&polls);
+        let completion = std::future::poll_fn(move |cx| -> Poll<Result<(), String>> {
+            std::hint::black_box(&capture);
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            if let Some(mut inner) = inner.take() {
+                assert!(inner.as_mut().poll(cx).is_ready());
+                drop(inner);
+            }
+            panic!("registered observer failed before return");
+        });
+        if with_finalization {
+            let finalized = Arc::clone(&order);
+            scope
+                .attachment()
+                .register_with_finalization(completion, move || finalized.lock().unwrap().push("finalization"))
+                .unwrap();
+        } else {
+            scope.attachment().register(completion).unwrap();
+        }
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let faults = Arc::clone(&reported);
+        let mut retirement = Box::pin(scope.retire_reporting(move |failures| {
+            faults.lock().unwrap().extend_from_slice(failures);
+        }));
+        assert!(retirement.as_mut().now_or_never().is_none());
+        assert!(retirement.as_mut().now_or_never().is_none());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *reported.lock().unwrap(),
+            vec![TaskFailure {
+                task: "invocation-cleanup",
+                kind: FailureKind::PollPanicked,
+            }]
+        );
+        let mut expected = Vec::new();
+        if with_finalization {
+            expected.push("finalization");
+        }
+        if nested_ready {
+            expected.extend(["future-return", "future-drop"]);
+        }
+        assert_eq!(*order.lock().unwrap(), expected);
+        // A failed observer has no completion path; do not force-drop its captures.
+        std::mem::forget(retirement);
+    }
 
     #[tokio::test]
     async fn no_attachment_completes_and_cannot_reopen() {
@@ -451,7 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn destruction_fault_is_recorded_before_any_diagnostic_can_panic() {
+    async fn invalid_driver_and_panicking_containment_diagnostics_remain_faults() {
         use tracing_subscriber::prelude::*;
 
         struct PanicOnError;
@@ -469,17 +717,39 @@ mod tests {
             }
         }
 
+        // Avoid tracing's single-dispatch cache shortcut when another test first
+        // reaches this callsite on a thread without a subscriber.
+        let _other_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(PanicOnError));
-        let scope = InvocationScope::new();
-        let result = catch_unwind(AssertUnwindSafe(|| scope.attachment().destroy_driver(BrokenDriver)));
-        assert!(result.is_ok(), "diagnostics escaped the protected driver destruction");
-        assert_eq!(
-            scope.retire().await,
-            Err(vec![TaskFailure {
-                task: "orchestration-driver",
-                kind: FailureKind::DestructionPanicked,
-            }])
-        );
+        let identity = UserOperation {
+            instance: "driver".to_string(),
+            execution_id: 1,
+            name: "flow".to_string(),
+            activity_id: None,
+        };
+        for valid_decision in [false, true] {
+            let scope = InvocationScope::new();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                scope
+                    .attachment()
+                    .destroy_driver(BrokenDriver, &identity, valid_decision)
+            }));
+            assert!(result.is_ok(), "diagnostics escaped the protected driver destruction");
+            assert_eq!(
+                scope.retire().await,
+                Err(vec![if valid_decision {
+                    TaskFailure {
+                        task: "user-cleanup-reporting",
+                        kind: FailureKind::ReportingPanicked,
+                    }
+                } else {
+                    TaskFailure {
+                        task: "orchestration-driver",
+                        kind: FailureKind::DestructionPanicked,
+                    }
+                }])
+            );
+        }
     }
 
     #[tokio::test]
@@ -679,18 +949,7 @@ mod tests {
         assert!(!engine.pending_actions.iter().any(|action| matches!(
             action, Action::SetKeyValue { key, .. } if key == "after-snapshot"
         )));
-        let retirement = scope.retire().await;
-        if fail_driver {
-            assert_eq!(
-                retirement,
-                Err(vec![TaskFailure {
-                    task: "orchestration-driver",
-                    kind: FailureKind::DestructionPanicked,
-                }])
-            );
-        } else {
-            assert_eq!(retirement, Ok(()));
-        }
+        assert_eq!(scope.retire().await, Ok(()));
         assert_eq!(*order.lock().unwrap(), ["finalization", "driver-drop", "completion"]);
     }
 }

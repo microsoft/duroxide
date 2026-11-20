@@ -235,10 +235,41 @@ Canceling a wait does not change shutdown or cleanup ownership.
 Source closure returns an unseen final state before `None`; neither proves cleanup.
 
 Use the typed cleanup result and the SDK's release checks to decide when resources
-can be released. The current SDKs and default .NET host do not automatically
-monitor this native API.
+can be released. Matching unreleased SDKs expose passive observers; default .NET
+hosting monitors its actual lifecycle owner for diagnostics only.
+Contained user-cleanup incidents do not set `Faulted` and are not delivered by
+that monitor. Native tracing reports them separately.
 See [native stop observation](ORCHESTRATION-GUIDE.md#native-stop-observation-unreleased)
 for the state contract, cancellation rules, example, and ownership diagram.
+
+### Contained user-cleanup incidents (unreleased)
+
+Enable the native `duroxide::runtime::cleanup` tracing target at `error`.
+Each contained incident uses `category="contained_user_cleanup"` and
+`disposition="operation-local"`. Repeated incidents produce separate records,
+not one sticky Runtime-fault notification.
+
+| Fields | Meaning |
+|---|---|
+| `instance`, `execution_id`, `operation` | The affected durable operation. |
+| `activity_id`, `task_id` | Optional activity and current Tokio task identities. |
+| `stage` | The named user-cleanup boundary. |
+| `payload_fate` | `disposed`, `secondary-disposed`, or `cleanup-skipped`. |
+| `payload_disposal_failures` | Number of failed payload-disposal attempts, at most two. |
+| `payload_cleanup_skipped` | Whether the remaining payload was deliberately left undisposed. |
+
+`disposed` describes the panic payload, not successful cleanup of the failing
+user value. `secondary-disposed` means disposal itself failed, but the replacement
+payload was disposed. `cleanup-skipped` means incomplete cleanup and a retained
+allocation, not repaired state. Repeated incidents can leak resources.
+Investigate the affected application cleanup; the Runtime does not repair it.
+
+These attempts have no wall-clock bound and cannot recover from process abort.
+The event excludes the raw panic payload; the separate Rust panic hook can still
+print it. A panic in the diagnostic subscriber remains a reporting fault and
+stops the Runtime. No new incident observer, host-stop policy or automatic restart
+is provided. See [fault shutdown and recovery](ORCHESTRATION-GUIDE.md#fault-shutdown-and-recovery)
+for eligibility, preserved outcomes and the failures that remain Runtime-fatal.
 
 ### Pending foreign retirements (unreleased)
 
@@ -259,12 +290,15 @@ that tracing target at `info` to observe those events.
 
 The count can rise while the number of running orchestrations falls.
 An orchestration can complete or dehydrate before its foreign work ends.
-The count falls only after the registered completion returns and protected destruction finishes.
-An `Err` result also confirms that foreign work ended.
-It decreases the count and causes a lifecycle failure.
+The count falls after the supplied registered observer actually returns and
+its protected destruction attempt ends. `Ok` and `Err` both certify the registered
+foreign work ended. A returned error or subsequent destruction failure still
+faults the Runtime; it does not erase the return or keep completed work counted.
+A destructor that blocks can still prevent retirement from finishing.
 
-A completion observer that panics or breaks remains in the count.
-Other evidence that suggests completion does not change this rule.
+An observer that fails before its actual return remains owned and counted,
+without repolling or force-dropping it. Nested readiness, sender loss, timeout
+and process exit are not completion certificates.
 Missing telemetry or a zero count does **not** prove that cleanup finished.
 
 The .NET retiring-invocation count measures a different population.
