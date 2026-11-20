@@ -1,15 +1,21 @@
-# Replay Simplification – Rolling Progress
+# Replay Simplification – Historical Progress
+
+> **Historical record (2026-01-21).** This file records past implementation work.
+> Test totals, commands, and open items describe that snapshot, not current status.
+> For current guidance, use the [Orchestration Guide](../ORCHESTRATION-GUIDE.md)
+> and [Replay Engine](../replay-engine.md).
 
 **Spec:** [proposals-impl/replay-simplification.md](../proposals-impl/replay-simplification.md)  
-**Checkpoint commit:** `555c5751653ac770a94d3962f743b7a2d7f6ad58` (revert here if approach fails)
+**Checkpoint commit:** `555c5751653ac770a94d3962f743b7a2d7f6ad58` (historical reference)
 
 ---
 
-## Current State (2026-01-21 - ALL PHASES COMPLETE)
+## Recorded State (2026-01-21)
 
 ### 605 tests passing, 0 skipped ✓
 
-All phases of replay simplification are complete. The codebase now uses simplified replay exclusively with clean APIs.
+The implementation had moved to simplified replay and removed the legacy APIs.
+The remaining sections record the completed work and open questions at that time.
 
 ### Phase 2: Bring the hammer down - COMPLETE ✓
 
@@ -57,7 +63,7 @@ All APIs now use clean names without `simplified_` prefix:
 - [x] `join()`, `join2()`, `join3()` - deterministic join combinators
 - [x] `select2()`, `select3()` - deterministic select combinators
 
-### Phase 4: Documentation - TODO
+### Phase 4: Documentation Tasks Recorded at the Time
 
 - [ ] Update `docs/ORCHESTRATION-GUIDE.md` (review for accuracy)
 - [ ] Update `docs/durable-futures-internals.md` (major rewrite needed)
@@ -81,9 +87,10 @@ All APIs now use clean names without `simplified_` prefix:
 | `select2/3()` | Uses local biased select futures for deterministic winner selection |
 | `trace*()` | Traces are emitted but not stored in history |
 
-### TBD: Cancellation Wiring (Orchestration → Activities)
+### Cancellation Questions Recorded at the Time
 
-During review, the following cancellation semantics appear incomplete and should be addressed (or explicitly documented as intentional):
+The review recorded the following cancellation questions.
+This list is historical, not a current defect report.
 
 - **Orchestration cancellation should cancel in-flight activities**
 	- Today, terminal states **Completed/Failed/ContinuedAsNew** compute in-flight activities and pass them to provider lock-stealing via `cancelled_activities`.
@@ -101,7 +108,7 @@ During review, the following cancellation semantics appear incomplete and should
 
 ---
 
-## Commands
+## Historical Commands
 - `cargo nt` - Full test suite (605 tests)
 - `cargo nt -E 'test(/replay_engine::/)' ` - Replay engine tests (113 tests)
 - `cargo clippy --lib --all-features` - Check for warnings

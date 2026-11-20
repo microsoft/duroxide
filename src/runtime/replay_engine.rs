@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{debug, warn};
 
+use super::task_safety::{UserOperation, dispose_user_payload};
+
 /// This version must not be released without the queue, positional and CAN cutover.
 pub(crate) const RACE_CANCELLATION_FIX_SINCE: semver::Version = semver::Version::new(0, 1, 31);
 
@@ -509,6 +511,25 @@ impl ReplayEngine {
         orchestration_version: String,
         worker_id: &str,
     ) -> TurnResult {
+        self.execute_orchestration_scoped(
+            handler,
+            input,
+            orchestration_name,
+            orchestration_version,
+            worker_id,
+            Default::default(),
+        )
+    }
+
+    pub(super) fn execute_orchestration_scoped(
+        &mut self,
+        handler: Arc<dyn OrchestrationHandler>,
+        input: String,
+        orchestration_name: String,
+        orchestration_version: String,
+        worker_id: &str,
+        cleanup: super::invocation_scope::CleanupAttachment,
+    ) -> TurnResult {
         debug!(instance = %self.instance, "executing orchestration turn");
 
         if let Some(err) = self.abort_error.clone() {
@@ -552,7 +573,8 @@ impl ReplayEngine {
             orchestration_name.clone(),
             orchestration_version.clone(),
             Some(worker_id.to_string()),
-        );
+        )
+        .with_invocation_cleanup(cleanup.clone());
 
         // This must be pinned for the whole execution, including its new turns.
         // Applying the fix to old decisions can change a recorded race winner.
@@ -580,6 +602,12 @@ impl ReplayEngine {
             }
         }
 
+        let identity = UserOperation {
+            instance: self.instance.clone(),
+            execution_id: self.execution_id,
+            name: orchestration_name,
+            activity_id: None,
+        };
         let ctx_for_future = ctx.clone();
         let h = handler.clone();
         let inp = input.clone();
@@ -592,7 +620,7 @@ impl ReplayEngine {
         let mut fut = match fut_result {
             Ok(f) => f,
             Err(panic_payload) => {
-                let msg = extract_panic_message(panic_payload);
+                let msg = extract_panic_message(panic_payload, &identity, &cleanup);
                 return TurnResult::Failed(crate::ErrorDetails::Application {
                     kind: crate::AppErrorKind::Panicked,
                     message: msg,
@@ -601,93 +629,117 @@ impl ReplayEngine {
             }
         };
 
-        let mut open_schedules: HashSet<u64> = HashSet::new();
-        let mut schedule_kinds: std::collections::HashMap<u64, ActionKind> = std::collections::HashMap::new();
-        let mut emitted_actions: VecDeque<(u64, Action)> = VecDeque::new();
+        let decision = catch_unwind(AssertUnwindSafe(|| {
+            let mut open_schedules: HashSet<u64> = HashSet::new();
+            let mut schedule_kinds: std::collections::HashMap<u64, ActionKind> = std::collections::HashMap::new();
+            let mut emitted_actions: VecDeque<(u64, Action)> = VecDeque::new();
 
-        let mut must_poll = true;
-        let mut output_opt: Option<Result<String, String>> = None;
-        let replay_boundary = self.persisted_history_len;
+            let mut must_poll = true;
+            let mut output_opt: Option<Result<String, String>> = None;
+            let replay_boundary = self.persisted_history_len;
 
-        if replay_boundary == 0 {
-            ctx.set_is_replaying(false);
-        }
-
-        // Pre-initialize accumulated_custom_status from OrchestrationStarted before any polling.
-        // This is needed because the first poll may happen before apply_history_event processes
-        // the OrchestrationStarted event (the loop polls before applying at each iteration).
-        if let Some(EventKind::OrchestrationStarted {
-            initial_custom_status: Some(status),
-            ..
-        }) = working_history.first().map(|e| &e.kind)
-        {
-            ctx.inner
-                .lock()
-                .expect("Mutex should not be poisoned")
-                .accumulated_custom_status = Some(status.clone());
-        }
-
-        for (event_index, event) in working_history.iter().enumerate() {
-            if event_index >= replay_boundary {
+            if replay_boundary == 0 {
                 ctx.set_is_replaying(false);
             }
 
-            if must_poll {
-                match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
-                    Ok(Some(result)) => {
-                        output_opt = Some(result);
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(err) => return err,
+            // Pre-initialize accumulated_custom_status from OrchestrationStarted before any polling.
+            // This is needed because the first poll may happen before apply_history_event processes
+            // the OrchestrationStarted event (the loop polls before applying at each iteration).
+            if let Some(EventKind::OrchestrationStarted {
+                initial_custom_status: Some(status),
+                ..
+            }) = working_history.first().map(|e| &e.kind)
+            {
+                ctx.inner
+                    .lock()
+                    .expect("Mutex should not be poisoned")
+                    .accumulated_custom_status = Some(status.clone());
+            }
+
+            for (event_index, event) in working_history.iter().enumerate() {
+                if event_index >= replay_boundary {
+                    ctx.set_is_replaying(false);
                 }
-                must_poll = false;
+
+                if must_poll {
+                    match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions, &identity) {
+                        Ok(Some(result)) => {
+                            output_opt = Some(result);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(err) => return Ok(err),
+                    }
+                    must_poll = false;
+                }
+
+                if let Err(err) = self.apply_history_event(
+                    &ctx,
+                    event,
+                    &mut emitted_actions,
+                    &mut open_schedules,
+                    &mut schedule_kinds,
+                    &mut must_poll,
+                ) {
+                    return Ok(err);
+                }
             }
 
-            if let Err(err) = self.apply_history_event(
-                &ctx,
-                event,
-                &mut emitted_actions,
-                &mut open_schedules,
-                &mut schedule_kinds,
-                &mut must_poll,
-            ) {
-                return err;
+            ctx.set_is_replaying(false);
+
+            if must_poll && output_opt.is_none() {
+                match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions, &identity) {
+                    Ok(Some(result)) => output_opt = Some(result),
+                    Ok(None) => {}
+                    Err(err) => return Ok(err),
+                }
             }
-        }
 
-        ctx.set_is_replaying(false);
-
-        if must_poll && output_opt.is_none() {
-            match Self::poll_orchestration_future(&mut fut, &ctx, &mut emitted_actions) {
-                Ok(Some(result)) => output_opt = Some(result),
-                Ok(None) => {}
-                Err(err) => return err,
+            {
+                // Legacy turns apply dropped queue cancellation here. In immediate
+                // mode these IDs were already marked at drop/bind; repeating is idempotent.
+                let cancelled_queue_waits = ctx.get_cancelled_queue_ids();
+                for schedule_id in cancelled_queue_waits {
+                    ctx.mark_queue_subscription_cancelled(schedule_id);
+                }
             }
-        }
 
-        {
-            // Legacy turns apply dropped queue cancellation here. In immediate
-            // mode these IDs were already marked at drop/bind; repeating is idempotent.
-            let cancelled_queue_waits = ctx.get_cancelled_queue_ids();
-            for schedule_id in cancelled_queue_waits {
-                ctx.mark_queue_subscription_cancelled(schedule_id);
+            self.convert_emitted_actions(&ctx, emitted_actions);
+
+            if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt, &identity) {
+                return Ok(err);
             }
+
+            #[cfg(feature = "test-hooks")]
+            cleanup.before_turn_decision();
+            let finalized = cleanup.finalize();
+            if cleanup.finalization_failed() {
+                return Err(());
+            }
+            if finalized {
+                self.convert_emitted_actions(&ctx, ctx.drain_emitted_actions());
+            }
+            Ok(self.finalize_turn(&ctx, output_opt))
+        }));
+        // Destruction may emit cancellation bookkeeping; it follows the durable
+        // decision, while foreign scheduling is fenced before that snapshot.
+        cleanup.finalize();
+        let finalization_failed = cleanup.finalization_failed();
+        cleanup.destroy_driver(fut, &identity, matches!(&decision, Ok(Ok(_))) && !finalization_failed);
+        match decision {
+            Ok(Ok(result)) if !finalization_failed => result,
+            // This is an engine failure, not a failed application turn: the caller
+            // must not acknowledge any newly generated history, actions or starts.
+            Ok(_) => std::panic::resume_unwind(Box::new(())),
+            Err(payload) => std::panic::resume_unwind(payload),
         }
-
-        self.convert_emitted_actions(&ctx, emitted_actions);
-
-        if let Err(err) = self.run_quiescence_loop(&ctx, &mut fut, &mut output_opt) {
-            return err;
-        }
-
-        self.finalize_turn(&ctx, output_opt)
     }
 
     fn poll_orchestration_future(
         fut: &mut Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>,
         ctx: &OrchestrationContext,
         emitted_actions: &mut VecDeque<(u64, Action)>,
+        identity: &UserOperation,
     ) -> Result<Option<Result<String, String>>, TurnResult> {
         let poll_result = catch_unwind(AssertUnwindSafe(|| poll_once(fut.as_mut())));
         match poll_result {
@@ -700,7 +752,7 @@ impl ReplayEngine {
                 Ok(None)
             }
             Err(panic_payload) => {
-                let msg = extract_panic_message(panic_payload);
+                let msg = extract_panic_message(panic_payload, identity, &ctx.invocation_cleanup);
                 Err(TurnResult::Failed(crate::ErrorDetails::Application {
                     kind: crate::AppErrorKind::Panicked,
                     message: msg,
@@ -1023,6 +1075,7 @@ impl ReplayEngine {
         ctx: &OrchestrationContext,
         fut: &mut Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>,
         output_opt: &mut Option<Result<String, String>>,
+        identity: &UserOperation,
     ) -> Result<(), TurnResult> {
         const MAX_QUIESCENCE_ITERATIONS: usize = 100;
         let mut quiescence_iter = 0;
@@ -1032,7 +1085,7 @@ impl ReplayEngine {
             quiescence_iter += 1;
             let actions_before = self.pending_actions.len();
 
-            if let Some(res) = Self::poll_orchestration_future(fut, ctx, &mut emitted_actions)? {
+            if let Some(res) = Self::poll_orchestration_future(fut, ctx, &mut emitted_actions, identity)? {
                 *output_opt = Some(res);
             }
             self.convert_emitted_actions(ctx, emitted_actions.drain(..));
@@ -1712,14 +1765,24 @@ fn nondeterminism_error(msg: &str) -> crate::ErrorDetails {
 }
 
 /// Extract panic message from payload
-fn extract_panic_message(panic_payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = panic_payload.downcast_ref::<&str>() {
+fn extract_panic_message(
+    panic_payload: Box<dyn std::any::Any + Send>,
+    identity: &UserOperation,
+    cleanup: &super::invocation_scope::CleanupAttachment,
+) -> String {
+    let message = if let Some(s) = panic_payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = panic_payload.downcast_ref::<String>() {
         s.clone()
     } else {
         "orchestration panicked".to_string()
-    }
+    };
+    cleanup.report_cleanup_failures(dispose_user_payload(
+        identity,
+        "orchestration-panic-payload",
+        panic_payload,
+    ));
+    message
 }
 
 /// Convert an Action to an Event for history persistence
