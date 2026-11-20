@@ -94,6 +94,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag. (#74)
 - Relative SQLite queue delays saturate instead of overflowing their timestamp
   representation. (#74)
+- Provider validation's multi-threaded lock-expiration recovery test measures
+  its waits from the first completed claim, so connection warm-up cannot consume
+  the expiry margin. The lease duration and margin are unchanged. (#76)
+
+- **Orchestration poison reporting** - Count `duroxide_orchestration_poison_total`
+  only when the provider confirms the acknowledgement. Errors after retry handling
+  increment the new `duroxide_orchestration_poison_failed_total` counter and emit a
+  correlated error log without claiming the write did not commit. This applies to
+  exceeded-attempt and corrupted-history handling as well as poison propagated from
+  activities or child orchestrations. The new count is also exposed through
+  `MetricsProvider::orchestration_poison_failed()` without changing `MetricsSnapshot`.
+  Retry, lease, and activity poison accounting behavior are unchanged. (#73)
+
+- **Activity acknowledgement retries** - Retry transient provider errors when
+  acknowledging activity success or application errors, up to five attempts with
+  lock renewal retained. This avoids unnecessary activity re-execution.
+  Cancellation acknowledgements remain single-attempt, and retries do not extend
+  the shutdown grace period. A permanent error after a transient acknowledgement
+  error is reported as an uncertain outcome rather than a confirmed infrastructure
+  failure; neither commit nor redelivery is guaranteed. Uncertain outcomes are
+  counted separately in `duroxide_activity_ack_uncertain_total`. (#72)
+
+### Provider notes for 0.2.0
+
+- **Duplicate activity acknowledgements** - Completion acknowledgements can be
+  retried after the transaction committed but its response was lost. Providers
+  must atomically remove the locked worker item and enqueue its completion.
+  After that commit, repeating `ack_work_item(token, Some(completion))` with the
+  same token must return a non-retryable error without enqueueing another
+  completion. See the [provider contract](docs/provider-implementation-guide.md#error-classification). (#72)
+- After upgrading the Duroxide dependency, register
+  [`duroxide::provider_validations::test_ack_work_item_duplicate_rejected`](src/provider_validation/atomicity.rs)
+  in your provider's validation suite. It acknowledges the same token twice and
+  verifies that the second call fails non-retryably, exactly one completion is
+  queued, and the worker item is removed. SQLite already runs this validation;
+  external providers must add their own wrapper. (#72)
 
 ## [0.1.32] - 2026-10-11
 

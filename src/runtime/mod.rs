@@ -869,9 +869,23 @@ impl Runtime {
     }
 
     #[inline]
+    fn record_activity_ack_uncertain(&self) {
+        if let Some(provider) = self.metrics_provider() {
+            provider.record_activity_ack_uncertain();
+        }
+    }
+
+    #[inline]
     fn record_orchestration_poison(&self) {
         if let Some(provider) = self.metrics_provider() {
             provider.record_orchestration_poison();
+        }
+    }
+
+    #[inline]
+    fn record_orchestration_poison_failed(&self) {
+        if let Some(provider) = self.metrics_provider() {
+            provider.record_orchestration_poison_failed();
         }
     }
 
@@ -1602,6 +1616,11 @@ impl Runtime {
     ///   - `None`: Default 1000ms
     ///   - `Some(0)`: Abort immediately, then wait for cancellation cleanup
     ///   - `Some(ms)`: Allow up to the given milliseconds before aborting stragglers
+    ///
+    /// Activity acknowledgement retries can spend up to 1.5 seconds in backoff,
+    /// plus time in provider calls. The default 1-second grace can interrupt them;
+    /// retries do not extend the grace period. Unacknowledged work becomes available
+    /// for redelivery after its lock expires.
     ///
     /// This is not a hard return deadline. Tokio cancellation requires tasks to yield;
     /// blocking or non-yielding user code can delay shutdown beyond the grace period.

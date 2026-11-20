@@ -53,6 +53,10 @@ pub struct PoisonInjectingProvider {
     history_reads: AtomicU32,
     execution_history_read_failures: AtomicU32,
     hide_management: AtomicBool,
+    reject_orchestration_acks: AtomicBool,
+    fail_next_orchestration_ack_after_commit: AtomicBool,
+    retryable_orchestration_ack_failures_remaining: AtomicU32,
+    orchestration_ack_calls: AtomicU32,
 }
 
 impl PoisonInjectingProvider {
@@ -78,7 +82,32 @@ impl PoisonInjectingProvider {
             history_reads: AtomicU32::new(0),
             execution_history_read_failures: AtomicU32::new(0),
             hide_management: AtomicBool::new(false),
+            reject_orchestration_acks: AtomicBool::new(false),
+            fail_next_orchestration_ack_after_commit: AtomicBool::new(false),
+            retryable_orchestration_ack_failures_remaining: AtomicU32::new(0),
+            orchestration_ack_calls: AtomicU32::new(0),
         }
+    }
+
+    /// Reject acks without modifying the underlying lease or committing changes.
+    pub fn reject_orchestration_acks(&self, reject: bool) {
+        self.reject_orchestration_acks.store(reject, Ordering::SeqCst);
+    }
+
+    /// Commit the next ack, then return a retryable error to simulate a lost response.
+    pub fn fail_next_orchestration_ack_after_commit(&self) {
+        self.fail_next_orchestration_ack_after_commit
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Reject the next `count` acknowledgements with a retryable error before committing.
+    pub fn fail_orchestration_acks_retryably(&self, count: u32) {
+        self.retryable_orchestration_ack_failures_remaining
+            .store(count, Ordering::SeqCst);
+    }
+
+    pub fn orchestration_ack_calls(&self) -> u32 {
+        self.orchestration_ack_calls.load(Ordering::SeqCst)
     }
 
     /// Next orchestration fetch will return this attempt_count instead of real one.
@@ -136,6 +165,11 @@ impl PoisonInjectingProvider {
         self.orchestration_skip_count.store(0, Ordering::SeqCst);
         self.activity_skip_count.store(0, Ordering::SeqCst);
         self.fail_orchestration_abandon.store(false, Ordering::SeqCst);
+        self.reject_orchestration_acks.store(false, Ordering::SeqCst);
+        self.fail_next_orchestration_ack_after_commit
+            .store(false, Ordering::SeqCst);
+        self.retryable_orchestration_ack_failures_remaining
+            .store(0, Ordering::SeqCst);
     }
 
     pub fn fail_orchestration_abandon_persistently(&self) {
@@ -284,6 +318,20 @@ impl Provider for PoisonInjectingProvider {
         metadata: ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
+        self.orchestration_ack_calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .retryable_orchestration_ack_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ProviderError::retryable(
+                "ack_orchestration_item",
+                "injected retryable turn-ack failure",
+            ));
+        }
+        if self.reject_orchestration_acks.load(Ordering::SeqCst) {
+            return Err(ProviderError::permanent("ack_orchestration_item", "Invalid lock token"));
+        }
         if self.fail_next_orchestration_ack.swap(false, Ordering::SeqCst) {
             return Err(ProviderError::permanent(
                 "ack_orchestration_item",
@@ -326,6 +374,15 @@ impl Provider for PoisonInjectingProvider {
         self.failure_commit_collision_notifications
             .fetch_add(collision_count, Ordering::SeqCst);
         self.collision_notices.lock().expect("notices lock").extend(notices);
+        if self
+            .fail_next_orchestration_ack_after_commit
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(ProviderError::retryable(
+                "ack_orchestration_item",
+                "injected response failure after commit",
+            ));
+        }
         Ok(())
     }
 
@@ -641,14 +698,29 @@ impl Provider for FilterBypassProvider {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkItemCall {
+    Ack {
+        token: String,
+        completion: Option<WorkItem>,
+    },
+    Abandon {
+        token: String,
+    },
+}
+
 /// A provider wrapper that can inject transient failures for testing
 /// error handling and retry logic.
 pub struct FailingProvider {
     inner: Arc<SqliteProvider>,
     fail_next_ack_work_item: AtomicBool,
+    /// Number of remaining `ack_work_item` calls to fail with a *retryable* error
+    retryable_ack_work_item_failures: AtomicU32,
+    work_item_calls: std::sync::Mutex<Vec<WorkItemCall>>,
     fail_next_ack_orchestration_item: AtomicBool,
     fail_next_fetch_orchestration_item: AtomicBool,
     fail_next_fetch_work_item: AtomicBool,
+    fail_next_renew_work_item_lock: AtomicBool,
     /// If true, allow failure event commits to succeed even when failing acks
     allow_failure_commits: AtomicBool,
     /// If true, do the actual ack before returning error (for testing post-ack failures)
@@ -660,9 +732,12 @@ impl FailingProvider {
         Self {
             inner,
             fail_next_ack_work_item: AtomicBool::new(false),
+            retryable_ack_work_item_failures: AtomicU32::new(0),
+            work_item_calls: std::sync::Mutex::new(Vec::new()),
             fail_next_ack_orchestration_item: AtomicBool::new(false),
             fail_next_fetch_orchestration_item: AtomicBool::new(false),
             fail_next_fetch_work_item: AtomicBool::new(false),
+            fail_next_renew_work_item_lock: AtomicBool::new(false),
             allow_failure_commits: AtomicBool::new(false),
             ack_then_fail: AtomicBool::new(false),
         }
@@ -670,6 +745,23 @@ impl FailingProvider {
 
     pub fn fail_next_ack_work_item(&self) {
         self.fail_next_ack_work_item.store(true, Ordering::SeqCst);
+    }
+
+    /// Fail the next `count` `ack_work_item` calls with a *retryable* error.
+    ///
+    /// The underlying ack is not performed unless `set_ack_then_fail(true)` is set.
+    pub fn fail_next_ack_work_item_retryable(&self, count: u32) {
+        self.retryable_ack_work_item_failures.store(count, Ordering::SeqCst);
+    }
+
+    /// Number of injected retryable ack failures that have not been consumed yet.
+    pub fn remaining_retryable_ack_failures(&self) -> u32 {
+        self.retryable_ack_work_item_failures.load(Ordering::SeqCst)
+    }
+
+    /// Return work-item acknowledgement and abandonment calls in invocation order.
+    pub fn work_item_calls(&self) -> Vec<WorkItemCall> {
+        self.work_item_calls.lock().unwrap().clone()
     }
 
     pub fn fail_next_ack_orchestration_item(&self) {
@@ -682,6 +774,10 @@ impl FailingProvider {
 
     pub fn fail_next_fetch_work_item(&self) {
         self.fail_next_fetch_work_item.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_next_renew_work_item_lock(&self) {
+        self.fail_next_renew_work_item_lock.store(true, Ordering::SeqCst);
     }
 
     /// When set, failure event commits (OrchestrationFailed) will succeed
@@ -798,21 +894,48 @@ impl Provider for FailingProvider {
     }
 
     async fn ack_work_item(&self, token: &str, completion: Option<WorkItem>) -> Result<(), ProviderError> {
-        if self.fail_next_ack_work_item.swap(false, Ordering::SeqCst) {
-            // If ack_then_fail is set, do the actual ack first
-            if self.ack_then_fail.load(Ordering::SeqCst) {
-                self.inner.ack_work_item(token, completion).await?;
-            }
-            Err(ProviderError::permanent(
+        self.work_item_calls.lock().unwrap().push(WorkItemCall::Ack {
+            token: token.to_string(),
+            completion: completion.clone(),
+        });
+
+        let failure = if self
+            .retryable_ack_work_item_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                n.checked_sub(1).filter(|_| n > 0)
+            })
+            .is_ok()
+        {
+            Some(ProviderError::retryable(
+                "ack_work_item",
+                "simulated transient lock contention",
+            ))
+        } else if self.fail_next_ack_work_item.swap(false, Ordering::SeqCst) {
+            Some(ProviderError::permanent(
                 "ack_work_item",
                 "simulated infrastructure failure",
             ))
+        } else {
+            None
+        };
+
+        if let Some(error) = failure {
+            if self.ack_then_fail.load(Ordering::SeqCst) {
+                self.inner.ack_work_item(token, completion).await?;
+            }
+            Err(error)
         } else {
             self.inner.ack_work_item(token, completion).await
         }
     }
 
     async fn renew_work_item_lock(&self, token: &str, extension: Duration) -> Result<(), ProviderError> {
+        if self.fail_next_renew_work_item_lock.swap(false, Ordering::SeqCst) {
+            return Err(ProviderError::retryable(
+                "renew_work_item_lock",
+                "simulated transient renewal failure",
+            ));
+        }
         self.inner.renew_work_item_lock(token, extension).await
     }
 
@@ -822,6 +945,9 @@ impl Provider for FailingProvider {
         delay: Option<Duration>,
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
+        self.work_item_calls.lock().unwrap().push(WorkItemCall::Abandon {
+            token: token.to_string(),
+        });
         self.inner.abandon_work_item(token, delay, ignore_attempt).await
     }
 

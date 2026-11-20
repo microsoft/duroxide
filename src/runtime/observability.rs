@@ -127,6 +127,7 @@ pub struct MetricsSnapshot {
     pub orch_application_errors: u64,
     pub orch_infrastructure_errors: u64,
     pub orch_configuration_errors: u64,
+    /// Confirmed poison acknowledgements.
     pub orch_poison: u64,
     pub activity_success: u64,
     pub activity_app_errors: u64,
@@ -154,9 +155,11 @@ pub struct MetricsProvider {
     orch_infrastructure_errors_atomic: AtomicU64,
     orch_configuration_errors_atomic: AtomicU64,
     orch_poison_atomic: AtomicU64,
+    orch_poison_failed_atomic: AtomicU64,
     activity_success_atomic: AtomicU64,
     activity_app_errors_atomic: AtomicU64,
     activity_infra_errors_atomic: AtomicU64,
+    activity_ack_uncertain_atomic: AtomicU64,
     activity_config_errors_atomic: AtomicU64,
     activity_poison_atomic: AtomicU64,
     activity_admission_deferrals_atomic: AtomicU64,
@@ -193,9 +196,11 @@ impl MetricsProvider {
             orch_infrastructure_errors_atomic: AtomicU64::new(0),
             orch_configuration_errors_atomic: AtomicU64::new(0),
             orch_poison_atomic: AtomicU64::new(0),
+            orch_poison_failed_atomic: AtomicU64::new(0),
             activity_success_atomic: AtomicU64::new(0),
             activity_app_errors_atomic: AtomicU64::new(0),
             activity_infra_errors_atomic: AtomicU64::new(0),
+            activity_ack_uncertain_atomic: AtomicU64::new(0),
             activity_config_errors_atomic: AtomicU64::new(0),
             activity_poison_atomic: AtomicU64::new(0),
             activity_admission_deferrals_atomic: AtomicU64::new(0),
@@ -454,6 +459,18 @@ impl MetricsProvider {
     }
 
     #[inline]
+    pub fn record_activity_ack_uncertain(&self) {
+        counter!("duroxide_activity_ack_uncertain_total").increment(1);
+        self.activity_ack_uncertain_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of activity completion acknowledgements with an uncertain outcome.
+    #[inline]
+    pub fn activity_ack_uncertain(&self) -> u64 {
+        self.activity_ack_uncertain_atomic.load(Ordering::Relaxed)
+    }
+
+    #[inline]
     pub fn record_activity_config_error(&self) {
         counter!("duroxide_activity_executions_total", "outcome" => "config_error").increment(1);
         counter!("duroxide_activity_configuration_errors_total").increment(1);
@@ -477,10 +494,20 @@ impl MetricsProvider {
         self.activity_admission_deferrals_atomic.load(Ordering::Relaxed)
     }
 
+    /// Record a confirmed orchestration poison acknowledgement.
     #[inline]
     pub fn record_orchestration_poison(&self) {
         self.orch_poison_atomic.fetch_add(1, Ordering::Relaxed);
         counter!("duroxide_orchestration_poison_total").increment(1);
+    }
+
+    /// Record a poison acknowledgement that returned an error after runtime retries.
+    ///
+    /// The disposition may still have committed, for example if its response was lost.
+    #[inline]
+    pub fn record_orchestration_poison_failed(&self) {
+        self.orch_poison_failed_atomic.fetch_add(1, Ordering::Relaxed);
+        counter!("duroxide_orchestration_poison_failed_total").increment(1);
     }
 
     #[inline]
@@ -629,6 +656,14 @@ impl MetricsProvider {
     // ========================================================================
     // Snapshot for testing
     // ========================================================================
+
+    /// Number of poison acknowledgements that returned an error after runtime retries.
+    ///
+    /// The disposition may still have committed. This count is exposed separately
+    /// to preserve source compatibility for callers constructing [`MetricsSnapshot`].
+    pub fn orchestration_poison_failed(&self) -> u64 {
+        self.orch_poison_failed_atomic.load(Ordering::Relaxed)
+    }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {

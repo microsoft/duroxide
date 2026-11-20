@@ -192,6 +192,8 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_orchestration_history_size` | Histogram | Orchestration | orchestration_name | Detect history growth issues |
 | `duroxide_orchestration_turns` | Histogram | Orchestration | orchestration_name | Identify multi-turn orchestrations |
 | `duroxide_orchestration_continue_as_new_total` | Counter | Orchestration | orchestration_name, execution_id | Track CAN operations |
+| `duroxide_orchestration_poison_total` | Counter | Orchestration | _(none)_ | Confirmed poison acknowledgements |
+| `duroxide_orchestration_poison_failed_total` | Counter | Orchestration | _(none)_ | Poison acknowledgements that returned an error after retries |
 | `duroxide_active_orchestrations` | Gauge | Orchestration | _(none)_ | **Current** active count |
 | `duroxide_pending_foreign_retirements` | Gauge | Runtime lifecycle | _(none)_ | Aggregate independently retained foreign completions (unreleased) |
 | **Activity Execution** |
@@ -199,6 +201,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_activity_admission_deferrals_total` | Counter | Activity | activity_name, tag | Track admission deferrals whose abandon returned success |
 | `duroxide_activity_duration_seconds` | Histogram | Activity | activity_name, outcome | Activity latency p95/p99 |
 | `duroxide_activity_errors_total` | Counter | Activity | activity_name, error_type, retryable | Detailed error tracking |
+| `duroxide_activity_ack_uncertain_total` | Counter | Activity | _(none)_ | Track uncertain acknowledgement outcomes separately from failures |
 | **Sub-Orchestration** |
 | `duroxide_suborchestration_calls_total` | Counter | Sub-Orch | parent_orchestration, child_orchestration, outcome | Track sub-orch calls |
 | `duroxide_suborchestration_duration_seconds` | Histogram | Sub-Orch | parent_orchestration, child_orchestration, outcome | Sub-orch latency |
@@ -311,6 +314,35 @@ Use the retained lifecycle operation and its cleanup result to decide when resou
 - **Labels**: `orchestration_name`, `execution_id`
 - **Use**: Verify continue-as-new is working, identify long-running actors
 
+**Poison acknowledgement counters**
+
+`duroxide_orchestration_poison_total` counts poison acknowledgements confirmed by
+the provider. `duroxide_orchestration_poison_failed_total` counts those that return
+an error after the runtime's retry handling. Each final acknowledgement result
+increments one counter, not once per acknowledgement retry. Neither counter has labels.
+
+Both counters include failures propagated from poisoned activities or child
+orchestrations, not just orchestrations that exceed their own attempt budget.
+For propagated failures, the logged attempt count and maximum come from the
+original poison error.
+
+An acknowledgement error does not prove the disposition failed to commit: its
+response may have been lost, or another dispatcher may have completed the work
+after a lease expired. These counters describe observed acknowledgement outcomes,
+not an exact ledger of durable terminations. Repeated failures warrant investigation;
+the error log includes the instance, attempt count, configured maximum, and provider
+error. This reporting does not change retry, backoff, or lease behavior.
+
+For in-process diagnostics, the failed count is available through
+`MetricsProvider::orchestration_poison_failed()` on the runtime's existing
+observability handle. The public `MetricsSnapshot` layout is unchanged.
+
+Activity poison accounting is unchanged: `duroxide_activity_poison_total` counts
+poison detections regardless of the activity acknowledgement result. It can count
+the same work item again on redelivery and does not confirm that the item was
+removed from the queue. Activity poison detection does not increment
+`duroxide_activity_infrastructure_errors_total`.
+
 **`duroxide_active_orchestrations`** (Gauge) 🆕
 - **Description**: Current number of orchestration instances that are actively running (not completed/failed)
 - **Value**: Count of orchestrations currently in progress
@@ -352,6 +384,11 @@ before admission count as infrastructure errors, not deferrals.
 - **Description**: Detailed activity error tracking
 - **Labels**: `activity_name`, `error_type` (app_error|infrastructure_error|config_error), `retryable` (true|false)
 - **Use**: Distinguish transient vs permanent errors
+
+**`duroxide_activity_ack_uncertain_total`** (Counter)
+- **Description**: Activity completion acknowledgements ending in a permanent error after a retryable error
+- **Labels**: _(none)_
+- **Use**: Track uncertainty separately from confirmed infrastructure failures. Counted once per uncertain outcome, not per retry. An earlier attempt may have committed or the lock may have been lost; redelivery is not guaranteed.
 
 #### Sub-Orchestration Metrics
 

@@ -904,7 +904,7 @@ Provider methods return `Result<..., ProviderError>`. The runtime uses error cla
 // Retryable: Transient failures, runtime will retry with backoff
 ProviderError::retryable("operation", "Database busy")
 
-// Permanent: Unrecoverable, runtime will fail the orchestration
+// Permanent: Retrying the operation will not recover it
 ProviderError::permanent("operation", "Duplicate event detected")
 ```
 
@@ -914,11 +914,46 @@ ProviderError::permanent("operation", "Duplicate event detected")
 - Network failure
 - Temporary resource exhaustion
 
-**Permanent errors** (runtime will fail):
+**Permanent errors** (do not retry):
 - Duplicate events
 - Missing lock token (already processed or cancelled)
 - Data corruption
 - Invalid input
+
+For acknowledgements of activity success or application errors,
+the runtime retries retryable errors in place up to five total attempts before
+abandoning the work item. A permanent error on the first attempt goes directly
+to abandonment. The retry waits are 100, 200, 400, and 800 milliseconds: 1.5 seconds of cumulative backoff,
+excluding time spent in provider calls. Normal activity completion retains lock
+renewal while acknowledgement is pending. Activities still have at-least-once
+execution semantics; exhausted retries or lost locks can lead to re-execution.
+
+Cancellation acknowledgements (`ack_work_item(token, None)`) are attempted only
+once. If that attempt fails, the worker falls back to abandonment rather than
+retrying the acknowledgement.
+
+A retryable error does not necessarily mean the transaction rolled back: a
+connection failure can leave the commit outcome unknown. If an acknowledgement
+already committed, a repeated call must reject the missing lock token with a
+permanent error without enqueueing another completion. Preserve the atomic
+delete-and-enqueue operation and lock validation described below.
+
+A permanent error after a retryable acknowledgement error is reported as an
+**uncertain outcome**, not as a confirmed activity infrastructure failure. The
+runtime cannot distinguish an earlier commit from lock loss or another permanent
+error. It increments `duroxide_activity_ack_uncertain_total` once for this outcome,
+without attempting abandonment or counting an activity infrastructure error.
+Redelivery is not guaranteed: the work item may already be gone. If uncommitted
+work remains in the queue, it can become eligible for redelivery after its lock
+expires.
+
+Acknowledgement retries do not extend the shutdown grace period. The default
+`shutdown(None)` grace is 1 second, shorter than the full 1.5-second backoff budget,
+so shutdown may abort a retrying acknowledgement, including during a backoff wait.
+Shutdown remains a bounded drain: retries continue within the grace period and
+are aborted when it expires. Choose a longer grace period to allow more time for
+retries and provider calls. Uncommitted work is recovered through lock expiry;
+an acknowledgement that committed before cancellation remains committed.
 
 ### Atomicity Requirements
 
