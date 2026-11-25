@@ -5,8 +5,8 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteTransactionManager};
+use sqlx::{Connection, Row, Sqlite, Transaction, TransactionManager};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
@@ -57,6 +57,15 @@ impl SqliteProvider {
 
         // Default: treat as retryable (conservative approach)
         ProviderError::retryable(operation, error_msg)
+    }
+
+    async fn begin_write_transaction(&self, operation: &str) -> Result<Transaction<'static, Sqlite>, ProviderError> {
+        // Reserve the writer before reading; upgrading a read snapshot can fail
+        // immediately under concurrent writes instead of using busy_timeout.
+        self.pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Self::sqlx_to_provider_error(operation, e))
     }
 
     /// Internal method to enqueue orchestrator work with optional visibility delay
@@ -128,6 +137,16 @@ impl SqliteProvider {
         let is_memory = database_url.contains(":memory:") || database_url.contains("mode=memory");
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            .after_release(|conn, _meta| {
+                Box::pin(async move {
+                    // SQLx 0.8.6 custom BEGIN has a cancellation point before
+                    // its Transaction guard exists. Never recycle that open writer.
+                    while conn.is_in_transaction() {
+                        SqliteTransactionManager::rollback(conn).await?;
+                    }
+                    Ok(true)
+                })
+            })
             .after_connect(move |conn, _meta| {
                 Box::pin({
                     let is_memory = is_memory;
@@ -726,11 +745,7 @@ impl Provider for SqliteProvider {
         _poll_timeout: Duration,
         filter: Option<&DispatcherCapabilityFilter>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("fetch_orchestration_item", e))?;
+        let mut tx = self.begin_write_transaction("fetch_orchestration_item").await?;
         let now_ms = Self::now_millis();
 
         // Implementation ordering (capability filtering contract):
@@ -1146,11 +1161,7 @@ impl Provider for SqliteProvider {
         metadata: crate::providers::ExecutionMetadata,
         cancelled_activities: Vec<ScheduledActivityIdentifier>,
     ) -> Result<(), ProviderError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("list_instances", e))?;
+        let mut tx = self.begin_write_transaction("ack_orchestration_item").await?;
 
         // Get instance from instance_locks table (we now use instance-level locking)
         let row = sqlx::query("SELECT instance_id FROM instance_locks WHERE lock_token = ?")
@@ -1807,11 +1818,7 @@ impl Provider for SqliteProvider {
             return Ok(None);
         }
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("fetch_work_item", e))?;
+        let mut tx = self.begin_write_transaction("fetch_work_item").await?;
 
         let lock_token = Self::generate_lock_token();
         let locked_until = Self::timestamp_after(lock_timeout);
@@ -2940,11 +2947,7 @@ impl ProviderAdmin for SqliteProvider {
         }
 
         // Step 2: Delete all instances in a single transaction using bulk operations
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("delete_instances_atomic", e))?;
+        let mut tx = self.begin_write_transaction("delete_instances_atomic").await?;
 
         // Step 2a: Check for orphan race condition
         // If any instance has parent_instance_id pointing to an instance we're deleting,
@@ -3283,11 +3286,7 @@ impl ProviderAdmin for SqliteProvider {
         }
 
         // Delete executions and their history in a transaction
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Self::sqlx_to_provider_error("prune_executions", e))?;
+        let mut tx = self.begin_write_transaction("prune_executions").await?;
 
         let mut result = PruneResult {
             instances_processed: 1,
@@ -3482,6 +3481,30 @@ mod tests {
         SqliteProvider::new("sqlite::memory:", None)
             .await
             .expect("Failed to create test store")
+    }
+
+    #[tokio::test]
+    async fn test_unowned_write_transaction_is_rolled_back_before_connection_reuse() {
+        let store = create_test_store().await;
+        let mut connections = Vec::new();
+        for _ in 0..store.pool.options().get_max_connections() {
+            connections.push(store.pool.acquire().await.unwrap());
+        }
+        let mut connection = connections.pop().unwrap();
+        // SQLx 0.8.6 can reach this state when custom BEGIN is cancelled after
+        // acknowledgement but before its handle-validation await returns.
+        SqliteTransactionManager::begin(&mut connection, Some("BEGIN IMMEDIATE".into()))
+            .await
+            .unwrap();
+        assert!(connection.is_in_transaction());
+        drop(connection);
+
+        // All other pool slots are held, so this must reuse or replace that slot.
+        let connection = tokio::time::timeout(Duration::from_secs(5), store.pool.acquire())
+            .await
+            .expect("cancelled transaction prevented connection reuse")
+            .unwrap();
+        assert!(!connection.is_in_transaction(), "unowned transaction returned to pool");
     }
 
     #[tokio::test]

@@ -195,6 +195,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_orchestration_poison_total` | Counter | Orchestration | _(none)_ | Confirmed poison acknowledgements |
 | `duroxide_orchestration_poison_failed_total` | Counter | Orchestration | _(none)_ | Poison acknowledgements that returned an error after retries |
 | `duroxide_active_orchestrations` | Gauge | Orchestration | _(none)_ | **Current** active count |
+| `duroxide_pending_foreign_retirements` | Gauge | Runtime lifecycle | _(none)_ | Aggregate independently retained foreign completions (unreleased) |
 | **Activity Execution** |
 | `duroxide_activity_executions_total` | Counter | Activity | activity_name, outcome, retry_attempt | Track success/failure rates |
 | `duroxide_activity_admission_deferrals_total` | Counter | Activity | activity_name, tag | Track admission deferrals whose abandon returned success |
@@ -219,6 +220,93 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide.worker.dispatcher.execution_duration_ms` | Histogram | Internal | _(none)_ | Worker execution time |
 
 **Note**: Internal dispatcher metrics use dot notation and milliseconds (not exported to Prometheus by default).
+
+### Native stop observation (unreleased)
+
+`Runtime::stop_status()` reports `NotRequested`, `Requested`, or `Faulted`.
+This is retained stop/fault state, not readiness or a health check.
+Fault-free forced shutdown remains `Requested`. A later lifecycle fault changes
+it to `Faulted`, and that state cannot change back.
+
+Use an owned `RuntimeStopObserver` from `stop_observer()` to wait for changes
+without retaining the Runtime or its callbacks.
+Independent observers can miss intermediate states but read the latest state.
+Canceling a wait does not change shutdown or cleanup ownership.
+Source closure returns an unseen final state before `None`; neither proves cleanup.
+
+Use the typed cleanup result and the SDK's release checks to decide when resources
+can be released. Matching unreleased SDKs expose passive observers; default .NET
+hosting monitors its actual lifecycle owner for diagnostics only.
+Contained user-cleanup incidents do not set `Faulted` and are not delivered by
+that monitor. Native tracing reports them separately.
+See [native stop observation](ORCHESTRATION-GUIDE.md#native-stop-observation-unreleased)
+for the state contract, cancellation rules, example, and ownership diagram.
+
+### Contained user-cleanup incidents (unreleased)
+
+Enable the native `duroxide::runtime::cleanup` tracing target at `error`.
+Each contained incident uses `category="contained_user_cleanup"` and
+`disposition="operation-local"`. Repeated incidents produce separate records,
+not one sticky Runtime-fault notification.
+
+| Fields | Meaning |
+|---|---|
+| `instance`, `execution_id`, `operation` | The affected durable operation. |
+| `activity_id`, `task_id` | Optional activity and current Tokio task identities. |
+| `stage` | The named user-cleanup boundary. |
+| `payload_fate` | `disposed`, `secondary-disposed`, or `cleanup-skipped`. |
+| `payload_disposal_failures` | Number of failed payload-disposal attempts, at most two. |
+| `payload_cleanup_skipped` | Whether the remaining payload was deliberately left undisposed. |
+
+`disposed` describes the panic payload, not successful cleanup of the failing
+user value. `secondary-disposed` means disposal itself failed, but the replacement
+payload was disposed. `cleanup-skipped` means incomplete cleanup and a retained
+allocation, not repaired state. Repeated incidents can leak resources.
+Investigate the affected application cleanup; the Runtime does not repair it.
+
+These attempts have no wall-clock bound and cannot recover from process abort.
+The event excludes the raw panic payload; the separate Rust panic hook can still
+print it. A panic in the diagnostic subscriber remains a reporting fault and
+stops the Runtime. No new incident observer, host-stop policy or automatic restart
+is provided. See [fault shutdown and recovery](ORCHESTRATION-GUIDE.md#fault-shutdown-and-recovery)
+for eligibility, preserved outcomes and the failures that remain Runtime-fatal.
+
+### Pending foreign retirements (unreleased)
+
+`duroxide_pending_foreign_retirements` counts registered foreign completions that
+the runtime retains independently after a turn. The existing metrics facade
+reports one aggregate gauge per recorder, without labels.
+All Runtime instances using that recorder contribute count changes.
+Starting or stopping another Runtime does not reset the count or create another series.
+
+Install the recorder before you start work.
+The runtime does not rebuild counts for a replacement recorder or manage exporter retention.
+
+Use structured events, not gauge labels, to identify a Runtime.
+The `duroxide::runtime::lifecycle` event with
+`category="foreign_retirement_count"` carries `lifecycle_id`, `runtime_id` and
+the affected Runtime's `pending_foreign_retirements` on count changes. Enable
+that tracing target at `info` to observe those events.
+
+The count can rise while the number of running orchestrations falls.
+An orchestration can complete or dehydrate before its foreign work ends.
+The count falls after the supplied registered observer actually returns and
+its protected destruction attempt ends. `Ok` and `Err` both certify the registered
+foreign work ended. A returned error or subsequent destruction failure still
+faults the Runtime; it does not erase the return or keep completed work counted.
+A destructor that blocks can still prevent retirement from finishing.
+
+An observer that fails before its actual return remains owned and counted,
+without repolling or force-dropping it. Nested readiness, sender loss, timeout
+and process exit are not completion certificates.
+Missing telemetry or a zero count does **not** prove that cleanup finished.
+
+The .NET retiring-invocation count measures a different population.
+Do not add the two counts as if they measured separate work.
+The gauge adds no age details, reservation details, outcome counters, or public backlog query.
+It does not trigger eviction or throttling.
+`metrics_snapshot()` and SDK metrics availability do not change.
+Use the retained lifecycle operation and its cleanup result to decide when resources can be released.
 
 #### Orchestration Lifecycle Metrics
 

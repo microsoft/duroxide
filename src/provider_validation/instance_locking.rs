@@ -548,10 +548,27 @@ pub async fn test_multi_threaded_lock_contention<F: ProviderFactory>(factory: &F
             tokio::spawn(async move {
                 // Small delay to stagger attempts
                 tokio::time::sleep(Duration::from_millis(i * 5)).await;
-                let result = p
-                    .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
-                    .await
-                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let result = loop {
+                    match p
+                        .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)
+                        .await
+                    {
+                        Ok(result) => break result,
+                        Err(error) => {
+                            assert!(error.is_retryable(), "fetch contender {i} failed: {error}");
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fetch contender {i} exhausted retries: {error}"
+                            );
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fetch contender {i} exhausted retries: {error}"
+                            );
+                        }
+                    }
+                };
                 (i, result)
             })
         })

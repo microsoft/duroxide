@@ -55,6 +55,36 @@ For broader runtime changes, also run the comprehensive two-pass suite:
 ./run-tests.sh
 ```
 
+### Hook-free lifecycle validation on Windows
+
+The integration-test dev-dependency enables `test-hooks`, even with
+`cargo test --no-default-features`. Those binaries are not production binaries
+without test hooks. To test the public lifecycle API without that feature, run:
+
+```powershell
+.\tests\Run-LifecycleProductionTests.ps1
+```
+
+The runner builds the SQLite production library in `target\lifecycle-production`.
+It uses locked dependencies and offline mode, then checks Cargo's feature and profile evidence.
+It uses `rustc` to link `tests\lifecycle_production_tests.rs` and
+`tests\foreign_retirement_metrics_tests.rs` directly to that library.
+
+A generated recorder fixture builds `metrics-util` without core's dev-dependencies.
+Its lock starts from the repository lock.
+The runner rejects registry dependencies with different versions or checksums, then builds with `--locked`.
+It checks that the recorder and core use the same metrics facade artifact.
+The recorder tests cover 100 successive Runtime lifetimes, overlapping populations,
+and concurrent updates without lifecycle test hooks.
+
+Each suite must run at least one test, with no failures or skips.
+The output's `evidence` directory records test totals and the paths and hashes of each artifact.
+Use `-TargetDirectory` and `-EvidenceDirectory` to select other isolated paths inside this repository.
+The runner does not copy test assets into SDK, package, or production native-asset directories.
+
+Keep the instrumented lifecycle, replay/CAN/KV, polling, formatting, and Clippy checks.
+This runner does not replace PostgreSQL, other-platform, or release-dependency validation.
+
 ## Filing pull requests
 
 Use the pull request template in [.github/pull_request_template.md](.github/pull_request_template.md) and fill in the docs checkboxes.

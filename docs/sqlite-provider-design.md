@@ -282,8 +282,20 @@ impl Provider for SqliteProvider {
 ## Advantages Over Filesystem Provider
 
 ### 1. **True ACID Transactions**
+
+Transactions that read before writing use `BEGIN IMMEDIATE`. This includes queue
+fetches, orchestration acknowledgements, instance deletion and execution pruning.
+SQLite then applies the existing busy timeout while acquiring writer access,
+rather than failing a later read-to-write upgrade when another operation writes
+concurrently. Read-only queries are unchanged.
+
+Before a connection returns to the pool, the provider rolls back any remaining
+transaction. This also covers cancellation between SQLx's custom `BEGIN`
+acknowledgement and creation of its transaction guard. A rollback error goes
+through SQLx's pool error reporting and discards the connection.
+
 ```sql
-BEGIN TRANSACTION;
+BEGIN IMMEDIATE;
 -- All operations succeed or fail together
 DELETE FROM orchestrator_queue WHERE lock_token = ?;
 INSERT INTO history ...;
