@@ -1,0 +1,7 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[[profile.default.overrides]]
+# File-backed end-to-end latency assertions must not compete with other tests.
+filter = 'binary(=runtime_options_test) & (test(=test_fast_polling) | test(=test_default_polling_frequency))'
+threads-required = "num-test-threads"

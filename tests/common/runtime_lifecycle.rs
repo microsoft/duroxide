@@ -46,6 +46,10 @@ pub struct Fixture {
 impl Fixture {
     pub async fn new() -> Self {
         let inner: Arc<dyn Provider> = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+        Self::with_store(inner)
+    }
+
+    pub fn with_store(inner: Arc<dyn Provider>) -> Self {
         let hooks = LifecycleHooks::default();
         let provider = Arc::new(ControlledProvider::new(
             Arc::clone(&inner),

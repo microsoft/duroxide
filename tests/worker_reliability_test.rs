@@ -115,15 +115,17 @@ async fn lifecycle_fetch_and_ack_faults_preserve_activity_redelivery_at_commit_b
 /// 5. Activity should be redelivered and executed again (at-least-once semantics)
 #[tokio::test]
 async fn activity_reliability_after_crash_before_completion_enqueue() {
-    // Use SQLite store for persistence across "crash"
-    // Shorten worker lock lease so redelivery happens quickly after restart
-    // Safety: setting environment variables in tests is process-wide; we set it before creating the store
-    // and use a deterministic value to control lease duration. We restore it at the end of the test.
-    let prev_lease = std::env::var("DUROXIDE_SQLITE_LOCK_TIMEOUT_MS").ok();
-    unsafe {
-        std::env::set_var("DUROXIDE_SQLITE_LOCK_TIMEOUT_MS", "1000");
-    }
+    use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
+    use lifecycle_support::{Fixture, bounded, entered, options};
+
     let (store, _temp_dir) = common::create_sqlite_store_disk().await;
+    let f = Fixture::with_store(store.clone());
+    let held = f.hold(LifecyclePoint::ProviderEnter(ProviderOperation::AcknowledgeActivity));
+    let runtime_options = runtime::RuntimeOptions {
+        worker_lock_timeout: Duration::from_secs(1),
+        ..options()
+    };
+    let activity_calls = Arc::new(AtomicU32::new(0));
 
     // Simple orchestration that schedules an activity and waits for completion
     let orch = |ctx: OrchestrationContext, input: String| async move {
@@ -136,11 +138,15 @@ async fn activity_reliability_after_crash_before_completion_enqueue() {
         Ok(format!("Activity result: {result}"))
     };
 
+    let calls = Arc::clone(&activity_calls);
     let activity_registry = ActivityRegistry::builder()
-        .register("TestActivity", |_ctx: ActivityContext, input: String| async move {
-            println!("Executing TestActivity with input: {input}");
-            // Simulate some work
-            Ok(format!("Processed: {input}"))
+        .register("TestActivity", move |_ctx: ActivityContext, input: String| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                println!("Executing TestActivity with input: {input}");
+                Ok(format!("Processed: {input}"))
+            }
         })
         .build();
 
@@ -148,14 +154,14 @@ async fn activity_reliability_after_crash_before_completion_enqueue() {
         .register("ActivityReliabilityTest", orch)
         .build();
 
-    // Phase 1: Start orchestration and let it schedule the activity
+    // Phase 1: Execute the activity, but hold its durable acknowledgement.
     let store1 = store.clone();
-    let rt1 = runtime::Runtime::start_with_store(
-        store1.clone(),
+    let rt1 = f.prepare(
         activity_registry.clone(),
         orchestration_registry.clone(),
-    )
-    .await;
+        runtime_options.clone(),
+    );
+    Arc::clone(&rt1).start_execution().await.unwrap();
 
     let instance = "inst-activity-reliability";
     let client1 = duroxide::Client::new(store1.clone());
@@ -175,9 +181,15 @@ async fn activity_reliability_after_crash_before_completion_enqueue() {
         .await,
         "Activity should be scheduled"
     );
+    entered(&held).await;
+    assert_eq!(
+        activity_calls.load(Ordering::SeqCst),
+        1,
+        "Activity must execute before its acknowledgement is interrupted"
+    );
 
     // Verify activity hasn't completed yet (we'll simulate crash before completion)
-    let hist_before = store1.read(instance).await.unwrap_or_default();
+    let hist_before = store1.read(instance).await.unwrap();
     assert!(
         !hist_before
             .iter()
@@ -197,17 +209,25 @@ async fn activity_reliability_after_crash_before_completion_enqueue() {
         )
     );
 
-    // Simulate crash by shutting down runtime
+    // Force retirement while acknowledgement is held, leaving the leased item durable.
     println!("Simulating crash - shutting down runtime before activity completes...");
-    rt1.shutdown(None).await;
-
-    // Small delay to ensure shutdown completes
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        bounded(rt1.shutdown_with_grace(Duration::ZERO)).await.unwrap(),
+        runtime::ShutdownOutcome::Forced
+    );
+    f.assert_retired();
+    held.release();
 
     // Phase 2: "Restart" system with new runtime but same store
     println!("Restarting system...");
     let store2 = store.clone();
-    let rt2 = runtime::Runtime::start_with_store(store2.clone(), activity_registry, orchestration_registry).await;
+    let rt2 = runtime::Runtime::start_with_options(
+        store2.clone(),
+        activity_registry,
+        orchestration_registry,
+        runtime_options,
+    )
+    .await;
 
     // The runtime should automatically resume the orchestration and reprocess pending activities
 
@@ -231,7 +251,11 @@ async fn activity_reliability_after_crash_before_completion_enqueue() {
     }
 
     // Verify the activity actually completed
-    let hist_after = store2.read(instance).await.unwrap_or_default();
+    let hist_after = store2.read(instance).await.unwrap();
+    assert!(
+        activity_calls.load(Ordering::SeqCst) >= 2,
+        "The unacknowledged activity must execute again after restart"
+    );
 
     // Debug: print all events (can be removed in production)
     println!("History after restart:");
@@ -260,16 +284,6 @@ async fn activity_reliability_after_crash_before_completion_enqueue() {
 
     println!("✅ Activity reliability test passed - activity completed correctly after restart");
     rt2.shutdown(None).await;
-
-    // Restore environment
-    match prev_lease {
-        Some(v) => unsafe {
-            std::env::set_var("DUROXIDE_SQLITE_LOCK_TIMEOUT_MS", v);
-        },
-        None => unsafe {
-            std::env::remove_var("DUROXIDE_SQLITE_LOCK_TIMEOUT_MS");
-        },
-    }
 }
 
 /// Test multiple activities with crash/recovery
@@ -285,14 +299,16 @@ async fn activity_reliability_after_crash_before_completion_enqueue() {
 /// 4. Restart runtime and verify all activities complete successfully
 #[tokio::test]
 async fn multiple_activities_reliability_after_crash() {
-    // Use SQLite store for persistence across "crash" - SQLite provides atomicity
-    // Shorten worker lock lease so redelivery happens quickly after restart
-    // We restore the environment variable at the end of the test
-    let prev_lease = std::env::var("DUROXIDE_SQLITE_LOCK_TIMEOUT_MS").ok();
-    unsafe {
-        std::env::set_var("DUROXIDE_SQLITE_LOCK_TIMEOUT_MS", "1000");
-    }
+    use duroxide::runtime::test_hooks::{LifecyclePoint, ProviderOperation};
+    use lifecycle_support::{Fixture, bounded, entered, options};
+
     let (store, _temp_dir) = common::create_sqlite_store_disk().await;
+    let f = Fixture::with_store(store.clone());
+    let held = f.hold(LifecyclePoint::ProviderEnter(ProviderOperation::AcknowledgeActivity));
+    let runtime_options = runtime::RuntimeOptions {
+        worker_lock_timeout: Duration::from_secs(1),
+        ..options()
+    };
 
     // Orchestration with multiple activities
     let orch = |ctx: OrchestrationContext, _input: String| async move {
@@ -330,12 +346,12 @@ async fn multiple_activities_reliability_after_crash() {
 
     // Phase 1: Start and wait for all activities to be scheduled
     let store1 = store.clone();
-    let rt1 = runtime::Runtime::start_with_store(
-        store1.clone(),
+    let rt1 = f.prepare(
         activity_registry.clone(),
         orchestration_registry.clone(),
-    )
-    .await;
+        runtime_options.clone(),
+    );
+    Arc::clone(&rt1).start_execution().await.unwrap();
 
     let instance = "inst-multi-activity-reliability";
     let client1 = duroxide::Client::new(store1.clone());
@@ -359,9 +375,10 @@ async fn multiple_activities_reliability_after_crash() {
         .await,
         "All 3 activities should be scheduled"
     );
+    entered(&held).await;
 
     // Crash before any activity completes
-    let hist_before = store1.read(instance).await.unwrap_or_default();
+    let hist_before = store1.read(instance).await.unwrap();
     assert_eq!(
         hist_before
             .iter()
@@ -372,13 +389,23 @@ async fn multiple_activities_reliability_after_crash() {
     );
 
     println!("Crashing with 3 pending activities...");
-    rt1.shutdown(None).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        bounded(rt1.shutdown_with_grace(Duration::ZERO)).await.unwrap(),
+        runtime::ShutdownOutcome::Forced
+    );
+    f.assert_retired();
+    held.release();
 
     // Phase 2: Restart and verify all activities complete
     println!("Restarting...");
     let store2 = store.clone();
-    let rt2 = runtime::Runtime::start_with_store(store2.clone(), activity_registry, orchestration_registry).await;
+    let rt2 = runtime::Runtime::start_with_options(
+        store2.clone(),
+        activity_registry,
+        orchestration_registry,
+        runtime_options,
+    )
+    .await;
 
     // Wait for completion
     let client2 = duroxide::Client::new(store2.clone());
@@ -400,7 +427,7 @@ async fn multiple_activities_reliability_after_crash() {
     }
 
     // Verify all 3 TestActivity activities completed
-    let hist_after = store2.read(instance).await.unwrap_or_default();
+    let hist_after = store2.read(instance).await.unwrap();
     let test_activity_completed_count = hist_after
         .iter()
         .filter(
@@ -414,16 +441,6 @@ async fn multiple_activities_reliability_after_crash() {
     );
 
     rt2.shutdown(None).await;
-
-    // Restore environment
-    match prev_lease {
-        Some(v) => unsafe {
-            std::env::set_var("DUROXIDE_SQLITE_LOCK_TIMEOUT_MS", v);
-        },
-        None => unsafe {
-            std::env::remove_var("DUROXIDE_SQLITE_LOCK_TIMEOUT_MS");
-        },
-    }
 }
 
 struct AckTest {

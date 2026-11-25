@@ -195,7 +195,7 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 | `duroxide_orchestration_poison_total` | Counter | Orchestration | _(none)_ | Confirmed poison acknowledgements |
 | `duroxide_orchestration_poison_failed_total` | Counter | Orchestration | _(none)_ | Poison acknowledgements that returned an error after retries |
 | `duroxide_active_orchestrations` | Gauge | Orchestration | _(none)_ | **Current** active count |
-| `duroxide_pending_foreign_retirements` | Gauge | Runtime lifecycle | _(none)_ | Aggregate independently retained foreign completions (unreleased) |
+| `duroxide_pending_foreign_retirements` | Gauge | Runtime lifecycle | _(none)_ | Aggregate independently retained foreign completions (since 0.2.1) |
 | **Activity Execution** |
 | `duroxide_activity_executions_total` | Counter | Activity | activity_name, outcome, retry_attempt | Track success/failure rates |
 | `duroxide_activity_admission_deferrals_total` | Counter | Activity | activity_name, tag | Track admission deferrals whose abandon returned success |
@@ -221,7 +221,11 @@ All metrics follow Prometheus naming conventions with `_total` for counters and 
 
 **Note**: Internal dispatcher metrics use dot notation and milliseconds (not exported to Prometheus by default).
 
-### Native stop observation (unreleased)
+The native lifecycle APIs and diagnostics below require Duroxide 0.2.1 or later.
+
+<a name="native-stop-observation-unreleased"></a>
+
+### Native stop observation
 
 `Runtime::stop_status()` reports `NotRequested`, `Requested`, or `Faulted`.
 This is retained stop/fault state, not readiness or a health check.
@@ -239,10 +243,12 @@ can be released. Matching unreleased SDKs expose passive observers; default .NET
 hosting monitors its actual lifecycle owner for diagnostics only.
 Contained user-cleanup incidents do not set `Faulted` and are not delivered by
 that monitor. Native tracing reports them separately.
-See [native stop observation](ORCHESTRATION-GUIDE.md#native-stop-observation-unreleased)
+See [native stop observation](ORCHESTRATION-GUIDE.md#native-stop-observation)
 for the state contract, cancellation rules, example, and ownership diagram.
 
-### Contained user-cleanup incidents (unreleased)
+<a name="contained-user-cleanup-incidents-unreleased"></a>
+
+### Contained user-cleanup incidents
 
 Enable the native `duroxide::runtime::cleanup` tracing target at `error`.
 Each contained incident uses `category="contained_user_cleanup"` and
@@ -271,7 +277,9 @@ stops the Runtime. No new incident observer, host-stop policy or automatic resta
 is provided. See [fault shutdown and recovery](ORCHESTRATION-GUIDE.md#fault-shutdown-and-recovery)
 for eligibility, preserved outcomes and the failures that remain Runtime-fatal.
 
-### Pending foreign retirements (unreleased)
+<a name="pending-foreign-retirements-unreleased"></a>
+
+### Pending foreign retirements
 
 `duroxide_pending_foreign_retirements` counts registered foreign completions that
 the runtime retains independently after a turn. The existing metrics facade
