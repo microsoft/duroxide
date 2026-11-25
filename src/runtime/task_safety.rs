@@ -15,6 +15,7 @@ use super::Runtime;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum TaskRole {
     GaugePoller,
     OrchestrationSlot,

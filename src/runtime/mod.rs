@@ -411,6 +411,7 @@ static NEXT_LIFECYCLE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// Actual retirement of tracked native work and registered foreign cleanup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ShutdownOutcome {
     Drained,
     Forced,
@@ -418,6 +419,7 @@ pub enum ShutdownOutcome {
 
 /// Retained stop/fault state, not readiness or proof of cleanup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeStopStatus {
     /// No stop has been accepted. The runtime can be prepared, starting or running.
     NotRequested,
@@ -466,6 +468,7 @@ impl RuntimeStopObserver {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeStartError {
     InvalidSessionIdleTimeout,
     NoExecutor,
@@ -491,6 +494,7 @@ impl std::fmt::Display for RuntimeStartError {
 impl std::error::Error for RuntimeStartError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeShutdownError {
     Failed { quiescent: bool },
 }

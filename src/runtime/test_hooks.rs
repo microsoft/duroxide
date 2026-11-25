@@ -85,6 +85,7 @@ pub fn clear_orch_processing_delay() {
 pub use super::task_safety::TaskRole as LifecycleTask;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ProviderOperation {
     FetchOrchestration,
     FetchActivity,
@@ -101,6 +102,7 @@ pub enum ProviderOperation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LifecyclePoint {
     StartupBeforeIo,
     StartupAfterSpawn(LifecycleTask),
@@ -140,6 +142,7 @@ pub struct LifecycleCounts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HookError {
     AlreadyArmed,
     TasksActive,

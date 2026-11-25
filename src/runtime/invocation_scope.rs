@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Rejection of a foreign-cleanup attachment before foreign execution may begin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AttachError {
     /// Standalone or synchronous replay has no asynchronous cleanup owner.
     Unsupported,
