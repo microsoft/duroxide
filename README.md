@@ -268,6 +268,10 @@ that fits how you want to author and host your workflows:
   provider for the duroxide runtime. Plug this into duroxide / duroxide-python /
   duroxide-node when you want **PostgreSQL** as the durable store.
 
+### Community providers
+
+- **[duroxide-mysql-tidb](https://github.com/mingley/duroxide-mysql-tidb)** ([crates.io](https://crates.io/crates/duroxide-mysql-tidb)) — MySQL 8.0+ and TiDB storage provider for Duroxide.
+
 ## Learn more
 
 - **[Orchestration Guide](docs/ORCHESTRATION-GUIDE.md)** — the complete guide to writing workflows.
