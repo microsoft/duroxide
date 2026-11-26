@@ -4,8 +4,8 @@
 [![Crates.io](https://img.shields.io/crates/v/duroxide.svg)](https://crates.io/crates/duroxide)
 [![Documentation](https://docs.rs/duroxide/badge.svg)](https://docs.rs/duroxide)
 
-> **[Latest Release: v0.2.0](https://crates.io/crates/duroxide/0.2.0)** — Activities can defer work until resources are available without holding a worker slot. SQLite prevents deferred work from starving ready items, and workers retry transient errors when acknowledging activity results.
-> See [CHANGELOG.md](CHANGELOG.md#020---2026-11-19) for release notes and provider upgrade requirements.
+> **[Latest Release: v0.2.1](https://crates.io/crates/duroxide/0.2.1)** — Fallible worker startup, passive stop/fault observation, and explicit cleanup outcomes. Runtime-owned tasks and registered foreign cleanup remain owned until they end.
+> See [CHANGELOG.md](CHANGELOG.md#021---2026-11-25) for release notes. Upgrades from 0.1.x must also follow the [0.2.0 provider notes](CHANGELOG.md#provider-notes-for-020).
 >
 > **Release policy:** Official packages are published through Microsoft-managed
 > internal pipelines. Repository GitHub Actions are validation-only. See
@@ -47,17 +47,17 @@ and [Temporal](https://temporal.io/).
 
 ```toml
 [dependencies]
-duroxide = { version = "0.2", features = ["sqlite"] }  # With the bundled SQLite provider
+duroxide = { version = "0.2.1", features = ["sqlite"] }  # With the bundled SQLite provider
 # OR
-duroxide = "0.2"  # Core only — bring your own Provider
+duroxide = "0.2.1"  # Core only — bring your own Provider
 ```
 
 ## Examples
 
 ### Hello world
 
-The fallible lifecycle calls below are **unreleased**. Use the source build
-containing these changes; the published 0.1.32 crate does not have them.
+The fallible lifecycle calls below require Duroxide **0.2.1 or later**.
+Matching .NET, Node, and Python SDK updates remain unreleased.
 
 ```rust
 use std::sync::Arc;
@@ -102,7 +102,9 @@ rt.shutdown_with_grace(std::time::Duration::from_secs(1)).await?;
 # }
 ```
 
-### Worker lifetime (unreleased)
+<a name="worker-lifetime-unreleased"></a>
+
+### Worker lifetime
 
 Use `Runtime::prepare` followed by `Arc::clone(&runtime).start_execution().await`
 to handle startup errors without a panic. Preparation does not start work or
@@ -140,7 +142,7 @@ before replacing a failed worker.
 Legacy `shutdown(None)` still uses one second of grace and returns `()` after cleanup.
 It has no total deadline and logs operational failures. SDK nanosecond transport
 limits do not restrict native grace. See the
-[lifecycle guide](docs/ORCHESTRATION-GUIDE.md#worker-lifecycle-unreleased) for
+[lifecycle guide](docs/ORCHESTRATION-GUIDE.md#worker-lifecycle) for
 validation, provider I/O, and language-adapter boundaries.
 
 ### Surviving crashes

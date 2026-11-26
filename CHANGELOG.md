@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-25
+
+**Release:** <https://crates.io/crates/duroxide/0.2.1>
+
+Includes [#64](https://github.com/microsoft/duroxide/pull/64).
+
 ### Added
 
 - **Foreign-runtime lifecycle integration** - Add fallible preparation and startup,

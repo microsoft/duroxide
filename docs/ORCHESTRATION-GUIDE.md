@@ -24,8 +24,7 @@
 
 ### Minimum Viable Orchestration
 
-The fallible lifecycle in this example is **unreleased**, requiring a matching
-source build rather than published 0.1.32.
+The fallible lifecycle in this example requires Duroxide **0.2.1 or later**.
 
 ```rust
 use duroxide::{ActivityContext, OrchestrationContext, OrchestrationRegistry, Client};
@@ -81,7 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Worker lifecycle (unreleased)
+<a name="worker-lifecycle-unreleased"></a>
+
+### Worker lifecycle
 
 `Runtime::prepare` validates configuration and returns an `Arc` without starting work.
 It does not call the provider. `start_execution` requires a Tokio executor.
@@ -165,7 +166,9 @@ Legacy `shutdown(None)` retains the unit return and one-second grace;
 `Some(0)` requests immediate force. Both wait for actual cleanup without a total limit.
 They log operational failures instead of raising shutdown-timeout panics.
 
-### Native stop observation (unreleased)
+<a name="native-stop-observation-unreleased"></a>
+
+### Native stop observation
 
 Use `Runtime::stop_status()` to read the current stop state.
 Use `Runtime::stop_observer()` to obtain an owned, read-only `RuntimeStopObserver`.
@@ -237,7 +240,7 @@ Contained user-cleanup incidents use native tracing, not stop-state notification
 
 ### Fault shutdown and recovery
 
-The unreleased core contains cleanup panics at named user-code boundaries:
+Since 0.2.1, the core contains cleanup panics at named user-code boundaries:
 destruction of an activity future or application admission guard, and destruction
 of an orchestration driver after a valid, finalized turn decision in
 Runtime-owned replay. Core obligations keep their independent completion and
@@ -265,7 +268,7 @@ This can interrupt unrelated work already admitted by the same worker.
 There is no general recovery or configurable catch-and-continue mode.
 
 Each contained incident emits a protected
-[native cleanup diagnostic](observability-guide.md#contained-user-cleanup-incidents-unreleased).
+[native cleanup diagnostic](observability-guide.md#contained-user-cleanup-incidents).
 It does not set `Faulted`. A failure in diagnostic reporting remains a Runtime
 fault. Passive stop observation is not an incident stream or a health check.
 
@@ -376,7 +379,7 @@ This contract does not cover unregistered continuations.
 The .NET adapter registers its handler root and SDK continuations.
 The Node and Python adapters do not provide that additional guarantee.
 
-Production [retirement diagnostics](observability-guide.md#pending-foreign-retirements-unreleased)
+Production [retirement diagnostics](observability-guide.md#pending-foreign-retirements)
 report pending foreign completions separately from durable workload metrics.
 A zero count is never permission to release resources.
 
